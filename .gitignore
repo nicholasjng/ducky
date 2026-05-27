@@ -1,0 +1,18 @@
+# Build artifacts
+/build/
+/dist/
+*.so
+*.pyd
+
+# caches
+/.cache/clangd
+/.pytest_cache
+/.ruff_cache
+
+# scikit-build-core / CMake
+compile_commands.json
+
+# Python
+__pycache__/
+*.egg-info/
+.venv/
