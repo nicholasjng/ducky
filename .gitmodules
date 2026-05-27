@@ -1,0 +1,4 @@
+[submodule "ext/duckdb"]
+	path = ext/duckdb
+	url = https://github.com/duckdb/duckdb.git
+	shallow = true
