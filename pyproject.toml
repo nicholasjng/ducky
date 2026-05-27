@@ -1,0 +1,62 @@
+[build-system]
+requires = ["scikit-build-core>=0.10", "nanobind>=2.0"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "ducky"
+version = "0.1.0"
+description = "small and fast duckdb bindings"
+readme = "README.md"
+license = "Apache-2.0"
+authors = [{ name = "Nicholas Junge", email = "nicho.junge@gmail.com" }]
+requires-python = ">=3.13"
+dependencies = []
+
+[dependency-groups]
+build = [
+    "nanobind >=2.2",
+    "ruff>=0.15.12",  # for CMake's post-build stub formatting step.
+    "scikit-build-core >=0.10",
+]
+dev = [
+    "pandas>=3.0.3",
+    "polars>=1.40.1",
+    "pyarrow>=24.0.0",
+    "pytest>=8",
+]
+typing = [
+    "ty>=0.0.35",
+]
+
+[tool.uv]
+# Build ducky against the project .venv so includes from Python packages
+# (nanobind etc.) in compile_commands.json survive across rebuilds.
+no-build-isolation-package = ["ducky"]
+exclude-newer = "1 week"
+# Require the "build" group by default, due to no build isolation.
+default-groups = ["build"]
+
+[tool.scikit-build]
+# Reuse the same build tree across rebuilds so DuckDB is only compiled once.
+build-dir = "build/{wheel_tag}"
+wheel.packages = ["src/ducky"]
+cmake.build-type = "Release"
+logging.level = "INFO"
+# Editable installs rebuild the extension (incremental ninja) on import, so a
+# C++ change is picked up by the next `import ducky` with no manual reinstall.
+# Only affects editable installs; wheel builds ignore these. verbose=false keeps
+# successful imports quiet (build failures are still raised); flip it to true to
+# watch rebuilds.
+editable.mode = "redirect"
+editable.rebuild = true
+editable.verbose = false
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+extend-select = ["I", "UP", "B", "SIM"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
