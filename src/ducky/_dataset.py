@@ -1,0 +1,414 @@
+"""Higher-level dataset / feature API for ML pipelines on top of DuckDB.
+
+Sketch — surface plus a minimal SQL compiler. The goal is to demonstrate the
+shape of the API; advanced features (stratified split, fillna='mean', custom
+fold lists, streaming batches) are deliberately left out for now.
+
+Typical use:
+
+    ds = ducky.dataset(
+        "https://…/titanic.csv",
+        columns={
+            "pclass":   ducky.feature("Pclass",                  dtype="f32"),
+            "sex_male": ducky.feature("Sex = 'male'",            dtype="f32"),
+            "age":      ducky.feature("Age",  standardize=True,  dtype="f32"),
+            "sibsp":    ducky.feature('"Siblings/Spouses Aboard"'),
+            "parch":    ducky.feature('"Parents/Children Aboard"'),
+            "fare":     ducky.feature("Fare", standardize=True,  dtype="f32"),
+        },
+        target=ducky.target("Survived", dtype="f32"),
+        drop_nulls=["Age"],
+        split=ducky.split(0.8, seed=0),
+    )
+    Xtr, ytr = ds.train.to_jax()
+    Xval, yval = ds.val.to_jax()
+"""
+
+from __future__ import annotations
+
+from collections.abc import Iterator
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
+
+from ._core import Connection, connect
+
+if TYPE_CHECKING:
+    import jax
+    import numpy as np
+    import torch
+
+
+# ── User-facing spec dataclasses ────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class Feature:
+    """One column in the output table.
+
+    ``expr`` is a SQL expression (not a Python expression) — typically just a
+    column name, optionally quoted: ``"Pclass"``, ``'"Siblings/Spouses Aboard"'``,
+    or a small expression like ``"Sex = 'male'"`` or
+    ``"coalesce(Age, 30.0)"``.
+
+    When ``standardize=True``, the column is z-scored using stats computed
+    against the *train* fold only — never the full dataset.
+    """
+
+    expr: str
+    dtype: str = "f32"
+    standardize: bool = False
+
+
+@dataclass(frozen=True)
+class Target:
+    """The label column. Always emitted to the result; not included in X."""
+
+    expr: str
+    dtype: str = "f32"
+
+
+@dataclass(frozen=True)
+class Split:
+    """Random named-fold split based on a hash bucket over row position.
+
+    ``fractions`` maps fold name → share, and must sum to 1.0. The most common
+    case (single ``"train"``/``"val"`` split) has a shorthand: pass a plain
+    float to :func:`split` and we expand it to
+    ``{"train": x, "val": 1 - x}``.
+
+    Reproducible across runs given a fixed ``seed``. Stratified splits and
+    user-supplied fold columns are not supported in this v0 sketch.
+
+    Standardisation statistics (see :class:`Feature` ``standardize=True``) are
+    always computed against the fold named ``"train"`` if present; otherwise
+    they're computed across the whole dataset.
+    """
+
+    fractions: dict[str, float] = field(default_factory=lambda: {"train": 0.8, "val": 0.2})
+    seed: int = 0
+
+
+def feature(expr: str, *, dtype: str = "f32", standardize: bool = False) -> Feature:
+    """Shorthand for ``Feature(expr=..., dtype=..., standardize=...)``."""
+    return Feature(expr=expr, dtype=dtype, standardize=standardize)
+
+
+def target(expr: str, *, dtype: str = "f32") -> Target:
+    """Shorthand for ``Target(expr=..., dtype=...)``."""
+    return Target(expr=expr, dtype=dtype)
+
+
+def split(
+    fractions: float | dict[str, float] = 0.8,
+    *,
+    seed: int = 0,
+) -> Split:
+    """Shorthand for ``Split(fractions=..., seed=...)``.
+
+    ``fractions`` is either a single float in ``(0, 1)`` (expanded to
+    ``{"train": x, "val": 1 - x}``) or a dict of fold name → share that sums
+    to 1.0.
+    """
+    if isinstance(fractions, float):
+        if not 0.0 < fractions < 1.0:
+            raise ValueError(f"train fraction must be in (0, 1); got {fractions}")
+        return Split(fractions={"train": fractions, "val": 1.0 - fractions}, seed=seed)
+    total = sum(fractions.values())
+    if abs(total - 1.0) > 1e-6:
+        raise ValueError(f"fold fractions must sum to 1.0; got {total}")
+    if not all(v > 0 for v in fractions.values()):
+        raise ValueError("each fold fraction must be > 0")
+    return Split(fractions=dict(fractions), seed=seed)
+
+
+# ── Dtype mapping ──────────────────────────────────────────────────────────
+
+_DUCKDB_DTYPES: dict[str, str] = {
+    "f32": "FLOAT",
+    "f64": "DOUBLE",
+    "i8": "TINYINT",
+    "i16": "SMALLINT",
+    "i32": "INTEGER",
+    "i64": "BIGINT",
+    "u8": "UTINYINT",
+    "u16": "USMALLINT",
+    "u32": "UINTEGER",
+    "u64": "UBIGINT",
+    "bool": "BOOLEAN",
+}
+
+
+def _to_duckdb_dtype(name: str) -> str:
+    try:
+        return _DUCKDB_DTYPES[name]
+    except KeyError as exc:
+        raise ValueError(f"unknown dtype {name!r}; pick one of {sorted(_DUCKDB_DTYPES)}") from exc
+
+
+# ── Output: Fold + Dataset ─────────────────────────────────────────────────
+
+
+@dataclass
+class Fold:
+    """One side of a train/val split — feature ndarrays + target ndarray.
+
+    ``arrays`` is a dict view keyed by feature/target name; ``tensors()``
+    stacks the feature columns into a single ``(n_rows, n_features)`` array.
+    """
+
+    feature_names: list[str]
+    target_name: str
+    _arrays: dict[str, np.ndarray]
+
+    @property
+    def arrays(self) -> dict[str, np.ndarray]:
+        return dict(self._arrays)
+
+    @property
+    def n_rows(self) -> int:
+        return int(next(iter(self._arrays.values())).shape[0])
+
+    def tensors(self) -> tuple[np.ndarray, np.ndarray]:
+        """Returns ``(X, y)``: features stacked into ``(n, d)``, target ``(n,)``."""
+        import numpy as np
+
+        X = np.stack([self._arrays[name] for name in self.feature_names], axis=1)
+        y = self._arrays[self.target_name]
+        return X, y
+
+    def to_jax(self, device: jax.Device | None = None) -> tuple[jax.Array, jax.Array]:
+        import jax.numpy as jnp
+
+        X, y = self.tensors()
+        return jnp.asarray(X, device=device), jnp.asarray(y, device=device)
+
+    def to_torch(
+        self, device: torch.device | str | int | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        import torch
+
+        X, y = self.tensors()
+        Xt = torch.from_numpy(X)
+        yt = torch.from_numpy(y)
+        if device is not None:
+            Xt, yt = Xt.to(device), yt.to(device)
+        return Xt, yt
+
+    def batches(
+        self,
+        batch_size: int,
+        *,
+        shuffle: bool = False,
+        seed: int | None = None,
+        drop_last: bool = False,
+    ) -> Iterator[tuple[np.ndarray, np.ndarray]]:
+        """Yield ``(X_batch, y_batch)`` slices of ``self.tensors()``.
+
+        Materialises the fold into one ``(X, y)`` pair up front (cheap — same
+        memory as ``tensors()``); each batch is then a fancy-index slice.
+        For GPU training loops, prefer ``to_jax()`` / ``to_torch()`` outside
+        the loop and slice the resulting device array yourself — that avoids
+        host→device transfers per batch.
+
+        ``shuffle=True`` permutes row order once per call (i.e. once per
+        epoch if you wrap this in a ``for epoch in range(...)``). Pass a
+        fresh ``seed`` per epoch for a deterministic but varying shuffle, or
+        ``seed=None`` for non-deterministic.
+        """
+        import numpy as np
+
+        if batch_size <= 0:
+            raise ValueError(f"batch_size must be > 0; got {batch_size}")
+        X, y = self.tensors()
+        n = self.n_rows
+        indices = np.arange(n)
+        if shuffle:
+            np.random.default_rng(seed).shuffle(indices)
+        end = (n // batch_size) * batch_size if drop_last else n
+        for start in range(0, end, batch_size):
+            idx = indices[start : start + batch_size]
+            yield X[idx], y[idx]
+
+    def __repr__(self) -> str:
+        return (
+            f"Fold(n_rows={self.n_rows}, features={self.feature_names!r}, "
+            f"target={self.target_name!r})"
+        )
+
+
+@dataclass
+class Dataset:
+    """A loaded dataset, split into one or more named folds.
+
+    The most common access patterns:
+
+    - ``ds.train`` / ``ds.val`` / ``ds.test`` — convenience aliases for the
+      standard fold names (return ``None`` if that fold doesn't exist).
+    - ``ds.folds["custom"]`` or ``ds["custom"]`` — arbitrary fold names.
+    - Iterating ``ds.folds`` gives all available folds in declaration order.
+
+    When the spec includes no split, all rows land in a single ``"train"`` fold.
+    """
+
+    folds: dict[str, Fold]
+
+    @property
+    def train(self) -> Fold | None:
+        return self.folds.get("train")
+
+    @property
+    def val(self) -> Fold | None:
+        return self.folds.get("val")
+
+    @property
+    def test(self) -> Fold | None:
+        return self.folds.get("test")
+
+    @property
+    def feature_names(self) -> list[str]:
+        return next(iter(self.folds.values())).feature_names
+
+    @property
+    def target_name(self) -> str:
+        return next(iter(self.folds.values())).target_name
+
+    def __getitem__(self, name: str) -> Fold:
+        return self.folds[name]
+
+    def __repr__(self) -> str:
+        parts = ", ".join(f"{name}={f.n_rows}" for name, f in self.folds.items())
+        return f"Dataset({parts} rows, features={self.feature_names!r})"
+
+
+# ── SQL compiler ───────────────────────────────────────────────────────────
+
+
+# 1000 buckets gives 0.1% resolution on fold fractions — enough for anything
+# users want to express in v0.
+_N_BUCKETS = 1000
+
+
+def _fold_ranges(fractions: dict[str, float]) -> list[tuple[str, int, int]]:
+    """Cumulative-threshold conversion: each fold gets a [lo, hi) bucket range.
+    The last fold absorbs any rounding drift so the ranges always tile [0, N).
+    """
+    ranges: list[tuple[str, int, int]] = []
+    cum = 0.0
+    items = list(fractions.items())
+    for i, (name, frac) in enumerate(items):
+        lo = round(cum * _N_BUCKETS)
+        cum += frac
+        hi = _N_BUCKETS if i == len(items) - 1 else round(cum * _N_BUCKETS)
+        ranges.append((name, lo, hi))
+    return ranges
+
+
+def _compile_sql(
+    source: str,
+    columns: dict[str, Feature],
+    target_spec: Target,
+    drop_nulls: list[str] | None,
+    split_spec: Split | None,
+) -> tuple[str, list[str], str, list[tuple[str, int, int]]]:
+    """Compile a dataset spec into one SQL query.
+
+    Returns ``(sql, feature_names, target_name, fold_ranges)``. The query emits
+    one row per source row, with feature columns + ``_y`` + ``_bucket`` (in
+    ``[0, _N_BUCKETS)``). Standardisation, when requested, references a
+    ``stats`` CTE computed against the ``"train"`` fold only — never the full
+    dataset.
+    """
+    if not isinstance(source, str):
+        raise NotImplementedError("source must be a string URL/path in this sketch")
+    if not columns:
+        raise ValueError("at least one feature column is required")
+
+    from_clause = f"'{source}'"
+
+    if split_spec is not None:
+        ranges = _fold_ranges(split_spec.fractions)
+        bucket_expr = f"(hash(row_number() OVER () + {split_spec.seed}) % {_N_BUCKETS})"
+    else:
+        ranges = [("train", 0, _N_BUCKETS)]
+        bucket_expr = "0::BIGINT"
+
+    null_filter = (
+        " WHERE " + " AND ".join(f"{c} IS NOT NULL" for c in drop_nulls) if drop_nulls else ""
+    )
+    raw_sql = f"SELECT *, {bucket_expr} AS _bucket FROM {from_clause}{null_filter}"
+
+    needs_stats = any(f.standardize for f in columns.values())
+    if needs_stats:
+        train_range = next((r for r in ranges if r[0] == "train"), None)
+        if train_range is None:
+            raise ValueError(
+                "standardize=True requires a fold named 'train'; either rename "
+                "your training fold or compute statistics yourself in SQL"
+            )
+        _, train_lo, train_hi = train_range
+        is_train = f"_bucket >= {train_lo} AND _bucket < {train_hi}"
+        stats_cols: list[str] = []
+        for name, feat in columns.items():
+            if feat.standardize:
+                stats_cols.append(f"avg({feat.expr}) AS _{name}_mean")
+                stats_cols.append(f"stddev_pop({feat.expr}) AS _{name}_std")
+        stats_sql = f"SELECT {', '.join(stats_cols)} FROM raw WHERE {is_train}"
+        ctes = f"WITH raw AS ({raw_sql}), stats AS ({stats_sql})"
+        from_outer = "raw, stats"
+    else:
+        ctes = f"WITH raw AS ({raw_sql})"
+        from_outer = "raw"
+
+    select_items: list[str] = []
+    for name, feat in columns.items():
+        if feat.standardize:
+            expr = f"({feat.expr} - stats._{name}_mean) / stats._{name}_std"
+        else:
+            expr = feat.expr
+        select_items.append(f"CAST({expr} AS {_to_duckdb_dtype(feat.dtype)}) AS {name}")
+    select_items.append(f"CAST({target_spec.expr} AS {_to_duckdb_dtype(target_spec.dtype)}) AS _y")
+    select_items.append("CAST(_bucket AS BIGINT) AS _bucket")
+
+    sql = f"{ctes} SELECT {', '.join(select_items)} FROM {from_outer}"
+    return sql, list(columns.keys()), "_y", ranges
+
+
+# ── Public API ─────────────────────────────────────────────────────────────
+
+
+def dataset(
+    source: str,
+    *,
+    columns: dict[str, Feature],
+    target: Target,
+    drop_nulls: list[str] | None = None,
+    split: Split | None = None,
+    con: Connection | None = None,
+) -> Dataset:
+    """Load a remote / local table as a feature-engineered dataset.
+
+    ``source`` is a string passed straight into ``FROM '…'`` — URL, local path,
+    or anything DuckDB's auto-detection can read (CSV, Parquet, JSON, …).
+    """
+    sql, feature_names, target_name, ranges = _compile_sql(
+        source, columns, target, drop_nulls, split
+    )
+    own_connection = con is None
+    if own_connection:
+        con = connect()
+    try:
+        arrays = con.sql(sql).to_numpy()
+    finally:
+        if own_connection:
+            con.close()
+
+    bucket = arrays.pop("_bucket")
+    folds: dict[str, Fold] = {}
+    for name, lo, hi in ranges:
+        mask = (bucket >= lo) & (bucket < hi)
+        folds[name] = Fold(
+            feature_names,
+            target_name,
+            {k: v[mask] for k, v in arrays.items()},
+        )
+    return Dataset(folds=folds)
