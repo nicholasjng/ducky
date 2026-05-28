@@ -16,3 +16,7 @@ compile_commands.json
 __pycache__/
 *.egg-info/
 .venv/
+# Symlinks staged by CMakeLists.txt for out-of-tree extensions (httpfs etc.);
+# pointed into ext/duckdb/.
+/scripts/
+/.github/patches/
