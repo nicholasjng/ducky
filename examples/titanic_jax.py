@@ -58,9 +58,8 @@ def step(params, X, y, lr):
 
 def main() -> None:
     ds = load()
-    Xtr, ytr = ds.train.to_jax()
-    assert ds.val is not None
-    Xval, yval = ds.val.to_jax()
+    Xtr, ytr = ds["train"].to_jax()
+    Xval, yval = ds["val"].to_jax()
 
     key = jax.random.PRNGKey(0)
     params = (jax.random.normal(key, (Xtr.shape[1],)) * 0.01, jnp.zeros(()))
