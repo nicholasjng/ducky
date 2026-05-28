@@ -104,6 +104,7 @@ nanobind_add_module(
   _core
   NB_STATIC
   src/cpp/ducky.cpp
+  src/cpp/appender.cpp
   src/cpp/connection.cpp
   src/cpp/chunk.cpp
   src/cpp/function.cpp

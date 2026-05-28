@@ -47,6 +47,10 @@ class Connection {
         return handle_->connection;
     }
 
+    // Shared owner of the database + connection. Used by Appender so the
+    // database stays open for as long as the appender is alive.
+    std::shared_ptr<DuckDBHandle> handle() const { return handle_; }
+
     void close();
 
    private:

@@ -1,12 +1,14 @@
 #include "ducky.hpp"
 
 #include <nanobind/nanobind.h>
+#include <nanobind/stl/optional.h>
 #include <nanobind/stl/shared_ptr.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/vector.h>
 
 #include <atomic>
 
+#include "appender.hpp"
 #include "chunk.hpp"
 #include "connection.hpp"
 #include "duckdb.h"
@@ -173,6 +175,30 @@ NB_MODULE(_core, m) {
             },
             nb::sig("def __next__(self) -> tuple"));
 
+    nb::class_<Appender>(m, "Appender",
+                         "Bulk-insert handle for a target table. Supports a "
+                         "row-at-a-time API for mixed/typed writes and a "
+                         "columnar fast path for numeric/temporal ndarrays.")
+        .def_prop_ro("columns", &Appender::column_names, "Target column names.")
+        .def_prop_ro("types", &Appender::column_types, "Target column type names.")
+        .def("append_row", &Appender::append_row,
+             nb::sig("def append_row(self, *values: object) -> None"),
+             "Append one row of positional values, matching the target column order.")
+        .def("append_columns", &Appender::append_columns, "columns"_a, "masks"_a = nb::none(),
+             nb::sig("def append_columns(self, columns: dict[str, numpy.ndarray], "
+                     "masks: dict[str, numpy.ndarray] | None = None) -> None"),
+             "Append a batch of columns. Missing columns are filled with NULL. "
+             "`masks` maps column name -> 1-D bool/uint8 array (True = valid).")
+        .def("flush", &Appender::flush, "Flush pending rows to the table.")
+        .def("close", &Appender::close, "Flush and tear down the appender.")
+        .def(
+            "__enter__", [](Appender& self) -> Appender& { return self; }, nb::rv_policy::reference)
+        .def(
+            "__exit__", [](Appender& self, nb::object, nb::object, nb::object) { self.close(); },
+            "exc_type"_a.none(), "exc_value"_a.none(), "traceback"_a.none(),
+            nb::sig("def __exit__(self, exc_type: type[BaseException] | None, exc_value: "
+                    "BaseException | None, traceback: types.TracebackType | None) -> None"));
+
     nb::class_<Connection>(m, "Connection", "A connection to a DuckDB database.")
         .def("execute", &Connection::execute, "query"_a, "parameters"_a = nb::none(),
              nb::rv_policy::reference,
@@ -282,6 +308,18 @@ NB_MODULE(_core, m) {
             "dict of {name: type_string} (dict-style call). Inputs arrive as "
             "zero-copy 1-D ndarrays; `fn` must return one ndarray of length "
             "chunk_size and matching dtype.")
+        .def(
+            "appender",
+            [](Connection& self, const std::string& table, std::optional<std::string> schema,
+               std::optional<std::string> catalog) {
+                return new Appender(self, table, std::move(schema), std::move(catalog));
+            },
+            "table"_a, "schema"_a = nb::none(), "catalog"_a = nb::none(),
+            nb::sig("def appender(self, table: str, schema: str | None = None, "
+                    "catalog: str | None = None) -> Appender"),
+            "Open an Appender for bulk inserts into `table`. The appender shares "
+            "the connection's database handle, so the database stays open until "
+            "the appender is closed.")
         .def("close", &Connection::close, "Close the connection.")
         .def(
             "__enter__", [](Connection& self) -> Connection& { return self; },
