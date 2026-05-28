@@ -297,10 +297,22 @@ void Connection::ensure_open() const {
 duckdb_result Connection::run(const std::string& query, nb::object parameters) {
     ensure_open();
     duckdb_result result;
+    duckdb_connection con = handle_->connection;
 
     // Fast path: no parameters, run the query directly.
+    // We release the GIL across duckdb_query so DuckDB's parallel scheduler
+    // can run worker threads — in particular, so workers can call back into
+    // Python UDF trampolines (which re-acquire the GIL via nb::gil_scoped_acquire).
+    // Without this release, the main thread holds the GIL while spinning in
+    // Executor::ExecuteTask waiting for workers that themselves block on GIL acquisition,
+    // a deterministic deadlock whenever DuckDB schedules the UDF on a worker.
     if (parameters.is_none()) {
-        if (duckdb_query(handle_->connection, query.c_str(), &result) == DuckDBError) {
+        duckdb_state state;
+        {
+            nb::gil_scoped_release release;
+            state = duckdb_query(con, query.c_str(), &result);
+        }
+        if (state == DuckDBError) {
             std::string message = duckdb_result_error(&result);
             duckdb_destroy_result(&result);
             throw DuckyError(message);
@@ -308,9 +320,10 @@ duckdb_result Connection::run(const std::string& query, nb::object parameters) {
         return result;
     }
 
-    // Parameterized path: prepare, bind, execute.
+    // Parameterized path: prepare, bind, execute. Prepare and bind keep the GIL
+    // (they touch Python objects); only execute releases it.
     duckdb_prepared_statement stmt = nullptr;
-    if (duckdb_prepare(handle_->connection, query.c_str(), &stmt) == DuckDBError) {
+    if (duckdb_prepare(con, query.c_str(), &stmt) == DuckDBError) {
         std::string message = duckdb_prepare_error(stmt);
         duckdb_destroy_prepare(&stmt);
         throw DuckyError(message);
@@ -321,7 +334,11 @@ duckdb_result Connection::run(const std::string& query, nb::object parameters) {
         duckdb_destroy_prepare(&stmt);
         throw;
     }
-    duckdb_state state = duckdb_execute_prepared(stmt, &result);
+    duckdb_state state;
+    {
+        nb::gil_scoped_release release;
+        state = duckdb_execute_prepared(stmt, &result);
+    }
     duckdb_destroy_prepare(&stmt);
     if (state == DuckDBError) {
         std::string message = duckdb_result_error(&result);
