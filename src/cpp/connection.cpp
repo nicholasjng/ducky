@@ -22,24 +22,22 @@ void bind_parameters(duckdb_prepared_statement stmt, nb::handle parameters) {
         } else if (nb::isinstance<nb::float_>(value)) {
             state = duckdb_bind_double(stmt, param, nb::cast<double>(value));
         } else if (nb::isinstance<nb::str>(value)) {
-            state = duckdb_bind_varchar(stmt, param,
-                                        nb::cast<std::string>(value).c_str());
+            state = duckdb_bind_varchar(stmt, param, nb::cast<std::string>(value).c_str());
         } else {
             throw DuckyError("ducky: unsupported parameter type at position " +
                              std::to_string(param));
         }
         if (state == DuckDBError) {
-            throw DuckyError("ducky: failed to bind parameter " +
-                             std::to_string(param));
+            throw DuckyError("ducky: failed to bind parameter " + std::to_string(param));
         }
     }
 }
 
 }  // namespace
 
-Connection::Connection(const std::string &database) {
+Connection::Connection(const std::string& database) {
     auto handle = std::make_shared<DuckDBHandle>();
-    char *error = nullptr;
+    char* error = nullptr;
     if (duckdb_open_ext(database.c_str(), &handle->database, nullptr, &error) == DuckDBError) {
         std::string message = error ? error : "unknown error";
         duckdb_free(error);
@@ -65,7 +63,7 @@ void Connection::ensure_open() const {
     if (!handle_ || !handle_->connection) throw DuckyError("ducky: connection is closed");
 }
 
-duckdb_result Connection::run(const std::string &query, nb::object parameters) {
+duckdb_result Connection::run(const std::string& query, nb::object parameters) {
     ensure_open();
     duckdb_result result;
 
@@ -106,16 +104,16 @@ std::shared_ptr<Result> Connection::make_result(duckdb_result result) {
     return std::make_shared<Result>(result, handle_);
 }
 
-Connection &Connection::execute(const std::string &query, nb::object parameters) {
+Connection& Connection::execute(const std::string& query, nb::object parameters) {
     last_result_ = make_result(run(query, parameters));
     return *this;
 }
 
-std::shared_ptr<Result> Connection::sql(const std::string &query) {
+std::shared_ptr<Result> Connection::sql(const std::string& query) {
     return make_result(run(query, nb::none()));
 }
 
-Result &Connection::current() {
+Result& Connection::current() {
     if (!last_result_) throw DuckyError("ducky: no result set; call execute() first");
     return *last_result_;
 }

@@ -15,8 +15,8 @@ struct DuckDBHandle {
     duckdb_connection connection = nullptr;
 
     DuckDBHandle() = default;
-    DuckDBHandle(const DuckDBHandle &) = delete;
-    DuckDBHandle &operator=(const DuckDBHandle &) = delete;
+    DuckDBHandle(const DuckDBHandle&) = delete;
+    DuckDBHandle& operator=(const DuckDBHandle&) = delete;
 
     ~DuckDBHandle() {
         if (connection) duckdb_disconnect(&connection);

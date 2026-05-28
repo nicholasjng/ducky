@@ -14,8 +14,6 @@ def test_version_attrs():
 
 def test_scalar_select():
     con = ducky.connect()
-    # Note: a bare `3.5` literal is DECIMAL in DuckDB, which ducky does not
-    # decode yet, so cast to DOUBLE explicitly.
     rows = con.execute(
         "SELECT 42, 'hello', CAST(3.5 AS DOUBLE), TRUE, CAST(NULL AS INTEGER)"
     ).fetchall()
@@ -35,7 +33,9 @@ def test_description_and_columns():
     res = ducky.connect().sql("SELECT 1 AS a, 'x' AS b")
     assert res.columns == ["a", "b"]
     assert res.types == ["INTEGER", "VARCHAR"]
-    assert [d[0] for d in res.description] == ["a", "b"]
+    description = res.description
+    assert description is not None
+    assert [d[0] for d in description] == ["a", "b"]
 
 
 def test_positional_parameters():
@@ -94,9 +94,7 @@ def test_temporal_decoding():
     assert row[0] == datetime.date(2026, 5, 27)
     assert row[1] == datetime.time(13, 45, 30, 500000)
     assert row[2] == datetime.datetime(2026, 5, 27, 13, 45, 30, 123456)
-    assert row[3] == datetime.datetime(
-        2026, 5, 27, 13, 45, 30, tzinfo=datetime.timezone.utc
-    )
+    assert row[3] == datetime.datetime(2026, 5, 27, 13, 45, 30, tzinfo=datetime.UTC)
 
 
 def test_blob_and_uuid_decoding():
@@ -180,9 +178,7 @@ def test_list_decoding():
 
 def test_struct_and_map_decoding():
     con = ducky.connect()
-    (row,) = con.execute(
-        "SELECT {'a': 1, 'b': 'x'}, MAP {'k1': 10, 'k2': 20}"
-    ).fetchall()
+    (row,) = con.execute("SELECT {'a': 1, 'b': 'x'}, MAP {'k1': 10, 'k2': 20}").fetchall()
     assert row[0] == {"a": 1, "b": "x"}
     assert row[1] == {"k1": 10, "k2": 20}
 

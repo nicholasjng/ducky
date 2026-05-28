@@ -7,6 +7,7 @@
 #include <cstdlib>
 
 #include "arrow_abi.h"
+#include "chunk.hpp"
 #include "ducky.hpp"
 
 using namespace nb::literals;
@@ -14,58 +15,89 @@ using namespace nb::literals;
 namespace {
 
 // Maps the DuckDB types we decode to their canonical SQL names.
-const char *type_name(duckdb_type type) {
+const char* type_name(duckdb_type type) {
     switch (type) {
-        case DUCKDB_TYPE_BOOLEAN: return "BOOLEAN";
-        case DUCKDB_TYPE_TINYINT: return "TINYINT";
-        case DUCKDB_TYPE_SMALLINT: return "SMALLINT";
-        case DUCKDB_TYPE_INTEGER: return "INTEGER";
-        case DUCKDB_TYPE_BIGINT: return "BIGINT";
-        case DUCKDB_TYPE_UTINYINT: return "UTINYINT";
-        case DUCKDB_TYPE_USMALLINT: return "USMALLINT";
-        case DUCKDB_TYPE_UINTEGER: return "UINTEGER";
-        case DUCKDB_TYPE_UBIGINT: return "UBIGINT";
-        case DUCKDB_TYPE_HUGEINT: return "HUGEINT";
-        case DUCKDB_TYPE_UHUGEINT: return "UHUGEINT";
-        case DUCKDB_TYPE_FLOAT: return "FLOAT";
-        case DUCKDB_TYPE_DOUBLE: return "DOUBLE";
-        case DUCKDB_TYPE_DECIMAL: return "DECIMAL";
-        case DUCKDB_TYPE_VARCHAR: return "VARCHAR";
-        case DUCKDB_TYPE_BLOB: return "BLOB";
-        case DUCKDB_TYPE_DATE: return "DATE";
-        case DUCKDB_TYPE_TIME: return "TIME";
-        case DUCKDB_TYPE_TIMESTAMP: return "TIMESTAMP";
-        case DUCKDB_TYPE_TIMESTAMP_S: return "TIMESTAMP_S";
-        case DUCKDB_TYPE_TIMESTAMP_MS: return "TIMESTAMP_MS";
-        case DUCKDB_TYPE_TIMESTAMP_NS: return "TIMESTAMP_NS";
-        case DUCKDB_TYPE_TIMESTAMP_TZ: return "TIMESTAMP_TZ";
-        case DUCKDB_TYPE_UUID: return "UUID";
-        case DUCKDB_TYPE_INTERVAL: return "INTERVAL";
-        case DUCKDB_TYPE_ENUM: return "ENUM";
-        case DUCKDB_TYPE_LIST: return "LIST";
-        case DUCKDB_TYPE_STRUCT: return "STRUCT";
-        case DUCKDB_TYPE_MAP: return "MAP";
-        case DUCKDB_TYPE_ARRAY: return "ARRAY";
-        default: return "UNKNOWN";
+        case DUCKDB_TYPE_BOOLEAN:
+            return "BOOLEAN";
+        case DUCKDB_TYPE_TINYINT:
+            return "TINYINT";
+        case DUCKDB_TYPE_SMALLINT:
+            return "SMALLINT";
+        case DUCKDB_TYPE_INTEGER:
+            return "INTEGER";
+        case DUCKDB_TYPE_BIGINT:
+            return "BIGINT";
+        case DUCKDB_TYPE_UTINYINT:
+            return "UTINYINT";
+        case DUCKDB_TYPE_USMALLINT:
+            return "USMALLINT";
+        case DUCKDB_TYPE_UINTEGER:
+            return "UINTEGER";
+        case DUCKDB_TYPE_UBIGINT:
+            return "UBIGINT";
+        case DUCKDB_TYPE_HUGEINT:
+            return "HUGEINT";
+        case DUCKDB_TYPE_UHUGEINT:
+            return "UHUGEINT";
+        case DUCKDB_TYPE_FLOAT:
+            return "FLOAT";
+        case DUCKDB_TYPE_DOUBLE:
+            return "DOUBLE";
+        case DUCKDB_TYPE_DECIMAL:
+            return "DECIMAL";
+        case DUCKDB_TYPE_VARCHAR:
+            return "VARCHAR";
+        case DUCKDB_TYPE_BLOB:
+            return "BLOB";
+        case DUCKDB_TYPE_DATE:
+            return "DATE";
+        case DUCKDB_TYPE_TIME:
+            return "TIME";
+        case DUCKDB_TYPE_TIMESTAMP:
+            return "TIMESTAMP";
+        case DUCKDB_TYPE_TIMESTAMP_S:
+            return "TIMESTAMP_S";
+        case DUCKDB_TYPE_TIMESTAMP_MS:
+            return "TIMESTAMP_MS";
+        case DUCKDB_TYPE_TIMESTAMP_NS:
+            return "TIMESTAMP_NS";
+        case DUCKDB_TYPE_TIMESTAMP_TZ:
+            return "TIMESTAMP_TZ";
+        case DUCKDB_TYPE_UUID:
+            return "UUID";
+        case DUCKDB_TYPE_INTERVAL:
+            return "INTERVAL";
+        case DUCKDB_TYPE_ENUM:
+            return "ENUM";
+        case DUCKDB_TYPE_LIST:
+            return "LIST";
+        case DUCKDB_TYPE_STRUCT:
+            return "STRUCT";
+        case DUCKDB_TYPE_MAP:
+            return "MAP";
+        case DUCKDB_TYPE_ARRAY:
+            return "ARRAY";
+        default:
+            return "UNKNOWN";
     }
 }
 
 // Python constructors we convert into, imported once and intentionally leaked so
 // their destructors never run after interpreter shutdown.
 struct PyTypes {
-    nb::object date;          // datetime.date
-    nb::object time;          // datetime.time
-    nb::object datetime;      // datetime.datetime
-    nb::object timedelta;     // datetime.timedelta
-    nb::object timezone_utc;  // datetime.timezone.utc
-    nb::object decimal;       // decimal.Decimal
-    nb::object decimal_ctx;   // decimal.Context(prec=40), enough for DECIMAL(38)
-    nb::object uuid;          // uuid.UUID
+    nb::type_object date;       // datetime.date
+    nb::type_object time;       // datetime.time
+    nb::type_object datetime;   // datetime.datetime
+    nb::type_object timedelta;  // datetime.timedelta
+    nb::object timezone_utc;    // datetime.timezone.utc — an instance, not a type
+    nb::type_object decimal;    // decimal.Decimal
+    nb::object decimal_ctx;     // decimal.Context(prec=40) — an instance
+    nb::type_object uuid;       // uuid.UUID
 };
 
-const PyTypes &py_types() {
-    static const PyTypes *types = [] {
-        auto *t = new PyTypes();
+const PyTypes& py_types() {
+    static const PyTypes* types = [] {
+        auto* t = new PyTypes();
         nb::module_ datetime = nb::module_::import_("datetime");
         t->date = datetime.attr("date");
         t->time = datetime.attr("time");
@@ -81,7 +113,7 @@ const PyTypes &py_types() {
     return *types;
 }
 
-nb::object steal_checked(PyObject *obj) {
+nb::object steal_checked(PyObject* obj) {
     if (!obj) throw nb::python_error();
     return nb::steal(obj);
 }
@@ -119,9 +151,8 @@ nb::object timestamp_to_py(int64_t micros, bool utc) {
     duckdb_timestamp ts{micros};
     duckdb_timestamp_struct s = duckdb_from_timestamp(ts);
     if (utc) {
-        return py_types().datetime(s.date.year, s.date.month, s.date.day, s.time.hour,
-                                   s.time.min, s.time.sec, s.time.micros,
-                                   py_types().timezone_utc);
+        return py_types().datetime(s.date.year, s.date.month, s.date.day, s.time.hour, s.time.min,
+                                   s.time.sec, s.time.micros, py_types().timezone_utc);
     }
     return py_types().datetime(s.date.year, s.date.month, s.date.day, s.time.hour, s.time.min,
                                s.time.sec, s.time.micros);
@@ -135,21 +166,27 @@ nb::object uuid_to_py(duckdb_hugeint value) {
     return py_types().uuid("int"_a = as_int);
 }
 
-nb::object decimal_to_py(void *data, idx_t row, duckdb_type internal, uint8_t scale) {
+nb::object decimal_to_py(void* data, idx_t row, duckdb_type internal, uint8_t scale) {
     nb::object unscaled;
     switch (internal) {
-        case DUCKDB_TYPE_SMALLINT: unscaled = nb::int_(((int16_t *)data)[row]); break;
-        case DUCKDB_TYPE_INTEGER: unscaled = nb::int_(((int32_t *)data)[row]); break;
-        case DUCKDB_TYPE_BIGINT: unscaled = nb::int_(((int64_t *)data)[row]); break;
-        case DUCKDB_TYPE_HUGEINT:
-            unscaled = hugeint_to_py(((duckdb_hugeint *)data)[row]);
+        case DUCKDB_TYPE_SMALLINT:
+            unscaled = nb::int_(((int16_t*)data)[row]);
             break;
-        default: throw DuckyError("ducky: unexpected DECIMAL storage type");
+        case DUCKDB_TYPE_INTEGER:
+            unscaled = nb::int_(((int32_t*)data)[row]);
+            break;
+        case DUCKDB_TYPE_BIGINT:
+            unscaled = nb::int_(((int64_t*)data)[row]);
+            break;
+        case DUCKDB_TYPE_HUGEINT:
+            unscaled = hugeint_to_py(((duckdb_hugeint*)data)[row]);
+            break;
+        default:
+            throw DuckyError("ducky: unexpected DECIMAL storage type");
     }
     // Decimal(unscaled).scaleb(-scale) shifts the decimal point exactly (the
     // wide context avoids any rounding).
-    return py_types().decimal(unscaled).attr("scaleb")(-(int)scale,
-                                                       py_types().decimal_ctx);
+    return py_types().decimal(unscaled).attr("scaleb")(-(int)scale, py_types().decimal_ctx);
 }
 
 nb::object interval_to_py(duckdb_interval value) {
@@ -159,12 +196,16 @@ nb::object interval_to_py(duckdb_interval value) {
     return py_types().timedelta(days, 0, value.micros);  // (days, seconds, microseconds)
 }
 
-idx_t enum_index(void *data, idx_t row, duckdb_type internal) {
+idx_t enum_index(void* data, idx_t row, duckdb_type internal) {
     switch (internal) {
-        case DUCKDB_TYPE_UTINYINT: return ((uint8_t *)data)[row];
-        case DUCKDB_TYPE_USMALLINT: return ((uint16_t *)data)[row];
-        case DUCKDB_TYPE_UINTEGER: return ((uint32_t *)data)[row];
-        default: return 0;
+        case DUCKDB_TYPE_UTINYINT:
+            return ((uint8_t*)data)[row];
+        case DUCKDB_TYPE_USMALLINT:
+            return ((uint16_t*)data)[row];
+        case DUCKDB_TYPE_UINTEGER:
+            return ((uint32_t*)data)[row];
+        default:
+            return 0;
     }
 }
 
@@ -174,56 +215,75 @@ idx_t enum_index(void *data, idx_t row, duckdb_type internal) {
 // the Result's cached types, so the hot path never allocates a logical type per
 // cell. Nested children fetch their own type once per cell and free it.
 nb::object convert_value(duckdb_vector vector, duckdb_logical_type logical, idx_t row) {
-    uint64_t *validity = duckdb_vector_get_validity(vector);
+    uint64_t* validity = duckdb_vector_get_validity(vector);
     if (validity && !duckdb_validity_row_is_valid(validity, row)) return nb::none();
 
-    void *data = duckdb_vector_get_data(vector);
+    void* data = duckdb_vector_get_data(vector);
     switch (duckdb_get_type_id(logical)) {
-        case DUCKDB_TYPE_BOOLEAN: return nb::cast(((bool *)data)[row]);
-        case DUCKDB_TYPE_TINYINT: return nb::cast(((int8_t *)data)[row]);
-        case DUCKDB_TYPE_SMALLINT: return nb::cast(((int16_t *)data)[row]);
-        case DUCKDB_TYPE_INTEGER: return nb::cast(((int32_t *)data)[row]);
-        case DUCKDB_TYPE_BIGINT: return nb::cast(((int64_t *)data)[row]);
-        case DUCKDB_TYPE_UTINYINT: return nb::cast(((uint8_t *)data)[row]);
-        case DUCKDB_TYPE_USMALLINT: return nb::cast(((uint16_t *)data)[row]);
-        case DUCKDB_TYPE_UINTEGER: return nb::cast(((uint32_t *)data)[row]);
-        case DUCKDB_TYPE_UBIGINT: return nb::cast(((uint64_t *)data)[row]);
-        case DUCKDB_TYPE_HUGEINT: return hugeint_to_py(((duckdb_hugeint *)data)[row]);
-        case DUCKDB_TYPE_UHUGEINT: return uhugeint_to_py(((duckdb_uhugeint *)data)[row]);
-        case DUCKDB_TYPE_FLOAT: return nb::cast(((float *)data)[row]);
-        case DUCKDB_TYPE_DOUBLE: return nb::cast(((double *)data)[row]);
+        case DUCKDB_TYPE_BOOLEAN:
+            return nb::cast(((bool*)data)[row]);
+        case DUCKDB_TYPE_TINYINT:
+            return nb::cast(((int8_t*)data)[row]);
+        case DUCKDB_TYPE_SMALLINT:
+            return nb::cast(((int16_t*)data)[row]);
+        case DUCKDB_TYPE_INTEGER:
+            return nb::cast(((int32_t*)data)[row]);
+        case DUCKDB_TYPE_BIGINT:
+            return nb::cast(((int64_t*)data)[row]);
+        case DUCKDB_TYPE_UTINYINT:
+            return nb::cast(((uint8_t*)data)[row]);
+        case DUCKDB_TYPE_USMALLINT:
+            return nb::cast(((uint16_t*)data)[row]);
+        case DUCKDB_TYPE_UINTEGER:
+            return nb::cast(((uint32_t*)data)[row]);
+        case DUCKDB_TYPE_UBIGINT:
+            return nb::cast(((uint64_t*)data)[row]);
+        case DUCKDB_TYPE_HUGEINT:
+            return hugeint_to_py(((duckdb_hugeint*)data)[row]);
+        case DUCKDB_TYPE_UHUGEINT:
+            return uhugeint_to_py(((duckdb_uhugeint*)data)[row]);
+        case DUCKDB_TYPE_FLOAT:
+            return nb::cast(((float*)data)[row]);
+        case DUCKDB_TYPE_DOUBLE:
+            return nb::cast(((double*)data)[row]);
         case DUCKDB_TYPE_DECIMAL:
             return decimal_to_py(data, row, duckdb_decimal_internal_type(logical),
                                  duckdb_decimal_scale(logical));
         case DUCKDB_TYPE_VARCHAR: {
-            auto *s = (duckdb_string_t *)data;
+            auto* s = (duckdb_string_t*)data;
             return nb::str(duckdb_string_t_data(&s[row]), duckdb_string_t_length(s[row]));
         }
         case DUCKDB_TYPE_BLOB: {
-            auto *s = (duckdb_string_t *)data;
+            auto* s = (duckdb_string_t*)data;
             return nb::bytes(duckdb_string_t_data(&s[row]), duckdb_string_t_length(s[row]));
         }
-        case DUCKDB_TYPE_DATE: return date_to_py(((int32_t *)data)[row]);
-        case DUCKDB_TYPE_TIME: return time_to_py(((int64_t *)data)[row]);
-        case DUCKDB_TYPE_TIMESTAMP: return timestamp_to_py(((int64_t *)data)[row], false);
-        case DUCKDB_TYPE_TIMESTAMP_TZ: return timestamp_to_py(((int64_t *)data)[row], true);
+        case DUCKDB_TYPE_DATE:
+            return date_to_py(((int32_t*)data)[row]);
+        case DUCKDB_TYPE_TIME:
+            return time_to_py(((int64_t*)data)[row]);
+        case DUCKDB_TYPE_TIMESTAMP:
+            return timestamp_to_py(((int64_t*)data)[row], false);
+        case DUCKDB_TYPE_TIMESTAMP_TZ:
+            return timestamp_to_py(((int64_t*)data)[row], true);
         case DUCKDB_TYPE_TIMESTAMP_S:
-            return timestamp_to_py(((int64_t *)data)[row] * 1000000, false);
+            return timestamp_to_py(((int64_t*)data)[row] * 1000000, false);
         case DUCKDB_TYPE_TIMESTAMP_MS:
-            return timestamp_to_py(((int64_t *)data)[row] * 1000, false);
+            return timestamp_to_py(((int64_t*)data)[row] * 1000, false);
         case DUCKDB_TYPE_TIMESTAMP_NS:
-            return timestamp_to_py(((int64_t *)data)[row] / 1000, false);
-        case DUCKDB_TYPE_UUID: return uuid_to_py(((duckdb_hugeint *)data)[row]);
-        case DUCKDB_TYPE_INTERVAL: return interval_to_py(((duckdb_interval *)data)[row]);
+            return timestamp_to_py(((int64_t*)data)[row] / 1000, false);
+        case DUCKDB_TYPE_UUID:
+            return uuid_to_py(((duckdb_hugeint*)data)[row]);
+        case DUCKDB_TYPE_INTERVAL:
+            return interval_to_py(((duckdb_interval*)data)[row]);
         case DUCKDB_TYPE_ENUM: {
             idx_t index = enum_index(data, row, duckdb_enum_internal_type(logical));
-            char *value = duckdb_enum_dictionary_value(logical, index);
+            char* value = duckdb_enum_dictionary_value(logical, index);
             nb::str out(value);
             duckdb_free(value);
             return out;
         }
         case DUCKDB_TYPE_LIST: {
-            duckdb_list_entry entry = ((duckdb_list_entry *)data)[row];
+            duckdb_list_entry entry = ((duckdb_list_entry*)data)[row];
             duckdb_vector child = duckdb_list_vector_get_child(vector);
             duckdb_logical_type child_type = duckdb_vector_get_column_type(child);
             nb::list items;
@@ -248,7 +308,7 @@ nb::object convert_value(duckdb_vector vector, duckdb_logical_type logical, idx_
             idx_t n = duckdb_struct_type_child_count(logical);
             nb::dict fields;
             for (idx_t c = 0; c < n; ++c) {
-                char *name = duckdb_struct_type_child_name(logical, c);
+                char* name = duckdb_struct_type_child_name(logical, c);
                 duckdb_vector child = duckdb_struct_vector_get_child(vector, c);
                 duckdb_logical_type child_type = duckdb_vector_get_column_type(child);
                 fields[nb::str(name)] = convert_value(child, child_type, row);
@@ -259,7 +319,7 @@ nb::object convert_value(duckdb_vector vector, duckdb_logical_type logical, idx_
         }
         case DUCKDB_TYPE_MAP: {
             // Physical layout: LIST(STRUCT(key, value)).
-            duckdb_list_entry entry = ((duckdb_list_entry *)data)[row];
+            duckdb_list_entry entry = ((duckdb_list_entry*)data)[row];
             duckdb_vector pairs = duckdb_list_vector_get_child(vector);
             duckdb_vector keys = duckdb_struct_vector_get_child(pairs, 0);
             duckdb_vector values = duckdb_struct_vector_get_child(pairs, 1);
@@ -285,15 +345,15 @@ nb::object convert_value(duckdb_vector vector, duckdb_logical_type logical, idx_
 // and exporting each via the DuckDB Arrow C API. `owner` keeps the Python
 // Result alive for as long as the stream exists.
 struct ArrowStreamState {
-    nb::object owner;        // keeps the Result (and its DuckDBHandle) alive
-    duckdb_result *result;   // borrowed from owner
+    nb::object owner;              // keeps the Result (and its DuckDBHandle) alive
+    duckdb_result* result;         // borrowed from owner
     duckdb_arrow_options options;  // owned by the stream, destroyed on release
     std::string last_error;
 };
 
 // Records an error from a duckdb_error_data (if any) and destroys it. Returns
 // true when an error was present.
-bool consume_error(ArrowStreamState *state, duckdb_error_data error) {
+bool consume_error(ArrowStreamState* state, duckdb_error_data error) {
     if (!error) return false;
     bool has_error = duckdb_error_data_has_error(error);
     if (has_error) state->last_error = duckdb_error_data_message(error);
@@ -301,11 +361,11 @@ bool consume_error(ArrowStreamState *state, duckdb_error_data error) {
     return has_error;
 }
 
-int stream_get_schema(ArrowArrayStream *stream, ArrowSchema *out) {
-    auto *state = (ArrowStreamState *)stream->private_data;
+int stream_get_schema(ArrowArrayStream* stream, ArrowSchema* out) {
+    auto* state = (ArrowStreamState*)stream->private_data;
     idx_t n = duckdb_column_count(state->result);
     std::vector<duckdb_logical_type> types(n);
-    std::vector<const char *> names(n);
+    std::vector<const char*> names(n);
     for (idx_t i = 0; i < n; ++i) {
         types[i] = duckdb_column_logical_type(state->result, i);
         names[i] = duckdb_column_name(state->result, i);
@@ -316,8 +376,8 @@ int stream_get_schema(ArrowArrayStream *stream, ArrowSchema *out) {
     return consume_error(state, error) ? EIO : 0;
 }
 
-int stream_get_next(ArrowArrayStream *stream, ArrowArray *out) {
-    auto *state = (ArrowStreamState *)stream->private_data;
+int stream_get_next(ArrowArrayStream* stream, ArrowArray* out) {
+    auto* state = (ArrowStreamState*)stream->private_data;
     out->release = nullptr;  // Arrow signals end-of-stream with a released array.
     duckdb_data_chunk chunk = duckdb_fetch_chunk(*state->result);
     if (!chunk) return 0;  // exhausted
@@ -326,13 +386,13 @@ int stream_get_next(ArrowArrayStream *stream, ArrowArray *out) {
     return consume_error(state, error) ? EIO : 0;
 }
 
-const char *stream_get_last_error(ArrowArrayStream *stream) {
-    auto *state = (ArrowStreamState *)stream->private_data;
+const char* stream_get_last_error(ArrowArrayStream* stream) {
+    auto* state = (ArrowStreamState*)stream->private_data;
     return state->last_error.empty() ? nullptr : state->last_error.c_str();
 }
 
-void stream_release(ArrowArrayStream *stream) {
-    auto *state = (ArrowStreamState *)stream->private_data;
+void stream_release(ArrowArrayStream* stream) {
+    auto* state = (ArrowStreamState*)stream->private_data;
     if (state) {
         if (state->options) duckdb_destroy_arrow_options(&state->options);
         nb::gil_scoped_acquire gil;  // drop the owner reference under the GIL
@@ -342,8 +402,8 @@ void stream_release(ArrowArrayStream *stream) {
     stream->release = nullptr;
 }
 
-void stream_capsule_destructor(PyObject *capsule) {
-    auto *stream = (ArrowArrayStream *)PyCapsule_GetPointer(capsule, "arrow_array_stream");
+void stream_capsule_destructor(PyObject* capsule) {
+    auto* stream = (ArrowArrayStream*)PyCapsule_GetPointer(capsule, "arrow_array_stream");
     if (stream) {
         if (stream->release) stream->release(stream);
         free(stream);
@@ -361,16 +421,16 @@ nb::object Result::arrow_c_stream(nb::object self) {
     duckdb_arrow_options options = nullptr;
     duckdb_connection_get_arrow_options(handle_->connection, &options);
 
-    auto *stream = (ArrowArrayStream *)calloc(1, sizeof(ArrowArrayStream));
+    auto* stream = (ArrowArrayStream*)calloc(1, sizeof(ArrowArrayStream));
     if (!stream) throw std::bad_alloc();
-    auto *state = new ArrowStreamState{self, &result_, options, std::string()};
+    auto* state = new ArrowStreamState{self, &result_, options, std::string()};
     stream->get_schema = stream_get_schema;
     stream->get_next = stream_get_next;
     stream->get_last_error = stream_get_last_error;
     stream->release = stream_release;
     stream->private_data = state;
 
-    PyObject *capsule = PyCapsule_New(stream, "arrow_array_stream", stream_capsule_destructor);
+    PyObject* capsule = PyCapsule_New(stream, "arrow_array_stream", stream_capsule_destructor);
     if (!capsule) {
         stream_release(stream);
         free(stream);
@@ -395,7 +455,7 @@ Result::Result(duckdb_result result, std::shared_ptr<DuckDBHandle> handle)
 
 Result::~Result() {
     release_chunk();
-    for (duckdb_logical_type &logical : column_types_) {
+    for (duckdb_logical_type& logical : column_types_) {
         if (logical) duckdb_destroy_logical_type(&logical);
     }
     duckdb_destroy_result(&result_);
@@ -451,7 +511,7 @@ bool Result::ensure_row() {
 
 nb::object Result::build_row() {
     idx_t row = cursor_++;
-    PyObject *tuple = PyTuple_New((Py_ssize_t)column_count_);
+    PyObject* tuple = PyTuple_New((Py_ssize_t)column_count_);
     if (!tuple) throw nb::python_error();
     for (idx_t c = 0; c < column_count_; ++c) {
         nb::object value = convert_value(vectors_[c], column_types_[c], row);
@@ -475,4 +535,10 @@ nb::list Result::fetchall() {
     nb::list out;
     while (ensure_row()) out.append(build_row());
     return out;
+}
+
+nb::object Result::fetch_chunk() {
+    duckdb_data_chunk chunk = duckdb_fetch_chunk(result_);
+    if (!chunk) return nb::none();
+    return nb::cast(new Chunk(chunk, names_, handle_));
 }

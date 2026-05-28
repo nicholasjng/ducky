@@ -16,20 +16,20 @@ namespace nb = nanobind;
 // its own database, so connecting to ":memory:" yields an isolated in-memory
 // database, matching duckdb.connect() semantics.
 class Connection {
-public:
-    explicit Connection(const std::string &database);
+   public:
+    explicit Connection(const std::string& database);
     ~Connection();
 
-    Connection(const Connection &) = delete;
-    Connection &operator=(const Connection &) = delete;
+    Connection(const Connection&) = delete;
+    Connection& operator=(const Connection&) = delete;
 
     // Runs a query (optionally with positional parameters) and stashes the
     // result for the PEP 249-style fetch* methods. Returns *this so callers can
     // chain, e.g. con.execute(...).fetchall().
-    Connection &execute(const std::string &query, nb::object parameters);
+    Connection& execute(const std::string& query, nb::object parameters);
 
     // Eagerly runs a query and hands back its Result directly.
-    std::shared_ptr<Result> sql(const std::string &query);
+    std::shared_ptr<Result> sql(const std::string& query);
 
     nb::object fetchone();
     nb::list fetchmany(int64_t size);
@@ -40,12 +40,19 @@ public:
     // The last result produced by execute(), for the DataFrame/Arrow accessors.
     std::shared_ptr<Result> current_result();
 
+    // Raw C-API connection handle, valid until close(). Used by UDF
+    // registration in function.cpp; not exposed to Python.
+    duckdb_connection raw_connection() {
+        ensure_open();
+        return handle_->connection;
+    }
+
     void close();
 
-private:
+   private:
     void ensure_open() const;
-    Result &current();
-    duckdb_result run(const std::string &query, nb::object parameters);
+    Result& current();
+    duckdb_result run(const std::string& query, nb::object parameters);
     // Wraps a result, sharing ownership of the database/connection handle so the
     // result (and any Arrow stream from it) stays usable after this Connection
     // is closed or dropped.

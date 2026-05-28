@@ -45,25 +45,28 @@ def arrow(source: _ArrowSource) -> pyarrow.Table:
     return pa.table(source)
 
 
-def df(source: Any) -> Any:
+def df(source: _ArrowSource) -> pd.DataFrame:
     """Return the result as a ``pandas.DataFrame`` (via Arrow)."""
     return arrow(source).to_pandas()
 
 
-def pl(source: Any, lazy: bool = False) -> Any:
+def pl(source: _ArrowSource, lazy: bool = False) -> polars.DataFrame | polars.LazyFrame:
     """Return the result as a polars ``DataFrame`` (or ``LazyFrame`` if ``lazy``)."""
     import polars
 
+    # `polars.from_arrow` is typed `DataFrame | Series`, but an Arrow stream
+    # always produces a multi-column DataFrame here.
     frame = polars.from_arrow(source)
+    assert isinstance(frame, polars.DataFrame)
     return frame.lazy() if lazy else frame
 
 
-def fetchnumpy(source: Any) -> dict[str, Any]:
+def fetchnumpy(source: _ArrowSource) -> dict[str, np.ndarray]:
     """Return the result as a dict of column name -> ``numpy`` array."""
     table = arrow(source)
     return {
         name: column.to_numpy(zero_copy_only=False)
-        for name, column in zip(table.column_names, table.columns)
+        for name, column in zip(table.column_names, table.columns, strict=True)
     }
 
 

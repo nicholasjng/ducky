@@ -19,17 +19,17 @@ namespace nb = nanobind;
 // We keep the current chunk plus a cursor into it, so fetchone/fetchmany stream
 // without materializing the whole result up front.
 class Result {
-public:
+   public:
     // `handle` is the shared database/connection owner; the Result keeps it
     // alive so that fetching and Arrow export keep working even after the
     // originating Connection is dropped.
     Result(duckdb_result result, std::shared_ptr<DuckDBHandle> handle);
     ~Result();
 
-    Result(const Result &) = delete;
-    Result &operator=(const Result &) = delete;
+    Result(const Result&) = delete;
+    Result& operator=(const Result&) = delete;
 
-    const std::vector<std::string> &column_names() const { return names_; }
+    const std::vector<std::string>& column_names() const { return names_; }
     std::vector<std::string> column_types() const;
     // PEP 249 Cursor.description: one 7-tuple per column, or None when the
     // statement produced no result set.
@@ -40,12 +40,17 @@ public:
     nb::list fetchmany(int64_t size);
     nb::list fetchall();
 
+    // Pulls the next data chunk and returns it as a `Chunk` Python object, or
+    // None when the result is exhausted. Each call advances the same underlying
+    // cursor as fetch*/arrow_c_stream — don't mix them on one result.
+    nb::object fetch_chunk();
+
     // Arrow PyCapsule interface: exports the remaining result as an Arrow C
     // stream. `self` is the owning Python object, kept alive for the stream's
     // lifetime. Consumes the result (mutually exclusive with the fetch* path).
     nb::object arrow_c_stream(nb::object self);
 
-private:
+   private:
     // Ensures a row is available at the cursor, advancing to the next chunk as
     // needed. Returns false once the result is fully consumed.
     bool ensure_row();
