@@ -1,15 +1,14 @@
-"""End-to-end demo: train a Titanic survival classifier in JAX, with all the
-feature engineering and the train/val split running inside DuckDB.
+"""End-to-end demo: train a Titanic survival classifier in JAX.
 
 Run with:
 
     uv run --group dev python examples/titanic_jax.py
 
 What this shows:
-  1. Reading a remote CSV directly into the query engine (httpfs).
-  2. Doing the feature engineering in SQL (encoding, null filtering, splitting,
-     standardisation against the train-set statistics).
-  3. Zero-copy hand-off into JAX via Result.to_jax().
+  1. Reading a remote CSV directly into DuckDB (httpfs).
+  2. The high-level ``ducky.dataset`` API — column-to-feature mapping, dtype,
+     standardisation (with train-fold-only stats), and split — declared once.
+  3. Zero-copy hand-off into JAX via ``Fold.to_jax()``.
   4. A tiny logistic-regression training loop in plain JAX.
 """
 
@@ -22,53 +21,22 @@ import ducky
 
 URL = "https://web.stanford.edu/class/archive/cs/cs109/cs109.1166/stuff/titanic.csv"
 
-# Stable 80/20 split: hash the row position into one of 10 buckets and reserve
-# buckets {0, 1} for validation. Deterministic across runs; no leakage between
-# train and val statistics because we only standardise against the train set.
-FEATURE_SQL = """
-WITH raw AS (
-    SELECT
-        Pclass,
-        Sex,
-        Age,
-        "Siblings/Spouses Aboard" AS sibsp,
-        "Parents/Children Aboard" AS parch,
-        Fare,
-        Survived,
-        (hash(row_number() OVER ()) % 10) AS bucket
-    FROM read_csv_auto($url)
-    WHERE Age IS NOT NULL
-),
-stats AS (
-    SELECT
-        avg(Age)        AS age_mean,
-        stddev_pop(Age) AS age_std,
-        avg(Fare)        AS fare_mean,
-        stddev_pop(Fare) AS fare_std
-    FROM raw WHERE bucket >= 2
-)
-SELECT
-    CAST(Pclass AS DOUBLE)                                  AS pclass,
-    CAST(CASE WHEN Sex = 'male' THEN 1.0 ELSE 0.0 END
-         AS DOUBLE)                                          AS sex_male,
-    CAST((Age  - stats.age_mean)  / stats.age_std  AS DOUBLE) AS age_z,
-    CAST(sibsp AS DOUBLE)                                    AS sibsp,
-    CAST(parch AS DOUBLE)                                    AS parch,
-    CAST((Fare - stats.fare_mean) / stats.fare_std AS DOUBLE) AS fare_z,
-    CAST(Survived AS DOUBLE)                                  AS y,
-    CAST(bucket AS BIGINT)                                    AS bucket
-FROM raw, stats
-"""
 
-
-def load() -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
-    con = ducky.connect()
-    cols = con.execute(FEATURE_SQL, [URL]).to_jax()
-    feature_keys = ["pclass", "sex_male", "age_z", "sibsp", "parch", "fare_z"]
-    X = jnp.stack([cols[k] for k in feature_keys], axis=1)
-    y = cols["y"]
-    is_val = cols["bucket"] < 2  # ~20% of rows
-    return X[~is_val], y[~is_val], X[is_val], y[is_val]
+def load() -> ducky.Dataset:
+    return ducky.dataset(
+        URL,
+        columns={
+            "pclass": ducky.feature("Pclass"),
+            "sex_male": ducky.feature("Sex = 'male'"),
+            "age": ducky.feature("Age", standardize=True),
+            "sibsp": ducky.feature('"Siblings/Spouses Aboard"'),
+            "parch": ducky.feature('"Parents/Children Aboard"'),
+            "fare": ducky.feature("Fare", standardize=True),
+        },
+        target=ducky.target("Survived"),
+        drop_nulls=["Age"],
+        split=ducky.split(0.8, seed=0),
+    )
 
 
 def model(params: tuple[jax.Array, jax.Array], X: jax.Array) -> jax.Array:
@@ -89,8 +57,10 @@ def step(params, X, y, lr):
 
 
 def main() -> None:
-    Xtr, ytr, Xval, yval = load()
-    print(f"train: {Xtr.shape}, val: {Xval.shape}")
+    ds = load()
+    Xtr, ytr = ds.train.to_jax()
+    assert ds.val is not None
+    Xval, yval = ds.val.to_jax()
 
     key = jax.random.PRNGKey(0)
     params = (jax.random.normal(key, (Xtr.shape[1],)) * 0.01, jnp.zeros(()))
@@ -108,9 +78,8 @@ def main() -> None:
             )
 
     w, b = params
-    feature_names = ["pclass", "sex_male", "age_z", "sibsp", "parch", "fare_z"]
     print("\nlearned weights:")
-    for name, wi in zip(feature_names, w.tolist(), strict=True):
+    for name, wi in zip(ds.feature_names, w.tolist(), strict=True):
         print(f"  {name:>10}: {wi:+.3f}")
     print(f"  {'bias':>10}: {float(b):+.3f}")
 
