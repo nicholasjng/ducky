@@ -166,7 +166,7 @@ class Appender:
 class Connection:
     """A connection to a DuckDB database."""
 
-    def execute(self, query: str, parameters: list | None = None) -> Connection:
+    def execute(self, query: str, parameters: list | dict[str, Any] | None = None) -> Connection:
         """
         Execute a query, optionally with positional parameters, and return self for chaining.
         """

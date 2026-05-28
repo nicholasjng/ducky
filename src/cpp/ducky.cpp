@@ -202,7 +202,8 @@ NB_MODULE(_core, m) {
     nb::class_<Connection>(m, "Connection", "A connection to a DuckDB database.")
         .def("execute", &Connection::execute, "query"_a, "parameters"_a = nb::none(),
              nb::rv_policy::reference,
-             nb::sig("def execute(self, query: str, parameters: list | None = None) -> Connection"),
+             nb::sig("def execute(self, query: str, parameters: list | dict[str, typing.Any] | "
+                     "None = None) -> Connection"),
              "Execute a query, optionally with positional parameters, and "
              "return self for chaining.")
         // The returned Result shares the DuckDBHandle, so it keeps the database
