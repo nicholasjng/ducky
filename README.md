@@ -29,6 +29,23 @@ Implemented so far:
   `.df()` (pandas), `.pl(lazy=False)` (polars), and `.fetchnumpy()`. These import
   their target library lazily — none are hard dependencies. Consuming the stream
   drains the result, so call one of these (or the `fetch*` methods) per query.
+- Zero-copy ndarray output for numeric / temporal columns:
+  `Result.fetch_chunk()` returns a `Chunk` whose `column(key)` produces a 1-D
+  `nb::ndarray` view over the chunk's buffer; `validity(key)` gives the uint8
+  null mask. Built on this: `Result.chunks()`, `Result.iter_batches(columns=,
+  with_validity=)`, and the eager `Result.to_numpy(columns=)`,
+  `Result.to_torch(columns=, device=)`, `Result.to_jax(columns=, device=)`
+  (torch / jax imported lazily). NULL slots in dense arrays are raw buffer
+  contents — filter with SQL `WHERE x IS NOT NULL` or pass `with_validity=True`
+  to keep the masks.
+- Scalar UDFs over numeric / temporal types via
+  `Connection.create_function(name, fn, parameters, return_type)`. Inputs
+  arrive as zero-copy 1-D ndarrays over each chunk's vectors; `fn` returns one
+  ndarray of length chunk_size and matching dtype, which is memcpy'd into the
+  output vector. `parameters` is a list of type strings (positional call:
+  `fn(x, y, …)`) or a `dict[name, type]` (dict-style call:
+  `fn({"x": …, "y": …})`). Python exceptions are caught and surfaced as
+  `ducky.Error` at the SQL boundary.
 
 Value decoding currently covers:
 
@@ -63,6 +80,48 @@ CMakeLists.txt  builds DuckDB from the submodule and links the C API statically
 
 Requires CMake ≥ 3.29 and Ninja. The first build compiles DuckDB from source and
 takes a while; subsequent builds reuse `build/`.
+
+### Initialise the submodule (sparse)
+
+The DuckDB submodule's full working tree is ~280 MB; we only need ~50 MB of it
+(source, third_party, the two essential extensions, and a handful of CMake
+glue files). Configure the sparse checkout *before* the first checkout so the
+unused paths are never written to disk (and, with `--filter=blob:none`, their
+blobs are never fetched either):
+
+```sh
+git submodule update --init --no-checkout --filter=blob:none ext/duckdb
+
+git -C ext/duckdb sparse-checkout init --no-cone
+git -C ext/duckdb sparse-checkout set \
+    '/CMakeLists.txt' \
+    '/DuckDBConfig.cmake.in' \
+    '/DuckDBConfigVersion.cmake.in' \
+    '/LICENSE' \
+    '/src/' \
+    '/third_party/' \
+    '/scripts/' \
+    '/tools/CMakeLists.txt' \
+    '/tools/utils/' \
+    '/extension/CMakeLists.txt' \
+    '/extension/*.cmake' \
+    '/extension/*.in' \
+    '/extension/loader/' \
+    '/extension/core_functions/' \
+    '/extension/parquet/' \
+    '/extension/json/' \
+    '/.github/config/extensions/httpfs.cmake' \
+    '/.github/patches/extensions/httpfs/'
+
+git -C ext/duckdb checkout HEAD
+```
+
+If you already ran `git submodule update --init ext/duckdb`,
+the same `sparse-checkout init` / `set` / `checkout HEAD` sequence still
+works — it just trims an already-fat working tree rather than avoiding the
+download up front.
+
+### Compile
 
 Build is done **without build isolation** so nanobind's headers (already in the
 environment) are visible to CMake:
