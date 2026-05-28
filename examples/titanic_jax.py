@@ -1,8 +1,18 @@
-"""End-to-end demo: train a Titanic survival classifier in JAX.
+# /// script
+# requires-python = ">=3.13"
+# dependencies = [
+#     "ducky",
+#     "jax>=0.10.1",
+# ]
+#
+# [tool.uv.sources]
+# ducky = { path = "../", editable = true }
+# ///
+"""End-to-end demo: training a Titanic survival classifier in JAX.
 
 Run with:
 
-    uv run --group dev python examples/titanic_jax.py
+    uv run examples/titanic_jax.py
 
 What this shows:
   1. Reading a remote CSV directly into DuckDB (httpfs).
@@ -11,8 +21,6 @@ What this shows:
   3. Zero-copy hand-off into JAX via ``Fold.to_jax()``.
   4. A tiny logistic-regression training loop in plain JAX.
 """
-
-from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
