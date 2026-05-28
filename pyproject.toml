@@ -4,13 +4,13 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "ducky"
-version = "0.1.0"
 description = "small and fast duckdb bindings"
 readme = "README.md"
 license = "Apache-2.0"
 authors = [{ name = "Nicholas Junge", email = "nicho.junge@gmail.com" }]
 requires-python = ">=3.13"
 dependencies = []
+dynamic = ["version"]
 
 [dependency-groups]
 build = [
@@ -44,14 +44,8 @@ build-dir = "build/{wheel_tag}"
 wheel.packages = ["src/ducky"]
 cmake.build-type = "Release"
 logging.level = "INFO"
-# Editable installs rebuild the extension (incremental ninja) on import, so a
-# C++ change is picked up by the next `import ducky` with no manual reinstall.
-# Only affects editable installs; wheel builds ignore these. verbose=false keeps
-# successful imports quiet (build failures are still raised); flip it to true to
-# watch rebuilds.
-editable.mode = "redirect"
-editable.rebuild = true
-editable.verbose = false
+metadata.version.provider = "scikit_build_core.metadata.regex"
+metadata.version.input = "src/ducky/__init__.py"
 
 [tool.ruff]
 line-length = 100
