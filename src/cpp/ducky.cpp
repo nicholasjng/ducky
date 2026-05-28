@@ -1,15 +1,49 @@
+#include "ducky.hpp"
+
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/shared_ptr.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/vector.h>
 
+#include <atomic>
+
+#include "chunk.hpp"
 #include "connection.hpp"
-#include "ducky.hpp"
 #include "duckdb.h"
+#include "function.hpp"
 #include "result.hpp"
 
 namespace nb = nanobind;
 using namespace nb::literals;
+
+namespace {
+
+// Cached handle to the ducky._conversions module. Imported once on first use
+// and intentionally leaked so its Py_DECREF doesn't run at interpreter
+// shutdown (matches the pattern in result.cpp's py_types()). Avoids
+// re-acquiring the import lock + redoing the sys.modules lookup on every
+// .arrow() / .to_numpy() / .chunks() call.
+//
+// Care: PyImport_ImportModule may release the GIL (to run Python-level
+// import hooks), so we must not hold any lock across it — otherwise a
+// second thread can re-enter, block on our lock, and deadlock against
+// the importing thread that's now waiting on the GIL. Mirrors LLVM's
+// SafeInit pattern from llvm/llvm-project#160000. Also makes the cache
+// correct under free-threaded Python.
+const nb::module_& conversions() {
+    static std::atomic<nb::module_*> cached{nullptr};
+    static nb::ft_mutex mu;
+
+    if (nb::module_* p = cached.load()) return *p;
+    nb::module_ m = nb::module_::import_("ducky._conversions");
+    nb::ft_lock_guard lock(mu);
+    if (nb::module_* p = cached.load()) return *p;  // lost the race
+    auto* p = new nb::module_(std::move(m));
+    cached.store(p);
+    return *p;
+}
+
+}  // namespace
 
 NB_MODULE(_core, m) {
     m.doc() = "ducky: tiny nanobind bindings for the DuckDB C API";
@@ -18,110 +52,240 @@ NB_MODULE(_core, m) {
     // C++ DuckyError -> Python ducky.Error.
     nb::exception<DuckyError>(m, "Error");
 
+    nb::class_<Chunk>(m, "Chunk",
+                      "A single DuckDB data chunk: a column-major batch of up "
+                      "to STANDARD_VECTOR_SIZE rows. Numeric and temporal "
+                      "columns are exposed as zero-copy ndarrays.")
+        .def("__len__", &Chunk::size, "Number of rows in this chunk.")
+        .def_prop_ro("columns", &Chunk::column_names, "Column names.")
+        .def_prop_ro("types", &Chunk::column_types, "Column type names.")
+        .def(
+            "column",
+            [](nb::object self, nb::object key) {
+                return nb::cast<Chunk&>(self).column(key, self);
+            },
+            "key"_a, nb::sig("def column(self, key: int | str) -> numpy.ndarray"),
+            "Return the column at `key` (int index or str name) as a 1-D "
+            "ndarray view over the chunk's buffer.")
+        .def(
+            "validity",
+            [](nb::object self, nb::object key) {
+                return nb::cast<Chunk&>(self).validity(key, self);
+            },
+            "key"_a, nb::sig("def validity(self, key: int | str) -> numpy.ndarray | None"),
+            "Return a uint8 ndarray (1=valid, 0=null) of length len(self), or "
+            "None if the column has no nulls.");
+
     nb::class_<Result>(m, "Result",
                        "A query result. Iterate it, or use the fetch* methods, "
                        "to pull rows as tuples.")
         .def_prop_ro("columns", &Result::column_names, "Column names.")
         .def_prop_ro("types", &Result::column_types, "Column type names.")
         .def_prop_ro("description", &Result::description,
+                     nb::sig("def description(self) -> list[tuple] | None"),
                      "PEP 249 result description.")
-        .def("fetchone", &Result::fetchone, "Return the next row, or None.")
+        .def("fetchone", &Result::fetchone, nb::sig("def fetchone(self) -> tuple | None"),
+             "Return the next row, or None.")
         .def("fetchmany", &Result::fetchmany, "size"_a = 1,
+             nb::sig("def fetchmany(self, size: int = 1) -> list[tuple]"),
              "Return up to `size` rows.")
-        .def("fetchall", &Result::fetchall, "Return all remaining rows.")
+        .def("fetchall", &Result::fetchall, nb::sig("def fetchall(self) -> list[tuple]"),
+             "Return all remaining rows.")
+        .def("fetch_chunk", &Result::fetch_chunk, nb::sig("def fetch_chunk(self) -> Chunk | None"),
+             "Pull the next data chunk as a Chunk, or None at end of stream.")
         .def(
             "__arrow_c_stream__",
-            [](nb::object self, nb::object) { return nb::cast<Result &>(self).arrow_c_stream(self); },
+            [](nb::object self, nb::object) {
+                return nb::cast<Result&>(self).arrow_c_stream(self);
+            },
             "requested_schema"_a = nb::none(),
+            nb::sig("def __arrow_c_stream__(self, requested_schema: typing.Any = None) "
+                    "-> typing.Any"),
             "Export the result via the Arrow C stream (PyCapsule) interface.")
         .def(
-            "arrow",
-            [](nb::object self) {
-                return nb::module_::import_("ducky._conversions").attr("arrow")(self);
-            },
-            "Return the result as a pyarrow.Table.")
+            "arrow", [](nb::object self) { return conversions().attr("arrow")(self); },
+            nb::sig("def arrow(self) -> typing.Any"), "Return the result as a pyarrow.Table.")
         .def(
-            "df",
-            [](nb::object self) {
-                return nb::module_::import_("ducky._conversions").attr("df")(self);
-            },
-            "Return the result as a pandas.DataFrame.")
+            "df", [](nb::object self) { return conversions().attr("df")(self); },
+            nb::sig("def df(self) -> typing.Any"), "Return the result as a pandas.DataFrame.")
         .def(
-            "pl",
-            [](nb::object self, bool lazy) {
-                return nb::module_::import_("ducky._conversions").attr("pl")(self, lazy);
-            },
-            "lazy"_a = false, "Return the result as a polars DataFrame (or LazyFrame).")
+            "pl", [](nb::object self, bool lazy) { return conversions().attr("pl")(self, lazy); },
+            "lazy"_a = false, nb::sig("def pl(self, lazy: bool = False) -> typing.Any"),
+            "Return the result as a polars DataFrame (or LazyFrame).")
         .def(
-            "fetchnumpy",
-            [](nb::object self) {
-                return nb::module_::import_("ducky._conversions").attr("fetchnumpy")(self);
-            },
+            "fetchnumpy", [](nb::object self) { return conversions().attr("fetchnumpy")(self); },
+            nb::sig("def fetchnumpy(self) -> dict[str, numpy.ndarray]"),
             "Return the result as a dict of column name -> numpy array.")
-        .def("__iter__", [](nb::object self) { return self; })
-        .def("__next__", [](Result &self) {
-            nb::object row = self.fetchone();
-            if (row.is_none()) throw nb::stop_iteration();
-            return row;
-        });
+        .def(
+            "chunks", [](nb::object self) { return conversions().attr("chunks")(self); },
+            nb::sig("def chunks(self) -> collections.abc.Iterator[Chunk]"),
+            "Iterate over the result one Chunk at a time. Drains the result.")
+        .def(
+            "iter_batches",
+            [](nb::object self, nb::object columns, bool with_validity) {
+                return conversions().attr("iter_batches")(self, columns, with_validity);
+            },
+            "columns"_a = nb::none(), "with_validity"_a = false,
+            nb::sig("def iter_batches(self, columns: collections.abc.Iterable[str] | None = "
+                    "None, with_validity: bool = False) -> "
+                    "collections.abc.Iterator[dict[str, typing.Any]]"),
+            "Yield one dict per chunk: {name: ndarray}, or {name: (values, mask)} "
+            "if with_validity=True.")
+        .def(
+            "to_numpy",
+            [](nb::object self, nb::object columns) {
+                return conversions().attr("to_numpy")(self, columns);
+            },
+            "columns"_a = nb::none(),
+            nb::sig("def to_numpy(self, columns: collections.abc.Iterable[str] | None = None) "
+                    "-> dict[str, numpy.ndarray]"),
+            "Eagerly concatenate all chunks into {name: numpy.ndarray}.")
+        .def(
+            "to_torch",
+            [](nb::object self, nb::object columns, nb::object device) {
+                return conversions().attr("to_torch")(self, columns, device);
+            },
+            "columns"_a = nb::none(), "device"_a = nb::none(),
+            nb::sig("def to_torch(self, columns: collections.abc.Iterable[str] | None = None, "
+                    "device: typing.Any = None) -> dict[str, typing.Any]"),
+            "Eagerly concatenate all chunks into {name: torch.Tensor}.")
+        .def(
+            "to_jax",
+            [](nb::object self, nb::object columns, nb::object device) {
+                return conversions().attr("to_jax")(self, columns, device);
+            },
+            "columns"_a = nb::none(), "device"_a = nb::none(),
+            nb::sig("def to_jax(self, columns: collections.abc.Iterable[str] | None = None, "
+                    "device: typing.Any = None) -> dict[str, typing.Any]"),
+            "Eagerly concatenate all chunks into {name: jax.Array}.")
+        .def(
+            "__iter__", [](nb::object self) { return self; },
+            nb::sig("def __iter__(self) -> collections.abc.Iterator[tuple]"))
+        .def(
+            "__next__",
+            [](Result& self) {
+                nb::object row = self.fetchone();
+                if (row.is_none()) throw nb::stop_iteration();
+                return row;
+            },
+            nb::sig("def __next__(self) -> tuple"));
 
     nb::class_<Connection>(m, "Connection", "A connection to a DuckDB database.")
-        .def("execute", &Connection::execute, "query"_a,
-             "parameters"_a = nb::none(), nb::rv_policy::reference,
+        .def("execute", &Connection::execute, "query"_a, "parameters"_a = nb::none(),
+             nb::rv_policy::reference,
+             nb::sig("def execute(self, query: str, parameters: list | None = None) -> Connection"),
              "Execute a query, optionally with positional parameters, and "
              "return self for chaining.")
         // The returned Result shares the DuckDBHandle, so it keeps the database
         // open on its own — no keep_alive needed.
         .def("sql", &Connection::sql, "query"_a, "Run a query and return its Result.")
         .def("query", &Connection::sql, "query"_a, "Alias for sql().")
-        .def("fetchone", &Connection::fetchone)
-        .def("fetchmany", &Connection::fetchmany, "size"_a = 1)
-        .def("fetchall", &Connection::fetchall)
-        .def_prop_ro("description", &Connection::description)
-        .def_prop_ro("columns", &Connection::columns)
+        .def("fetchone", &Connection::fetchone, nb::sig("def fetchone(self) -> tuple | None"))
+        .def("fetchmany", &Connection::fetchmany, "size"_a = 1,
+             nb::sig("def fetchmany(self, size: int = 1) -> list[tuple]"))
+        .def("fetchall", &Connection::fetchall, nb::sig("def fetchall(self) -> list[tuple]"))
+        .def_prop_ro("description", &Connection::description,
+                     nb::sig("def description(self) -> list[tuple] | None"))
+        .def_prop_ro("columns", &Connection::columns,
+                     nb::sig("def columns(self) -> list[str] | None"))
         .def(
             "arrow",
-            [](Connection &self) {
-                return nb::module_::import_("ducky._conversions")
-                    .attr("arrow")(nb::cast(self.current_result()));
+            [](Connection& self) {
+                return conversions().attr("arrow")(nb::cast(self.current_result()));
             },
-            "Return the last result as a pyarrow.Table.")
+            nb::sig("def arrow(self) -> typing.Any"), "Return the last result as a pyarrow.Table.")
         .def(
             "df",
-            [](Connection &self) {
-                return nb::module_::import_("ducky._conversions")
-                    .attr("df")(nb::cast(self.current_result()));
+            [](Connection& self) {
+                return conversions().attr("df")(nb::cast(self.current_result()));
             },
-            "Return the last result as a pandas.DataFrame.")
+            nb::sig("def df(self) -> typing.Any"), "Return the last result as a pandas.DataFrame.")
         .def(
             "pl",
-            [](Connection &self, bool lazy) {
-                return nb::module_::import_("ducky._conversions")
-                    .attr("pl")(nb::cast(self.current_result()), lazy);
+            [](Connection& self, bool lazy) {
+                return conversions().attr("pl")(nb::cast(self.current_result()), lazy);
             },
-            "lazy"_a = false, "Return the last result as a polars DataFrame (or LazyFrame).")
+            "lazy"_a = false, nb::sig("def pl(self, lazy: bool = False) -> typing.Any"),
+            "Return the last result as a polars DataFrame (or LazyFrame).")
         .def(
             "fetchnumpy",
-            [](Connection &self) {
-                return nb::module_::import_("ducky._conversions")
-                    .attr("fetchnumpy")(nb::cast(self.current_result()));
+            [](Connection& self) {
+                return conversions().attr("fetchnumpy")(nb::cast(self.current_result()));
             },
+            nb::sig("def fetchnumpy(self) -> dict[str, numpy.ndarray]"),
             "Return the last result as a dict of column name -> numpy array.")
-        .def("close", &Connection::close, "Close the connection.")
-        .def("__enter__", [](Connection &self) -> Connection & { return self; },
-             nb::rv_policy::reference)
         .def(
-            "__exit__",
-            [](Connection &self, nb::object, nb::object, nb::object) {
-                self.close();
+            "chunks",
+            [](Connection& self) {
+                return conversions().attr("chunks")(nb::cast(self.current_result()));
             },
+            nb::sig("def chunks(self) -> collections.abc.Iterator[Chunk]"),
+            "Iterate over the last result one Chunk at a time.")
+        .def(
+            "iter_batches",
+            [](Connection& self, nb::object columns, bool with_validity) {
+                return conversions().attr("iter_batches")(nb::cast(self.current_result()), columns,
+                                                          with_validity);
+            },
+            "columns"_a = nb::none(), "with_validity"_a = false,
+            nb::sig("def iter_batches(self, columns: collections.abc.Iterable[str] | None = "
+                    "None, with_validity: bool = False) -> "
+                    "collections.abc.Iterator[dict[str, typing.Any]]"),
+            "Yield one dict per chunk for the last result.")
+        .def(
+            "to_numpy",
+            [](Connection& self, nb::object columns) {
+                return conversions().attr("to_numpy")(nb::cast(self.current_result()), columns);
+            },
+            "columns"_a = nb::none(),
+            nb::sig("def to_numpy(self, columns: collections.abc.Iterable[str] | None = None) "
+                    "-> dict[str, numpy.ndarray]"),
+            "Return the last result as {name: numpy.ndarray}.")
+        .def(
+            "to_torch",
+            [](Connection& self, nb::object columns, nb::object device) {
+                return conversions().attr("to_torch")(nb::cast(self.current_result()), columns,
+                                                      device);
+            },
+            "columns"_a = nb::none(), "device"_a = nb::none(),
+            nb::sig("def to_torch(self, columns: collections.abc.Iterable[str] | None = None, "
+                    "device: typing.Any = None) -> dict[str, typing.Any]"),
+            "Return the last result as {name: torch.Tensor}.")
+        .def(
+            "to_jax",
+            [](Connection& self, nb::object columns, nb::object device) {
+                return conversions().attr("to_jax")(nb::cast(self.current_result()), columns,
+                                                    device);
+            },
+            "columns"_a = nb::none(), "device"_a = nb::none(),
+            nb::sig("def to_jax(self, columns: collections.abc.Iterable[str] | None = None, "
+                    "device: typing.Any = None) -> dict[str, typing.Any]"),
+            "Return the last result as {name: jax.Array}.")
+        .def(
+            "create_function",
+            [](Connection& self, const std::string& name, nb::callable fn, nb::object parameters,
+               const std::string& return_type) {
+                create_scalar_function(self, name, std::move(fn), parameters, return_type);
+            },
+            "name"_a, "fn"_a, "parameters"_a, "return_type"_a,
+            nb::sig("def create_function(self, name: str, fn: collections.abc.Callable, "
+                    "parameters: list[str] | dict[str, str], return_type: str) -> None"),
+            "Register a Python callable as a DuckDB scalar function. "
+            "`parameters` is a list of type strings (positional call) or a "
+            "dict of {name: type_string} (dict-style call). Inputs arrive as "
+            "zero-copy 1-D ndarrays; `fn` must return one ndarray of length "
+            "chunk_size and matching dtype.")
+        .def("close", &Connection::close, "Close the connection.")
+        .def(
+            "__enter__", [](Connection& self) -> Connection& { return self; },
+            nb::rv_policy::reference)
+        .def(
+            "__exit__", [](Connection& self, nb::object, nb::object, nb::object) { self.close(); },
             "exc_type"_a.none(), "exc_value"_a.none(), "traceback"_a.none(),
             nb::sig("def __exit__(self, exc_type: type[BaseException] | None, exc_value: "
                     "BaseException | None, traceback: types.TracebackType | None) -> None"));
 
     m.def(
-        "connect",
-        [](const std::string &database) { return new Connection(database); },
-        "database"_a = ":memory:",
-        "Open `database` (default in-memory) and return a Connection.");
+        "connect", [](const std::string& database) { return new Connection(database); },
+        "database"_a = ":memory:", "Open `database` (default in-memory) and return a Connection.");
 }
