@@ -265,5 +265,12 @@ class Connection:
     ) -> None:
         pass
 
-def connect(database: str = ":memory:") -> Connection:
-    """Open `database` (default in-memory) and return a Connection."""
+def connect(database: str = ":memory:", config: dict[str, str] | None = None) -> Connection:
+    """
+    Open `database` (default in-memory) and return a Connection. `config` is an optional dict of DuckDB settings applied at open time (see ducky.config_options() for the full list of keys).
+    """
+
+def config_options() -> list[tuple[str, str]]:
+    """
+    Return the (name, description) of every DuckDB config option settable via connect(config=...).
+    """

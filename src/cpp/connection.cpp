@@ -266,10 +266,39 @@ void bind_parameters(duckdb_prepared_statement stmt, nb::handle parameters) {
 
 }  // namespace
 
-Connection::Connection(const std::string& database) {
+Connection::Connection(const std::string& database, nb::object config) {
     auto handle = std::make_shared<DuckDBHandle>();
+
+    // Build a duckdb_config from the user-supplied Mapping[str, str], if any.
+    // We iterate via .items() rather than requiring an nb::dict so the C
+    // surface honestly accepts any read-only Mapping (TypedDict, MappingProxy,
+    // user mappings) — we only read, never mutate or take ownership. The
+    // config is always destroyed; DuckDB copies the settings on open.
+    duckdb_config cfg = nullptr;
+    if (!config.is_none()) {
+        if (duckdb_create_config(&cfg) == DuckDBError) {
+            throw DuckyError("ducky: failed to allocate duckdb_config");
+        }
+        try {
+            for (nb::handle item : config.attr("items")()) {
+                nb::tuple kv = nb::cast<nb::tuple>(item);
+                std::string name = nb::cast<std::string>(kv[0]);
+                std::string value = nb::cast<std::string>(kv[1]);
+                if (duckdb_set_config(cfg, name.c_str(), value.c_str()) == DuckDBError) {
+                    throw DuckyError("ducky: invalid config option '" + name + "' = '" + value +
+                                     "'");
+                }
+            }
+        } catch (...) {
+            duckdb_destroy_config(&cfg);
+            throw;
+        }
+    }
+
     char* error = nullptr;
-    if (duckdb_open_ext(database.c_str(), &handle->database, nullptr, &error) == DuckDBError) {
+    duckdb_state state = duckdb_open_ext(database.c_str(), &handle->database, cfg, &error);
+    duckdb_destroy_config(&cfg);
+    if (state == DuckDBError) {
         std::string message = error ? error : "unknown error";
         duckdb_free(error);
         // ~DuckDBHandle closes the (opened-or-not) database as `handle` unwinds.

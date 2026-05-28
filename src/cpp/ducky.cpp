@@ -340,6 +340,32 @@ NB_MODULE(_core, m) {
                     "BaseException | None, traceback: types.TracebackType | None) -> None"));
 
     m.def(
-        "connect", [](const std::string& database) { return new Connection(database); },
-        "database"_a = ":memory:", "Open `database` (default in-memory) and return a Connection.");
+        "connect",
+        [](const std::string& database, nb::object config) {
+            return new Connection(database, std::move(config));
+        },
+        "database"_a = ":memory:", "config"_a = nb::none(),
+        nb::sig("def connect(database: str = ':memory:', config: dict[str, str] | None = None) "
+                "-> Connection"),
+        "Open `database` (default in-memory) and return a Connection. "
+        "`config` is an optional dict of DuckDB settings applied at open time "
+        "(see ducky.config_options() for the full list of keys).");
+
+    m.def(
+        "config_options",
+        []() {
+            size_t n = duckdb_config_count();
+            nb::list out;
+            for (size_t i = 0; i < n; ++i) {
+                const char* name = nullptr;
+                const char* desc = nullptr;
+                if (duckdb_get_config_flag(i, &name, &desc) == DuckDBSuccess) {
+                    out.append(nb::make_tuple(name ? name : "", desc ? desc : ""));
+                }
+            }
+            return out;
+        },
+        nb::sig("def config_options() -> list[tuple[str, str]]"),
+        "Return the (name, description) of every DuckDB config option "
+        "settable via connect(config=...).");
 }

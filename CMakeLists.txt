@@ -27,7 +27,7 @@ endif()
 # ──────────────────────────────────────────────────────────────────────────────
 # Python + nanobind
 # ──────────────────────────────────────────────────────────────────────────────
-find_package(Python 3.13 REQUIRED COMPONENTS Interpreter Development.Module)
+find_package(Python 3.11 REQUIRED COMPONENTS Interpreter Development.Module)
 
 # Locate the installed nanobind package and import its CMake config.
 execute_process(

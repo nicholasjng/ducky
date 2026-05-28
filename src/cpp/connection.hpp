@@ -17,7 +17,10 @@ namespace nb = nanobind;
 // database, matching duckdb.connect() semantics.
 class Connection {
    public:
-    explicit Connection(const std::string& database);
+    // `config` is an optional dict of {name: string-value} pairs applied via
+    // duckdb_set_config before opening the database. Invalid keys / values
+    // raise DuckyError with DuckDB's error message.
+    Connection(const std::string& database, nb::object config);
     ~Connection();
 
     Connection(const Connection&) = delete;

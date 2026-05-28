@@ -8,8 +8,10 @@ description = "small and fast duckdb bindings"
 readme = "README.md"
 license = "Apache-2.0"
 authors = [{ name = "Nicholas Junge", email = "nicho.junge@gmail.com" }]
-requires-python = ">=3.13"
-dependencies = []
+requires-python = ">=3.11"
+dependencies = [
+    'typing_extensions >=4.12 ; python_version < "3.12"', # for typing.Unpack (PEP 692).
+]
 dynamic = ["version"]
 
 [dependency-groups]
