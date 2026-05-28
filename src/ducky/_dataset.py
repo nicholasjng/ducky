@@ -109,10 +109,11 @@ def split(
     ``{"train": x, "val": 1 - x}``) or a dict of fold name → share that sums
     to 1.0.
     """
-    if isinstance(fractions, float):
-        if not 0.0 < fractions < 1.0:
-            raise ValueError(f"train fraction must be in (0, 1); got {fractions}")
-        return Split(fractions={"train": fractions, "val": 1.0 - fractions}, seed=seed)
+    if isinstance(fractions, int | float):
+        f = float(fractions)
+        if not 0.0 < f < 1.0:
+            raise ValueError(f"train fraction must be in (0, 1); got {f}")
+        return Split(fractions={"train": f, "val": 1.0 - f}, seed=seed)
     total = sum(fractions.values())
     if abs(total - 1.0) > 1e-6:
         raise ValueError(f"fold fractions must sum to 1.0; got {total}")

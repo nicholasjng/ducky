@@ -1,7 +1,7 @@
 """ducky: tiny nanobind bindings for the DuckDB C API"""
 
-import types
 from collections.abc import Callable, Iterable, Iterator
+from types import TracebackType
 from typing import Any, Literal, overload
 
 import jax
@@ -125,6 +125,44 @@ class Result:
     def __iter__(self) -> Iterator[tuple]: ...
     def __next__(self) -> tuple: ...
 
+class Appender:
+    """
+    Bulk-insert handle for a target table. Supports a row-at-a-time API for mixed/typed writes and a columnar fast path for numeric/temporal ndarrays.
+    """
+
+    @property
+    def columns(self) -> list[str]:
+        """Target column names."""
+
+    @property
+    def types(self) -> list[str]:
+        """Target column type names."""
+
+    def append_row(self, *values: object) -> None:
+        """Append one row of positional values, matching the target column order."""
+
+    def append_columns(
+        self, columns: dict[str, numpy.ndarray], masks: dict[str, numpy.ndarray] | None = None
+    ) -> None:
+        """
+        Append a batch of columns. Missing columns are filled with NULL. `masks` maps column name -> 1-D bool/uint8 array (True = valid).
+        """
+
+    def flush(self) -> None:
+        """Flush pending rows to the table."""
+
+    def close(self) -> None:
+        """Flush and tear down the appender."""
+
+    def __enter__(self) -> Appender: ...
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        pass
+
 class Connection:
     """A connection to a DuckDB database."""
 
@@ -198,6 +236,13 @@ class Connection:
         Register a Python callable as a DuckDB scalar function. `parameters` is a list of type strings (positional call) or a dict of {name: type_string} (dict-style call). Inputs arrive as zero-copy 1-D ndarrays; `fn` must return one ndarray of length chunk_size and matching dtype.
         """
 
+    def appender(
+        self, table: str, schema: str | None = None, catalog: str | None = None
+    ) -> Appender:
+        """
+        Open an Appender for bulk inserts into `table`. The appender shares the connection's database handle, so the database stays open until the appender is closed.
+        """
+
     def close(self) -> None:
         """Close the connection."""
 
@@ -206,8 +251,9 @@ class Connection:
         self,
         exc_type: type[BaseException] | None,
         exc_value: BaseException | None,
-        traceback: types.TracebackType | None,
-    ) -> None: ...
+        traceback: TracebackType | None,
+    ) -> None:
+        pass
 
 def connect(database: str = ":memory:") -> Connection:
     """Open `database` (default in-memory) and return a Connection."""

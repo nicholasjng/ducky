@@ -19,6 +19,21 @@ pl:
     def pl(self, lazy: bool = False) -> _PolarsDataFrame | _PolarsLazyFrame:
         \doc
 
+# __exit__: rewrite the traceback annotation to use `TracebackType` directly.
+# The default sig emits ``types.TracebackType``, which collides with the
+# ``types`` property on Appender (and would similarly collide on any class
+# that exposes a ``types`` member) — at class scope, ``types`` resolves to
+# the descriptor rather than the imported module.
+\.__exit__$:
+    \from types import TracebackType
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        \doc
+
 # iter_batches: dict values are bare ndarrays when with_validity=False,
 # (values, mask) tuples when with_validity=True.
 iter_batches:

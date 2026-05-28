@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from ._core import (
+    Appender,
     Connection,
     Error,
     Result,
@@ -22,6 +23,7 @@ from ._dataset import (
 )
 
 __all__ = [
+    "Appender",
     "Connection",
     "Dataset",
     "Error",
