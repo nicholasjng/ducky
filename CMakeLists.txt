@@ -146,6 +146,7 @@ nanobind_add_stub(
     MODULE _core
     OUTPUT ${CMAKE_CURRENT_SOURCE_DIR}/src/ducky/_core.pyi
     PYTHON_PATH $<TARGET_FILE_DIR:_core>
+    PATTERN_FILE ${CMAKE_CURRENT_SOURCE_DIR}/stub_patterns.txt
     DEPENDS _core
 )
 

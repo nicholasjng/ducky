@@ -1,0 +1,30 @@
+# nanobind stubgen pattern file.
+#
+# Format: each entry is a Python-regex matched against the qualified symbol
+# name (e.g. ``ducky._core.Result.pl``), followed by an indented block of
+# replacement lines. ``\doc`` inserts the original docstring; ``\from <mod>
+# import <name>`` adds an import.
+#
+# We use this to emit ``@typing.overload`` variants for methods whose return
+# type depends on a boolean argument — something nb::sig can't express
+# directly because each .def has a single signature string.
+
+pl:
+    \from typing import overload, Literal
+    \from polars import DataFrame as _PolarsDataFrame, LazyFrame as _PolarsLazyFrame
+    @overload
+    def pl(self, lazy: Literal[False] = False) -> _PolarsDataFrame: ...
+    @overload
+    def pl(self, lazy: Literal[True]) -> _PolarsLazyFrame: ...
+    def pl(self, lazy: bool = False) -> _PolarsDataFrame | _PolarsLazyFrame:
+        \doc
+
+# iter_batches: dict values are bare ndarrays when with_validity=False,
+# (values, mask) tuples when with_validity=True.
+iter_batches:
+    @overload
+    def iter_batches(self, columns: Iterable[str] | None = None, with_validity: Literal[False] = False) -> Iterator[dict[str, numpy.ndarray]]: ...
+    @overload
+    def iter_batches(self, columns: Iterable[str] | None = None, *, with_validity: Literal[True]) -> Iterator[dict[str, tuple[numpy.ndarray, numpy.ndarray | None]]]: ...
+    def iter_batches(self, columns: Iterable[str] | None = None, with_validity: bool = False) -> Iterator[dict[str, numpy.ndarray] | dict[str, tuple[numpy.ndarray, numpy.ndarray | None]]]:
+        \doc

@@ -50,6 +50,7 @@ NB_MODULE(_core, m) {
     m.attr("__duckdb_version__") = duckdb_library_version();
 
     // C++ DuckyError -> Python ducky.Error.
+    // NOLINTNEXTLINE(bugprone-unused-raii)
     nb::exception<DuckyError>(m, "Error");
 
     nb::class_<Chunk>(m, "Chunk",
@@ -104,13 +105,14 @@ NB_MODULE(_core, m) {
             "Export the result via the Arrow C stream (PyCapsule) interface.")
         .def(
             "arrow", [](nb::object self) { return conversions().attr("arrow")(self); },
-            nb::sig("def arrow(self) -> typing.Any"), "Return the result as a pyarrow.Table.")
+            nb::sig("def arrow(self) -> pyarrow.Table"), "Return the result as a pyarrow.Table.")
         .def(
             "df", [](nb::object self) { return conversions().attr("df")(self); },
-            nb::sig("def df(self) -> typing.Any"), "Return the result as a pandas.DataFrame.")
+            nb::sig("def df(self) -> pandas.DataFrame"), "Return the result as a pandas.DataFrame.")
         .def(
             "pl", [](nb::object self, bool lazy) { return conversions().attr("pl")(self, lazy); },
-            "lazy"_a = false, nb::sig("def pl(self, lazy: bool = False) -> typing.Any"),
+            "lazy"_a = false,
+            nb::sig("def pl(self, lazy: bool = False) -> polars.DataFrame | polars.LazyFrame"),
             "Return the result as a polars DataFrame (or LazyFrame).")
         .def(
             "fetchnumpy", [](nb::object self) { return conversions().attr("fetchnumpy")(self); },
@@ -127,8 +129,8 @@ NB_MODULE(_core, m) {
             },
             "columns"_a = nb::none(), "with_validity"_a = false,
             nb::sig("def iter_batches(self, columns: collections.abc.Iterable[str] | None = "
-                    "None, with_validity: bool = False) -> "
-                    "collections.abc.Iterator[dict[str, typing.Any]]"),
+                    "None, with_validity: bool = False) -> collections.abc.Iterator["
+                    "dict[str, numpy.ndarray | tuple[numpy.ndarray, numpy.ndarray | None]]]"),
             "Yield one dict per chunk: {name: ndarray}, or {name: (values, mask)} "
             "if with_validity=True.")
         .def(
@@ -147,7 +149,8 @@ NB_MODULE(_core, m) {
             },
             "columns"_a = nb::none(), "device"_a = nb::none(),
             nb::sig("def to_torch(self, columns: collections.abc.Iterable[str] | None = None, "
-                    "device: typing.Any = None) -> dict[str, typing.Any]"),
+                    "device: torch.device | str | int | None = None) "
+                    "-> dict[str, torch.Tensor]"),
             "Eagerly concatenate all chunks into {name: torch.Tensor}.")
         .def(
             "to_jax",
@@ -156,7 +159,7 @@ NB_MODULE(_core, m) {
             },
             "columns"_a = nb::none(), "device"_a = nb::none(),
             nb::sig("def to_jax(self, columns: collections.abc.Iterable[str] | None = None, "
-                    "device: typing.Any = None) -> dict[str, typing.Any]"),
+                    "device: jax.Device | None = None) -> dict[str, jax.Array]"),
             "Eagerly concatenate all chunks into {name: jax.Array}.")
         .def(
             "__iter__", [](nb::object self) { return self; },
@@ -193,19 +196,22 @@ NB_MODULE(_core, m) {
             [](Connection& self) {
                 return conversions().attr("arrow")(nb::cast(self.current_result()));
             },
-            nb::sig("def arrow(self) -> typing.Any"), "Return the last result as a pyarrow.Table.")
+            nb::sig("def arrow(self) -> pyarrow.Table"),
+            "Return the last result as a pyarrow.Table.")
         .def(
             "df",
             [](Connection& self) {
                 return conversions().attr("df")(nb::cast(self.current_result()));
             },
-            nb::sig("def df(self) -> typing.Any"), "Return the last result as a pandas.DataFrame.")
+            nb::sig("def df(self) -> pandas.DataFrame"),
+            "Return the last result as a pandas.DataFrame.")
         .def(
             "pl",
             [](Connection& self, bool lazy) {
                 return conversions().attr("pl")(nb::cast(self.current_result()), lazy);
             },
-            "lazy"_a = false, nb::sig("def pl(self, lazy: bool = False) -> typing.Any"),
+            "lazy"_a = false,
+            nb::sig("def pl(self, lazy: bool = False) -> polars.DataFrame | polars.LazyFrame"),
             "Return the last result as a polars DataFrame (or LazyFrame).")
         .def(
             "fetchnumpy",
@@ -229,8 +235,8 @@ NB_MODULE(_core, m) {
             },
             "columns"_a = nb::none(), "with_validity"_a = false,
             nb::sig("def iter_batches(self, columns: collections.abc.Iterable[str] | None = "
-                    "None, with_validity: bool = False) -> "
-                    "collections.abc.Iterator[dict[str, typing.Any]]"),
+                    "None, with_validity: bool = False) -> collections.abc.Iterator["
+                    "dict[str, numpy.ndarray | tuple[numpy.ndarray, numpy.ndarray | None]]]"),
             "Yield one dict per chunk for the last result.")
         .def(
             "to_numpy",
@@ -249,7 +255,8 @@ NB_MODULE(_core, m) {
             },
             "columns"_a = nb::none(), "device"_a = nb::none(),
             nb::sig("def to_torch(self, columns: collections.abc.Iterable[str] | None = None, "
-                    "device: typing.Any = None) -> dict[str, typing.Any]"),
+                    "device: torch.device | str | int | None = None) "
+                    "-> dict[str, torch.Tensor]"),
             "Return the last result as {name: torch.Tensor}.")
         .def(
             "to_jax",
@@ -259,7 +266,7 @@ NB_MODULE(_core, m) {
             },
             "columns"_a = nb::none(), "device"_a = nb::none(),
             nb::sig("def to_jax(self, columns: collections.abc.Iterable[str] | None = None, "
-                    "device: typing.Any = None) -> dict[str, typing.Any]"),
+                    "device: jax.Device | None = None) -> dict[str, jax.Array]"),
             "Return the last result as {name: jax.Array}.")
         .def(
             "create_function",
