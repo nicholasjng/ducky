@@ -243,6 +243,16 @@ class Connection:
         Open an Appender for bulk inserts into `table`. The appender shares the connection's database handle, so the database stays open until the appender is closed.
         """
 
+    def interrupt(self) -> None:
+        """
+        Best-effort cancel of any query currently running on this connection. Safe to call from another thread while execute() is in flight.
+        """
+
+    def progress(self) -> tuple[float, int, int]:
+        """
+        Snapshot of the current query's progress: (percentage, rows_processed, total_rows_to_process). `percentage` is -1.0 until DuckDB has an estimate.
+        """
+
     def close(self) -> None:
         """Close the connection."""
 

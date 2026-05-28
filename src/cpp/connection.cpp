@@ -281,6 +281,18 @@ Connection::Connection(const std::string& database) {
     handle_ = std::move(handle);
 }
 
+void Connection::interrupt() {
+    if (handle_ && handle_->connection) duckdb_interrupt(handle_->connection);
+}
+
+nb::tuple Connection::progress() const {
+    if (!handle_ || !handle_->connection) {
+        throw DuckyError("ducky: connection is closed");
+    }
+    duckdb_query_progress_type p = duckdb_query_progress(handle_->connection);
+    return nb::make_tuple(p.percentage, p.rows_processed, p.total_rows_to_process);
+}
+
 Connection::~Connection() { close(); }
 
 void Connection::close() {

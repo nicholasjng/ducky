@@ -321,6 +321,14 @@ NB_MODULE(_core, m) {
             "Open an Appender for bulk inserts into `table`. The appender shares "
             "the connection's database handle, so the database stays open until "
             "the appender is closed.")
+        .def("interrupt", &Connection::interrupt,
+             "Best-effort cancel of any query currently running on this connection. "
+             "Safe to call from another thread while execute() is in flight.")
+        .def("progress", &Connection::progress,
+             nb::sig("def progress(self) -> tuple[float, int, int]"),
+             "Snapshot of the current query's progress: "
+             "(percentage, rows_processed, total_rows_to_process). "
+             "`percentage` is -1.0 until DuckDB has an estimate.")
         .def("close", &Connection::close, "Close the connection.")
         .def(
             "__enter__", [](Connection& self) -> Connection& { return self; },

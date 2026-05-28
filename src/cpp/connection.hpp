@@ -51,6 +51,16 @@ class Connection {
     // database stays open for as long as the appender is alive.
     std::shared_ptr<DuckDBHandle> handle() const { return handle_; }
 
+    // Best-effort interrupt of any query currently running on this
+    // connection. Thread-safe: callable from a thread other than the one
+    // blocked in execute(). No-op if no query is in flight.
+    void interrupt();
+
+    // Snapshot of the current query's progress. Returns (percentage,
+    // rows_processed, total_rows_to_process). `percentage` is -1.0 when
+    // DuckDB hasn't computed an estimate yet. Thread-safe.
+    nb::tuple progress() const;
+
     void close();
 
    private:
