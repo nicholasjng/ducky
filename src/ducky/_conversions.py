@@ -26,8 +26,13 @@ if TYPE_CHECKING:
     from ._core import Chunk
 
 
-class _ArrowSource(Protocol):
-    """Anything implementing the Arrow C stream PyCapsule interface."""
+class ArrowSource(Protocol):
+    """Anything implementing the Arrow C stream PyCapsule interface.
+
+    Covers ducky's own ``Result``/``Connection`` and any third-party
+    object exposing ``__arrow_c_stream__`` — pyarrow ``Table``, polars
+    ``DataFrame``, pandas 3.x ``DataFrame``, etc.
+    """
 
     def __arrow_c_stream__(self, requested_schema: Any = None) -> Any: ...
 
@@ -38,19 +43,19 @@ class _ChunkSource(Protocol):
     def fetch_chunk(self) -> Chunk | None: ...
 
 
-def arrow(source: _ArrowSource) -> pyarrow.Table:
+def arrow(source: ArrowSource) -> pyarrow.Table:
     """Return the result as a ``pyarrow.Table``."""
     import pyarrow as pa
 
     return pa.table(source)
 
 
-def df(source: _ArrowSource) -> pd.DataFrame:
+def df(source: ArrowSource) -> pd.DataFrame:
     """Return the result as a ``pandas.DataFrame`` (via Arrow)."""
     return arrow(source).to_pandas()
 
 
-def pl(source: _ArrowSource, lazy: bool = False) -> polars.DataFrame | polars.LazyFrame:
+def pl(source: ArrowSource, lazy: bool = False) -> polars.DataFrame | polars.LazyFrame:
     """Return the result as a polars ``DataFrame`` (or ``LazyFrame`` if ``lazy``)."""
     import polars
 
@@ -61,7 +66,7 @@ def pl(source: _ArrowSource, lazy: bool = False) -> polars.DataFrame | polars.La
     return frame.lazy() if lazy else frame
 
 
-def fetchnumpy(source: _ArrowSource) -> dict[str, np.ndarray]:
+def fetchnumpy(source: ArrowSource) -> dict[str, np.ndarray]:
     """Return the result as a dict of column name -> ``numpy`` array."""
     table = arrow(source)
     return {

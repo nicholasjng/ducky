@@ -10,6 +10,7 @@ if sys.version_info >= (3, 12):
 else:
     from typing_extensions import Unpack
 
+from ._conversions import ArrowSource
 from ._core import (
     Appender,
     Connection,
@@ -58,6 +59,7 @@ def connect(
 
 __all__ = [
     "Appender",
+    "ArrowSource",
     "Connection",
     "Dataset",
     "DuckDBConfig",
