@@ -329,6 +329,12 @@ NB_MODULE(_core, m) {
              "Snapshot of the current query's progress: "
              "(percentage, rows_processed, total_rows_to_process). "
              "`percentage` is -1.0 until DuckDB has an estimate.")
+        .def("register_arrow", &Connection::register_arrow, "name"_a, "obj"_a,
+             nb::sig("def register_arrow(self, name: str, obj: typing.Any) -> None"),
+             "Register a Python object exposing `__arrow_c_stream__` (pyarrow "
+             "Table, polars DataFrame, pandas-3 DataFrame, ...) as a table named "
+             "`name`. The data is materialized into DuckDB at registration; "
+             "the source object is not retained.")
         .def("close", &Connection::close, "Close the connection.")
         .def(
             "__enter__", [](Connection& self) -> Connection& { return self; },

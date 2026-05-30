@@ -64,6 +64,13 @@ class Connection {
     // DuckDB hasn't computed an estimate yet. Thread-safe.
     nb::tuple progress() const;
 
+    // Register a Python object exposing the Arrow PyCapsule interface
+    // (`__arrow_c_stream__`) as a table named `name`. The data is materialized
+    // into a real DuckDB table at registration so subsequent queries against
+    // `name` see the full dataset (the Arrow C stream is single-pass — a
+    // lazy view would be drained by the first SELECT).
+    void register_arrow(const std::string& name, nb::object obj);
+
     void close();
 
    private:
