@@ -14,74 +14,6 @@ using namespace nb::literals;
 
 namespace {
 
-// Maps the DuckDB types we decode to their canonical SQL names.
-const char* type_name(duckdb_type type) {
-    switch (type) {
-        case DUCKDB_TYPE_BOOLEAN:
-            return "BOOLEAN";
-        case DUCKDB_TYPE_TINYINT:
-            return "TINYINT";
-        case DUCKDB_TYPE_SMALLINT:
-            return "SMALLINT";
-        case DUCKDB_TYPE_INTEGER:
-            return "INTEGER";
-        case DUCKDB_TYPE_BIGINT:
-            return "BIGINT";
-        case DUCKDB_TYPE_UTINYINT:
-            return "UTINYINT";
-        case DUCKDB_TYPE_USMALLINT:
-            return "USMALLINT";
-        case DUCKDB_TYPE_UINTEGER:
-            return "UINTEGER";
-        case DUCKDB_TYPE_UBIGINT:
-            return "UBIGINT";
-        case DUCKDB_TYPE_HUGEINT:
-            return "HUGEINT";
-        case DUCKDB_TYPE_UHUGEINT:
-            return "UHUGEINT";
-        case DUCKDB_TYPE_FLOAT:
-            return "FLOAT";
-        case DUCKDB_TYPE_DOUBLE:
-            return "DOUBLE";
-        case DUCKDB_TYPE_DECIMAL:
-            return "DECIMAL";
-        case DUCKDB_TYPE_VARCHAR:
-            return "VARCHAR";
-        case DUCKDB_TYPE_BLOB:
-            return "BLOB";
-        case DUCKDB_TYPE_DATE:
-            return "DATE";
-        case DUCKDB_TYPE_TIME:
-            return "TIME";
-        case DUCKDB_TYPE_TIMESTAMP:
-            return "TIMESTAMP";
-        case DUCKDB_TYPE_TIMESTAMP_S:
-            return "TIMESTAMP_S";
-        case DUCKDB_TYPE_TIMESTAMP_MS:
-            return "TIMESTAMP_MS";
-        case DUCKDB_TYPE_TIMESTAMP_NS:
-            return "TIMESTAMP_NS";
-        case DUCKDB_TYPE_TIMESTAMP_TZ:
-            return "TIMESTAMP_TZ";
-        case DUCKDB_TYPE_UUID:
-            return "UUID";
-        case DUCKDB_TYPE_INTERVAL:
-            return "INTERVAL";
-        case DUCKDB_TYPE_ENUM:
-            return "ENUM";
-        case DUCKDB_TYPE_LIST:
-            return "LIST";
-        case DUCKDB_TYPE_STRUCT:
-            return "STRUCT";
-        case DUCKDB_TYPE_MAP:
-            return "MAP";
-        case DUCKDB_TYPE_ARRAY:
-            return "ARRAY";
-        default:
-            return "UNKNOWN";
-    }
-}
-
 // Python constructors we convert into, imported once and intentionally leaked so
 // their destructors never run after interpreter shutdown.
 struct PyTypes {
@@ -336,7 +268,7 @@ nb::object convert_value(duckdb_vector vector, duckdb_logical_type logical, idx_
         }
         default:
             throw DuckyError(std::string("ducky: column type ") +
-                             type_name(duckdb_get_type_id(logical)) + " is not decoded yet");
+                             duckdb_type_name(duckdb_get_type_id(logical)) + " is not decoded yet");
     }
 }
 
@@ -473,7 +405,7 @@ void Result::release_chunk() {
 std::vector<std::string> Result::column_types() const {
     std::vector<std::string> out;
     out.reserve(column_count_);
-    for (duckdb_type t : types_) out.emplace_back(type_name(t));
+    for (duckdb_type t : types_) out.emplace_back(duckdb_type_name(t));
     return out;
 }
 
@@ -482,7 +414,7 @@ nb::object Result::description() const {
     nb::list out;
     for (idx_t i = 0; i < column_count_; ++i) {
         // (name, type_code, display_size, internal_size, precision, scale, null_ok)
-        out.append(nb::make_tuple(names_[i], type_name(types_[i]), nb::none(), nb::none(),
+        out.append(nb::make_tuple(names_[i], duckdb_type_name(types_[i]), nb::none(), nb::none(),
                                   nb::none(), nb::none(), nb::none()));
     }
     return out;

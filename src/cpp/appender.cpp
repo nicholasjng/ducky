@@ -66,73 +66,6 @@ bool flat_dtype_for(duckdb_type t, FlatDType& out) {
     }
 }
 
-const char* type_name(duckdb_type type) {
-    switch (type) {
-        case DUCKDB_TYPE_BOOLEAN:
-            return "BOOLEAN";
-        case DUCKDB_TYPE_TINYINT:
-            return "TINYINT";
-        case DUCKDB_TYPE_SMALLINT:
-            return "SMALLINT";
-        case DUCKDB_TYPE_INTEGER:
-            return "INTEGER";
-        case DUCKDB_TYPE_BIGINT:
-            return "BIGINT";
-        case DUCKDB_TYPE_UTINYINT:
-            return "UTINYINT";
-        case DUCKDB_TYPE_USMALLINT:
-            return "USMALLINT";
-        case DUCKDB_TYPE_UINTEGER:
-            return "UINTEGER";
-        case DUCKDB_TYPE_UBIGINT:
-            return "UBIGINT";
-        case DUCKDB_TYPE_HUGEINT:
-            return "HUGEINT";
-        case DUCKDB_TYPE_UHUGEINT:
-            return "UHUGEINT";
-        case DUCKDB_TYPE_FLOAT:
-            return "FLOAT";
-        case DUCKDB_TYPE_DOUBLE:
-            return "DOUBLE";
-        case DUCKDB_TYPE_DATE:
-            return "DATE";
-        case DUCKDB_TYPE_TIME:
-            return "TIME";
-        case DUCKDB_TYPE_TIMESTAMP:
-            return "TIMESTAMP";
-        case DUCKDB_TYPE_TIMESTAMP_S:
-            return "TIMESTAMP_S";
-        case DUCKDB_TYPE_TIMESTAMP_MS:
-            return "TIMESTAMP_MS";
-        case DUCKDB_TYPE_TIMESTAMP_NS:
-            return "TIMESTAMP_NS";
-        case DUCKDB_TYPE_TIMESTAMP_TZ:
-            return "TIMESTAMP_TZ";
-        case DUCKDB_TYPE_VARCHAR:
-            return "VARCHAR";
-        case DUCKDB_TYPE_BLOB:
-            return "BLOB";
-        case DUCKDB_TYPE_DECIMAL:
-            return "DECIMAL";
-        case DUCKDB_TYPE_INTERVAL:
-            return "INTERVAL";
-        case DUCKDB_TYPE_UUID:
-            return "UUID";
-        case DUCKDB_TYPE_ENUM:
-            return "ENUM";
-        case DUCKDB_TYPE_LIST:
-            return "LIST";
-        case DUCKDB_TYPE_STRUCT:
-            return "STRUCT";
-        case DUCKDB_TYPE_MAP:
-            return "MAP";
-        case DUCKDB_TYPE_ARRAY:
-            return "ARRAY";
-        default:
-            return "UNKNOWN";
-    }
-}
-
 // Quote a DuckDB identifier for safe embedding in a SQL string.
 std::string quote_ident(const std::string& s) {
     std::string out;
@@ -267,7 +200,7 @@ std::vector<std::string> Appender::column_names() const { return names_; }
 std::vector<std::string> Appender::column_types() const {
     std::vector<std::string> out;
     out.reserve(type_ids_.size());
-    for (auto id : type_ids_) out.emplace_back(type_name(id));
+    for (auto id : type_ids_) out.emplace_back(duckdb_type_name(id));
     return out;
 }
 
@@ -362,13 +295,13 @@ void append_one(duckdb_appender app, duckdb_type t, nb::handle value, idx_t col)
             break;
         }
         default:
-            throw DuckyError(std::string("ducky: row-API append for type ") + type_name(t) +
+            throw DuckyError(std::string("ducky: row-API append for type ") + duckdb_type_name(t) +
                              " not yet supported at column " + std::to_string(col) +
                              "; use append_columns or open a roadmap issue");
     }
     if (state == DuckDBError) {
         throw DuckyError(std::string("ducky: append failed at column ") + std::to_string(col) +
-                         " (" + type_name(t) + ")");
+                         " (" + duckdb_type_name(t) + ")");
     }
 }
 
@@ -415,12 +348,12 @@ void Appender::append_columns(nb::dict columns, nb::object masks) {
         FlatDType expect;
         if (!flat_dtype_for(type_ids_[idx], expect)) {
             throw DuckyError("ducky: columnar append for type " +
-                             std::string(type_name(type_ids_[idx])) +
+                             std::string(duckdb_type_name(type_ids_[idx])) +
                              " not supported in v1 (column '" + name + "'); use append_row");
         }
         if (!dtype_eq(arr.dtype(), expect.dtype)) {
             throw DuckyError("ducky: column '" + name + "' dtype mismatch (target is " +
-                             type_name(type_ids_[idx]) + ")");
+                             duckdb_type_name(type_ids_[idx]) + ")");
         }
         int64_t len = static_cast<int64_t>(arr.shape(0));
         if (n_rows < 0)

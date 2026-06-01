@@ -9,73 +9,6 @@
 
 namespace {
 
-const char* type_name(duckdb_type type) {
-    switch (type) {
-        case DUCKDB_TYPE_BOOLEAN:
-            return "BOOLEAN";
-        case DUCKDB_TYPE_TINYINT:
-            return "TINYINT";
-        case DUCKDB_TYPE_SMALLINT:
-            return "SMALLINT";
-        case DUCKDB_TYPE_INTEGER:
-            return "INTEGER";
-        case DUCKDB_TYPE_BIGINT:
-            return "BIGINT";
-        case DUCKDB_TYPE_UTINYINT:
-            return "UTINYINT";
-        case DUCKDB_TYPE_USMALLINT:
-            return "USMALLINT";
-        case DUCKDB_TYPE_UINTEGER:
-            return "UINTEGER";
-        case DUCKDB_TYPE_UBIGINT:
-            return "UBIGINT";
-        case DUCKDB_TYPE_FLOAT:
-            return "FLOAT";
-        case DUCKDB_TYPE_DOUBLE:
-            return "DOUBLE";
-        case DUCKDB_TYPE_DATE:
-            return "DATE";
-        case DUCKDB_TYPE_TIME:
-            return "TIME";
-        case DUCKDB_TYPE_TIMESTAMP:
-            return "TIMESTAMP";
-        case DUCKDB_TYPE_TIMESTAMP_S:
-            return "TIMESTAMP_S";
-        case DUCKDB_TYPE_TIMESTAMP_MS:
-            return "TIMESTAMP_MS";
-        case DUCKDB_TYPE_TIMESTAMP_NS:
-            return "TIMESTAMP_NS";
-        case DUCKDB_TYPE_TIMESTAMP_TZ:
-            return "TIMESTAMP_TZ";
-        case DUCKDB_TYPE_DECIMAL:
-            return "DECIMAL";
-        case DUCKDB_TYPE_HUGEINT:
-            return "HUGEINT";
-        case DUCKDB_TYPE_UHUGEINT:
-            return "UHUGEINT";
-        case DUCKDB_TYPE_VARCHAR:
-            return "VARCHAR";
-        case DUCKDB_TYPE_BLOB:
-            return "BLOB";
-        case DUCKDB_TYPE_UUID:
-            return "UUID";
-        case DUCKDB_TYPE_INTERVAL:
-            return "INTERVAL";
-        case DUCKDB_TYPE_ENUM:
-            return "ENUM";
-        case DUCKDB_TYPE_LIST:
-            return "LIST";
-        case DUCKDB_TYPE_STRUCT:
-            return "STRUCT";
-        case DUCKDB_TYPE_MAP:
-            return "MAP";
-        case DUCKDB_TYPE_ARRAY:
-            return "ARRAY";
-        default:
-            return "UNKNOWN";
-    }
-}
-
 // Maps DuckDB primitive types to a DLPack/numpy dtype matching the chunk's
 // in-memory layout. Temporal types are returned as their raw integer storage
 // (e.g. DATE -> int32 days since epoch, TIMESTAMP -> int64 microseconds).
@@ -204,7 +137,7 @@ Chunk::~Chunk() {
 std::vector<std::string> Chunk::column_types() const {
     std::vector<std::string> out;
     out.reserve(type_ids_.size());
-    for (duckdb_type t : type_ids_) out.emplace_back(type_name(t));
+    for (duckdb_type t : type_ids_) out.emplace_back(duckdb_type_name(t));
     return out;
 }
 
@@ -261,7 +194,7 @@ nb::object Chunk::column(nb::object key, nb::handle owner) {
         return nb::cast(nb::ndarray<nb::numpy, nb::ro>(data, 1, shape, owner, nullptr, idtype));
     }
 
-    throw DuckyError(std::string("ducky: column type ") + type_name(tid) +
+    throw DuckyError(std::string("ducky: column type ") + duckdb_type_name(tid) +
                      " has no flat ndarray representation; use .arrow() for this column");
 }
 
@@ -273,7 +206,7 @@ nb::object Chunk::dlpack(nb::object key, nb::handle owner) {
 
     nb::dlpack::dtype dtype;
     if (!dtype_for(tid, dtype)) {
-        throw DuckyError(std::string("ducky: column type ") + type_name(tid) +
+        throw DuckyError(std::string("ducky: column type ") + duckdb_type_name(tid) +
                          " has no flat DLPack representation; use .column() for structured types");
     }
     size_t shape[1] = {n};
@@ -284,7 +217,7 @@ int Chunk::decimal_scale(nb::object key) {
     idx_t i = resolve(key);
     if (type_ids_[i] != DUCKDB_TYPE_DECIMAL) {
         throw DuckyError(std::string("ducky: decimal_scale() called on non-DECIMAL column '") +
-                         names_[i] + "' (" + type_name(type_ids_[i]) + ")");
+                         names_[i] + "' (" + duckdb_type_name(type_ids_[i]) + ")");
     }
     return (int)duckdb_decimal_scale(types_[i]);
 }

@@ -14,6 +14,7 @@
 #include "duckdb.h"
 #include "function.hpp"
 #include "result.hpp"
+#include "table.hpp"
 
 namespace nb = nanobind;
 using namespace nb::literals;
@@ -389,6 +390,33 @@ NB_MODULE(_core, m) {
             "`pyarrow.Array` per column (positional, or a {name: Array} dict when "
             "`parameters` is a dict). Pass `record_batch=True` to receive a single "
             "`pyarrow.RecordBatch` instead. `fn` must return a `pyarrow.Array`.")
+        .def(
+            "create_aggregate_function",
+            [](Connection& self, const std::string& name, nb::object cls, nb::object parameters,
+               const std::string& return_type) {
+                create_aggregate_function(self, name, cls, parameters, return_type);
+            },
+            "name"_a, "cls"_a, "parameters"_a, "return_type"_a,
+            nb::sig("def create_aggregate_function(self, name: str, cls: type, "
+                    "parameters: list[str] | dict[str, str], return_type: str) -> None"),
+            "Register a Python class as a DuckDB aggregate function. `cls` must "
+            "have `__init__`, `update(self, *arrays)`, and `finalize(self) -> scalar` "
+            "methods. An optional `combine(self, other)` method enables parallel "
+            "aggregate execution.")
+        .def(
+            "create_table_function",
+            [](Connection& self, const std::string& name, nb::callable factory,
+               nb::object parameters, nb::object columns) {
+                create_table_function(self, name, factory, parameters, columns);
+            },
+            "name"_a, "factory"_a, "parameters"_a, "columns"_a,
+            nb::sig("def create_table_function(self, name: str, "
+                    "factory: collections.abc.Callable, "
+                    "parameters: list[str], columns: dict[str, str]) -> None"),
+            "Register a Python generator function as a DuckDB table function. "
+            "`factory` is called with the SQL arguments and must return a generator "
+            "that yields one tuple per row. `columns` is an ordered dict "
+            "{column_name: type_string} declaring the output schema.")
         .def(
             "appender",
             [](Connection& self, const std::string& table, std::optional<std::string> schema,
