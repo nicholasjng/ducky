@@ -317,6 +317,24 @@ NB_MODULE(_core, m) {
             "with `parameters`) to register a variable-arity function; `fn` is "
             "then called as `fn(*args)` with one ndarray per SQL argument.")
         .def(
+            "create_arrow_function",
+            [](Connection& self, const std::string& name, nb::callable fn, nb::object parameters,
+               const std::string& return_type, bool record_batch) {
+                create_arrow_scalar_function(self, name, std::move(fn), parameters, return_type,
+                                             record_batch);
+            },
+            "name"_a, "fn"_a, "parameters"_a, "return_type"_a, "record_batch"_a = false,
+            nb::sig("def create_arrow_function(self, name: str, fn: collections.abc.Callable, "
+                    "parameters: list[str] | dict[str, str], return_type: str, "
+                    "record_batch: bool = False) -> None"),
+            "Register a Python callable as a DuckDB scalar function backed by the "
+            "Arrow C-API path; supports VARCHAR, LIST, STRUCT, DECIMAL, MAP, and "
+            "any other DuckDB type. `parameters` is a list of DuckDB type strings "
+            "or a dict of {name: type_string}. By default `fn` is called with one "
+            "`pyarrow.Array` per column (positional, or a {name: Array} dict when "
+            "`parameters` is a dict). Pass `record_batch=True` to receive a single "
+            "`pyarrow.RecordBatch` instead. `fn` must return a `pyarrow.Array`.")
+        .def(
             "appender",
             [](Connection& self, const std::string& table, std::optional<std::string> schema,
                std::optional<std::string> catalog) {

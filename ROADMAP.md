@@ -7,10 +7,14 @@ Legend: ✅ shipped · 🟡 partially shipped · ⬜ not started.
 
 ## v2: UDFs
 
-- ⬜ **String / nested types.** A second registration variant takes a
+- ✅ **String / nested types.** `Connection.create_arrow_function` takes a
   `pyarrow.RecordBatch` per call and returns a `pyarrow.Array`. Built on
-  DuckDB's existing Arrow stream path, this covers `VARCHAR`, `LIST`,
-  `STRUCT`, `DECIMAL`, `MAP` — i.e. anything the ndarray path refuses.
+  DuckDB's Arrow C API (`duckdb_data_chunk_to_arrow` /
+  `duckdb_data_chunk_from_arrow` + `duckdb_vector_reference_vector`), this
+  covers `VARCHAR`, `LIST`, `STRUCT`, `DECIMAL`, `MAP` — i.e. anything the
+  ndarray path refuses. Type expressions are parsed by DuckDB itself via a
+  `SELECT CAST(NULL AS <t>)` round-trip, so the full type grammar is
+  supported.
 - ✅ **Nullable outputs.** A UDF may return `(values, mask)` where `mask` is a
   1D uint8/bool ndarray (1=valid, 0=null); the trampoline ensures the output
   validity bitset and flips the null bits via

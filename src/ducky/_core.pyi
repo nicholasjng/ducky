@@ -241,6 +241,18 @@ class Connection:
         Register a Python callable as a DuckDB scalar function. `parameters` is a list of type strings (positional call) or a dict of {name: type_string} (dict-style call). Inputs arrive as zero-copy 1-D ndarrays; `fn` must return one ndarray of length chunk_size and matching dtype. If `parameters` or `return_type` is omitted, they are inferred from `fn`'s annotations (bool/int/float → BOOLEAN/BIGINT/DOUBLE). Pass `varargs="TYPE"` (mutually exclusive with `parameters`) to register a variable-arity function; `fn` is then called as `fn(*args)` with one ndarray per SQL argument.
         """
 
+    def create_arrow_function(
+        self,
+        name: str,
+        fn: Callable,
+        parameters: list[str] | dict[str, str],
+        return_type: str,
+        record_batch: bool = False,
+    ) -> None:
+        """
+        Register a Python callable as a DuckDB scalar function backed by the Arrow C-API path; supports VARCHAR, LIST, STRUCT, DECIMAL, MAP, and any other DuckDB type. `parameters` is a list of DuckDB type strings or a dict of {name: type_string}. By default `fn` is called with one `pyarrow.Array` per column (positional, or a {name: Array} dict when `parameters` is a dict). Pass `record_batch=True` to receive a single `pyarrow.RecordBatch` instead. `fn` must return a `pyarrow.Array`.
+        """
+
     def appender(
         self, table: str, schema: str | None = None, catalog: str | None = None
     ) -> Appender:
