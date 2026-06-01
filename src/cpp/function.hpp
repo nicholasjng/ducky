@@ -1,6 +1,7 @@
 #pragma once
 
 #include <nanobind/nanobind.h>
+#include <nanobind/ndarray.h>
 
 #include <string>
 
@@ -10,6 +11,25 @@ namespace nb = nanobind;
 
 // Forward decl; full type in connection.hpp.
 class Connection;
+
+// A primitive type supported by ndarray UDFs and aggregate UDFs: DuckDB type
+// name, enum value, element size in bytes, and DLPack dtype factory.
+struct TypeSpec {
+    const char* name;
+    duckdb_type type;
+    size_t size;
+    nb::dlpack::dtype (*dtype)();
+};
+
+// Returns the TypeSpec for `name`, or throws DuckyError if not found.
+// Covers the same set as Chunk.column(): BOOLEAN, [U]TINYINT..BIGINT,
+// FLOAT, DOUBLE, DATE, TIME, TIMESTAMP variants.
+const TypeSpec& lookup_typespec(const std::string& name);
+
+// Parse a DuckDB type expression via a SQL round-trip. Supports the full type
+// grammar: "VARCHAR", "DECIMAL(10,2)", "LIST(INTEGER)", etc.
+// Returns an owned logical type; caller must destroy with duckdb_destroy_logical_type.
+duckdb_logical_type parse_logical_type(duckdb_connection con, const std::string& type_str);
 
 // Registers a Python callable as a DuckDB scalar function on `con`. Inputs are
 // passed to `fn` as zero-copy 1-D numpy ndarrays over the input chunk's vectors;

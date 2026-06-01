@@ -13,13 +13,6 @@
 
 namespace {
 
-struct TypeSpec {
-    const char* name;
-    duckdb_type type;
-    size_t size;  // size in bytes of one element in the chunk buffer
-    nb::dlpack::dtype (*dtype)();
-};
-
 template <typename T>
 nb::dlpack::dtype dt() {
     return nb::dtype<T>();
@@ -228,36 +221,6 @@ void udf_trampoline(duckdb_function_info info, duckdb_data_chunk input, duckdb_v
 
 // ── Arrow UDF ────────────────────────────────────────────────────────────────
 
-// Parse a DuckDB type expression (e.g. "VARCHAR", "DECIMAL(10,2)",
-// "LIST(INTEGER)", "STRUCT(a INTEGER, b VARCHAR)") by round-tripping through
-// DuckDB's own parser: `SELECT CAST(NULL AS <expr>)` produces a result column
-// whose logical type is exactly what we want. We restrict the allowed
-// character set so the interpolation can't smuggle in extra statements — this
-// is registration-time API, but the cost of being strict is essentially zero.
-duckdb_logical_type parse_logical_type(duckdb_connection con, const std::string& type_str) {
-    if (type_str.empty()) {
-        throw DuckyError("ducky: empty type string");
-    }
-    for (char c : type_str) {
-        bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
-                  c == '_' || c == '(' || c == ')' || c == '[' || c == ']' || c == '<' ||
-                  c == '>' || c == ',' || c == ' ';
-        if (!ok) {
-            throw DuckyError("ducky: invalid character in type string '" + type_str + "'");
-        }
-    }
-    std::string q = "SELECT CAST(NULL AS " + type_str + ")";
-    duckdb_result r;
-    if (duckdb_query(con, q.c_str(), &r) == DuckDBError) {
-        std::string err = duckdb_result_error(&r);
-        duckdb_destroy_result(&r);
-        throw DuckyError("ducky: invalid DuckDB type '" + type_str + "': " + err);
-    }
-    duckdb_logical_type lt = duckdb_column_logical_type(&r, 0);
-    duckdb_destroy_result(&r);
-    return lt;
-}
-
 struct ArrowUDFContext {
     nb::callable callable;            // owns the Python ref
     duckdb_connection con = nullptr;  // borrowed; valid while connection is open
@@ -413,6 +376,32 @@ void arrow_udf_trampoline(duckdb_function_info info, duckdb_data_chunk input,
 
 }  // namespace
 
+const TypeSpec& lookup_typespec(const std::string& name) { return lookup(name); }
+
+duckdb_logical_type parse_logical_type(duckdb_connection con, const std::string& type_str) {
+    if (type_str.empty()) {
+        throw DuckyError("ducky: empty type string");
+    }
+    for (char c : type_str) {
+        bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+                  c == '_' || c == '(' || c == ')' || c == '[' || c == ']' || c == '<' ||
+                  c == '>' || c == ',' || c == ' ';
+        if (!ok) {
+            throw DuckyError("ducky: invalid character in type string '" + type_str + "'");
+        }
+    }
+    std::string q = "SELECT CAST(NULL AS " + type_str + ")";
+    duckdb_result r;
+    if (duckdb_query(con, q.c_str(), &r) == DuckDBError) {
+        std::string err = duckdb_result_error(&r);
+        duckdb_destroy_result(&r);
+        throw DuckyError("ducky: invalid DuckDB type '" + type_str + "': " + err);
+    }
+    duckdb_logical_type lt = duckdb_column_logical_type(&r, 0);
+    duckdb_destroy_result(&r);
+    return lt;
+}
+
 duckdb_type parse_type_name(const std::string& name) { return lookup(name).type; }
 
 void create_scalar_function(Connection& con, const std::string& name, nb::callable fn,
@@ -476,6 +465,7 @@ void create_scalar_function(Connection& con, const std::string& name, nb::callab
     }
     // Hand off ownership of ctx to DuckDB; release() returns the raw pointer
     // (already stashed via set_extra_info above), which we intentionally drop.
+    // NOLINTNEXTLINE(bugprone-unused-return-value)
     (void)ctx.release();
 }
 
@@ -532,5 +522,6 @@ void create_arrow_scalar_function(Connection& con, const std::string& name, nb::
         throw DuckyError("ducky: failed to register arrow UDF '" + name +
                          "' (name in use, or invalid types?)");
     }
+    // NOLINTNEXTLINE(bugprone-unused-return-value)
     (void)ctx.release();
 }

@@ -8,6 +8,7 @@
 
 #include <atomic>
 
+#include "aggregate.hpp"
 #include "appender.hpp"
 #include "chunk.hpp"
 #include "connection.hpp"

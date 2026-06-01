@@ -285,6 +285,13 @@ class Connection:
         Register a Python callable as a DuckDB scalar function backed by the Arrow C-API path; supports VARCHAR, LIST, STRUCT, DECIMAL, MAP, and any other DuckDB type. `parameters` is a list of DuckDB type strings or a dict of {name: type_string}. By default `fn` is called with one `pyarrow.Array` per column (positional, or a {name: Array} dict when `parameters` is a dict). Pass `record_batch=True` to receive a single `pyarrow.RecordBatch` instead. `fn` must return a `pyarrow.Array`.
         """
 
+    def create_aggregate_function(
+        self, name: str, cls: type, parameters: list[str] | dict[str, str], return_type: str
+    ) -> None:
+        """
+        Register a Python class as a DuckDB aggregate function. `cls` must have `__init__`, `update(self, *arrays)`, and `finalize(self) -> scalar` methods. An optional `combine(self, other)` method enables parallel aggregate execution.
+        """
+
     def appender(
         self, table: str, schema: str | None = None, catalog: str | None = None
     ) -> Appender:
