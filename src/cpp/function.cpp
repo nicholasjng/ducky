@@ -55,6 +55,61 @@ const TypeSpec& lookup(const std::string& name) {
                      "DATE, TIME, TIMESTAMP[_S/MS/NS/TZ])");
 }
 
+// Map a Python annotation object to a DuckDB type string. Only the natural
+// numeric/boolean Python types are recognized — anything else is a user
+// error that should be made explicit by passing `parameters=` / `return_type=`.
+std::string annotation_to_type(nb::handle hint, const std::string& where) {
+    nb::module_ builtins = nb::module_::import_("builtins");
+    if (hint.is(builtins.attr("bool"))) return "BOOLEAN";
+    if (hint.is(builtins.attr("int"))) return "BIGINT";
+    if (hint.is(builtins.attr("float"))) return "DOUBLE";
+    std::string repr = nb::cast<std::string>(nb::str(hint));
+    throw DuckyError("ducky: cannot infer DuckDB type from annotation " + repr + " on " + where +
+                     " (supported: bool, int, float — pass `parameters=`/`return_type=` "
+                     "explicitly for other types)");
+}
+
+// Build a positional `parameters` list by inspecting `fn`'s annotations.
+nb::list infer_parameters(nb::callable fn) {
+    nb::module_ inspect = nb::module_::import_("inspect");
+    nb::module_ typing = nb::module_::import_("typing");
+    nb::object sig = inspect.attr("signature")(fn);
+    nb::object params = sig.attr("parameters");  // ordered mapping
+    nb::dict hints;
+    try {
+        hints = nb::cast<nb::dict>(typing.attr("get_type_hints")(fn));
+    } catch (nb::python_error&) {
+        throw DuckyError("ducky: failed to resolve type hints on UDF for inference");
+    }
+    nb::list out;
+    for (auto item : params) {
+        std::string pname = nb::cast<std::string>(item);
+        if (!hints.contains(pname.c_str())) {
+            throw DuckyError("ducky: UDF parameter '" + pname +
+                             "' has no type annotation (annotate it, or pass `parameters=` "
+                             "explicitly)");
+        }
+        out.append(annotation_to_type(hints[pname.c_str()], "parameter '" + pname + "'"));
+    }
+    return out;
+}
+
+std::string infer_return_type(nb::callable fn) {
+    nb::module_ typing = nb::module_::import_("typing");
+    nb::dict hints;
+    try {
+        hints = nb::cast<nb::dict>(typing.attr("get_type_hints")(fn));
+    } catch (nb::python_error&) {
+        throw DuckyError("ducky: failed to resolve type hints on UDF for inference");
+    }
+    if (!hints.contains("return")) {
+        throw DuckyError(
+            "ducky: UDF has no return type annotation (annotate it, or pass "
+            "`return_type=` explicitly)");
+    }
+    return annotation_to_type(hints["return"], "return value");
+}
+
 // Lives in DuckDB's extra_info slot; carries everything the trampoline needs to
 // dispatch one chunk of input to the user's callable.
 struct UDFContext {
@@ -167,8 +222,11 @@ duckdb_type parse_type_name(const std::string& name) { return lookup(name).type;
 void create_scalar_function(Connection& con, const std::string& name, nb::callable fn,
                             nb::object parameters, nb::object return_type) {
     auto ctx = std::make_unique<UDFContext>();
+    if (parameters.is_none()) parameters = infer_parameters(fn);
+    std::string rt_name =
+        return_type.is_none() ? infer_return_type(fn) : nb::cast<std::string>(return_type);
     ctx->callable = std::move(fn);
-    ctx->return_type = &lookup(return_type);
+    ctx->return_type = &lookup(rt_name);
 
     if (nb::isinstance<nb::dict>(parameters)) {
         nb::dict d = nb::cast<nb::dict>(parameters);

@@ -25,7 +25,7 @@ class Connection;
 // filter with SQL `WHERE x IS NOT NULL` if you need clean inputs. Output is
 // always non-null in v1.
 void create_scalar_function(Connection& con, const std::string& name, nb::callable fn,
-                            nb::object parameters, const std::string& return_type);
+                            nb::object parameters, nb::object return_type);
 
 // Returns the duckdb_type enum for one of our supported primitive type names.
 // Throws DuckyError on unknown names.

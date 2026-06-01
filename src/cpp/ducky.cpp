@@ -298,17 +298,20 @@ NB_MODULE(_core, m) {
         .def(
             "create_function",
             [](Connection& self, const std::string& name, nb::callable fn, nb::object parameters,
-               const std::string& return_type) {
+               nb::object return_type) {
                 create_scalar_function(self, name, std::move(fn), parameters, return_type);
             },
-            "name"_a, "fn"_a, "parameters"_a, "return_type"_a,
+            "name"_a, "fn"_a, "parameters"_a = nb::none(), "return_type"_a = nb::none(),
             nb::sig("def create_function(self, name: str, fn: collections.abc.Callable, "
-                    "parameters: list[str] | dict[str, str], return_type: str) -> None"),
+                    "parameters: list[str] | dict[str, str] | None = None, "
+                    "return_type: str | None = None) -> None"),
             "Register a Python callable as a DuckDB scalar function. "
             "`parameters` is a list of type strings (positional call) or a "
             "dict of {name: type_string} (dict-style call). Inputs arrive as "
             "zero-copy 1-D ndarrays; `fn` must return one ndarray of length "
-            "chunk_size and matching dtype.")
+            "chunk_size and matching dtype. If `parameters` or `return_type` is "
+            "omitted, they are inferred from `fn`'s annotations (bool/int/float "
+            "→ BOOLEAN/BIGINT/DOUBLE).")
         .def(
             "appender",
             [](Connection& self, const std::string& table, std::optional<std::string> schema,

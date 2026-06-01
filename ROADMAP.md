@@ -16,9 +16,10 @@ Legend: ✅ shipped · 🟡 partially shipped · ⬜ not started.
   validity bitset and flips the null bits via
   `duckdb_validity_set_row_invalid`.
 - ⬜ **Varargs UDFs** via `duckdb_scalar_function_set_varargs`.
-- ⬜ **Type inference from Python hints.** Optional sugar:
-  `def f(x: float, y: int) -> float` infers
-  `parameters=["DOUBLE", "BIGINT"]`, `return_type="DOUBLE"`.
+- ✅ **Type inference from Python hints.** `parameters` / `return_type` are
+  optional; when omitted, `inspect.signature` + `typing.get_type_hints` derive
+  them from `fn`'s annotations (`bool`→BOOLEAN, `int`→BIGINT, `float`→DOUBLE).
+  Anything else raises a clear error pointing the user at the explicit form.
 - ⬜ **Aggregate and table UDFs** (`duckdb_create_aggregate_function`,
   `duckdb_create_table_function`). The scalar trampoline is the template.
 
