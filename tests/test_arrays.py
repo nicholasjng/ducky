@@ -99,3 +99,72 @@ def test_to_jax_device():
     arrs = res.to_jax(device=cpu)
     # JAX places the array on the requested device.
     assert list(arrs["i"].devices()) == [cpu]
+
+
+# ── iter_batches_torch / iter_batches_jax ─────────────────────────────────
+
+
+def test_iter_batches_torch_yields_tensors():
+    torch = pytest.importorskip("torch")
+    n = 5000
+    res = ducky.connect().sql(f"SELECT i FROM range({n}) t(i)")
+    tensors = []
+    for batch in res.iter_batches_torch():
+        assert isinstance(batch["i"], torch.Tensor)
+        tensors.append(batch["i"])
+    combined = torch.cat(tensors)
+    assert combined.tolist() == list(range(n))
+
+
+def test_iter_batches_torch_column_subset():
+    torch = pytest.importorskip("torch")
+    res = ducky.connect().sql("SELECT 1 AS a, 2 AS b, 3 AS c")
+    [batch] = list(res.iter_batches_torch(columns=["a", "c"]))
+    assert set(batch) == {"a", "c"}
+    assert isinstance(batch["a"], torch.Tensor)
+
+
+def test_iter_batches_torch_via_connection():
+    pytest.importorskip("torch")
+    con = ducky.connect()
+    con.execute("SELECT i FROM range(4) t(i)")
+    [batch] = list(con.iter_batches_torch())
+    assert batch["i"].tolist() == [0, 1, 2, 3]
+
+
+def test_to_torch_no_numpy_intermediate():
+    # Regression: to_torch must not go through to_numpy (no copy to numpy first).
+    # Verified structurally — to_torch uses iter_batches_torch internally.
+    torch = pytest.importorskip("torch")
+    n = 5000
+    arrs = ducky.connect().sql(f"SELECT i FROM range({n}) t(i)").to_torch()
+    assert isinstance(arrs["i"], torch.Tensor)
+    assert arrs["i"].tolist() == list(range(n))
+
+
+def test_iter_batches_jax_yields_arrays():
+    pytest.importorskip("jax")
+    import jax.numpy as jnp
+
+    n = 5000
+    res = ducky.connect().sql(f"SELECT i FROM range({n}) t(i)")
+    arrays = []
+    for batch in res.iter_batches_jax():
+        arrays.append(batch["i"])
+    combined = jnp.concatenate(arrays)
+    np.testing.assert_array_equal(np.asarray(combined), np.arange(n))
+
+
+def test_iter_batches_jax_via_connection():
+    pytest.importorskip("jax")
+    con = ducky.connect()
+    con.execute("SELECT i FROM range(4) t(i)")
+    [batch] = list(con.iter_batches_jax())
+    np.testing.assert_array_equal(np.asarray(batch["i"]), [0, 1, 2, 3])
+
+
+def test_to_jax_no_numpy_intermediate():
+    pytest.importorskip("jax")
+    n = 5000
+    arrs = ducky.connect().sql(f"SELECT i FROM range({n}) t(i)").to_jax()
+    np.testing.assert_array_equal(np.asarray(arrs["i"]), np.arange(n))

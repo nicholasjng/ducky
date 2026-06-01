@@ -83,3 +83,116 @@ def test_bad_key_errors():
         chunk.column("nope")
     with pytest.raises(ducky.Error, match="out of range"):
         chunk.column(5)
+
+
+# ── Structured / wide-integer types ───────────────────────────────────────
+
+
+def test_hugeint_column():
+    chunk = ducky.connect().sql("SELECT CAST(1 AS HUGEINT) h").fetch_chunk()
+    assert chunk is not None
+    col = chunk.column("h")
+    assert col.dtype == np.dtype([("lower", "<u8"), ("upper", "<i8")])
+    assert col[0]["lower"] == 1
+    assert col[0]["upper"] == 0
+
+
+def test_uhugeint_column():
+    chunk = ducky.connect().sql("SELECT CAST(1 AS UHUGEINT) h").fetch_chunk()
+    assert chunk is not None
+    col = chunk.column("h")
+    assert col.dtype == np.dtype([("lower", "<u8"), ("upper", "<u8")])
+    assert col[0]["lower"] == 1
+    assert col[0]["upper"] == 0
+
+
+def test_interval_column():
+    chunk = ducky.connect().sql("SELECT INTERVAL '2' MONTH AS iv").fetch_chunk()
+    assert chunk is not None
+    col = chunk.column("iv")
+    assert col.dtype == np.dtype([("months", "<i4"), ("days", "<i4"), ("micros", "<i8")])
+    assert col[0]["months"] == 2
+    assert col[0]["days"] == 0
+    assert col[0]["micros"] == 0
+
+
+def test_decimal_column_small():
+    chunk = ducky.connect().sql("SELECT CAST(1.5 AS DECIMAL(5,2)) d").fetch_chunk()
+    assert chunk is not None
+    col = chunk.column("d")
+    # DECIMAL(5,2) fits in int16 — raw integer value should be 150 (1.5 * 10^2)
+    assert col.dtype in (np.dtype("int16"), np.dtype("int32"), np.dtype("int64"))
+    assert col[0] == 150
+
+
+def test_decimal_scale():
+    chunk = ducky.connect().sql("SELECT CAST(1.5 AS DECIMAL(5,2)) d").fetch_chunk()
+    assert chunk is not None
+    assert chunk.decimal_scale("d") == 2
+    assert chunk.decimal_scale(0) == 2
+
+
+def test_decimal_scale_non_decimal_raises():
+    chunk = ducky.connect().sql("SELECT 42 AS x").fetch_chunk()
+    assert chunk is not None
+    with pytest.raises(ducky.Error, match="non-DECIMAL"):
+        chunk.decimal_scale("x")
+
+
+# ── DLPack export ──────────────────────────────────────────────────────────
+
+
+def test_dlpack_has_protocol():
+    chunk = ducky.connect().sql("SELECT i FROM range(3) t(i)").fetch_chunk()
+    assert chunk is not None
+    obj = chunk.dlpack("i")
+    assert hasattr(obj, "__dlpack__")
+    assert hasattr(obj, "__dlpack_device__")
+
+
+def test_dlpack_torch():
+    torch = pytest.importorskip("torch")
+    chunk = (
+        ducky.connect().sql("SELECT i, CAST(i * 1.5 AS DOUBLE) d FROM range(4) t(i)").fetch_chunk()
+    )
+    assert chunk is not None
+    ti = torch.from_dlpack(chunk.dlpack("i"))
+    td = torch.from_dlpack(chunk.dlpack("d"))
+    assert ti.dtype == torch.int64
+    assert td.dtype == torch.float64
+    assert ti.tolist() == [0, 1, 2, 3]
+    assert td.tolist() == [0.0, 1.5, 3.0, 4.5]
+
+
+def test_dlpack_jax():
+    pytest.importorskip("jax")
+    import jax.numpy as jnp
+
+    chunk = ducky.connect().sql("SELECT CAST(i AS FLOAT) f FROM range(3) t(i)").fetch_chunk()
+    assert chunk is not None
+    arr = jnp.asarray(chunk.dlpack("f"))
+    np.testing.assert_allclose(np.asarray(arr), [0.0, 1.0, 2.0])
+
+
+def test_dlpack_outlives_chunk():
+    torch = pytest.importorskip("torch")
+    res = ducky.connect().sql("SELECT i FROM range(5) t(i)")
+    chunk = res.fetch_chunk()
+    assert chunk is not None
+    t = torch.from_dlpack(chunk.dlpack("i"))
+    del chunk
+    assert t.tolist() == [0, 1, 2, 3, 4]
+
+
+def test_dlpack_structured_type_raises():
+    chunk = ducky.connect().sql("SELECT CAST(1 AS HUGEINT) h").fetch_chunk()
+    assert chunk is not None
+    with pytest.raises(ducky.Error, match="structured"):
+        chunk.dlpack("h")
+
+
+def test_dlpack_varchar_raises():
+    chunk = ducky.connect().sql("SELECT 'hello' AS s").fetch_chunk()
+    assert chunk is not None
+    with pytest.raises(ducky.Error, match="VARCHAR"):
+        chunk.dlpack("s")
