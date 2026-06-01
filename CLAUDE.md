@@ -13,7 +13,7 @@ If you find that some choices do not make sense anymore or could be handled bett
 ## Style
 
 Use CMake and scikit-build-core for building the Python wheel.
-Run tests with pytest. Tests should live in the tests/ folder.
+Run tests with pytest using `uv run --all-groups pytest`. Tests should live in the tests/ folder.
 Export a compile commands database using CMake, and make sure to build the project without build isolation to keep nanobind's include paths alive.
 Use prek as a linter and formatter. Run `uvx prek run --all-files --show-diff-on-failure`.
 

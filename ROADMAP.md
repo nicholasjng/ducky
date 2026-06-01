@@ -15,7 +15,10 @@ Legend: ✅ shipped · 🟡 partially shipped · ⬜ not started.
   1D uint8/bool ndarray (1=valid, 0=null); the trampoline ensures the output
   validity bitset and flips the null bits via
   `duckdb_validity_set_row_invalid`.
-- ⬜ **Varargs UDFs** via `duckdb_scalar_function_set_varargs`.
+- ✅ **Varargs UDFs** via `duckdb_scalar_function_set_varargs`. Pass
+  `varargs="TYPE"` on registration (mutually exclusive with `parameters`); the
+  trampoline reads arity from `duckdb_data_chunk_get_column_count` and calls
+  `fn(*args)` with one ndarray per SQL argument.
 - ✅ **Type inference from Python hints.** `parameters` / `return_type` are
   optional; when omitted, `inspect.signature` + `typing.get_type_hints` derive
   them from `fn`'s annotations (`bool`→BOOLEAN, `int`→BIGINT, `float`→DOUBLE).

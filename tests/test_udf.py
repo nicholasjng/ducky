@@ -221,7 +221,7 @@ def test_infer_bool():
     con = ducky.connect()
 
     def isodd(x: int) -> bool:
-        return (x % 2 == 1).astype(np.bool_)  # type: ignore[union-attr]
+        return (x % 2 == 1).astype(np.bool_)  # ty: ignore[unresolved-attribute]
 
     con.create_function("isodd", isodd)
     rows = con.sql("SELECT isodd(i) FROM range(4) t(i) ORDER BY i").fetchall()
@@ -256,6 +256,42 @@ def test_unsupported_annotation_errors():
 
     with pytest.raises(ducky.Error, match="cannot infer"):
         con.create_function("f", f)
+
+
+def test_varargs_basic():
+    con = ducky.connect()
+
+    def add_all(*cols):
+        return sum(c.astype(np.int64) for c in cols)
+
+    con.create_function("add_all", add_all, varargs="INTEGER", return_type="BIGINT")
+    [(v2,)] = con.sql("SELECT add_all(CAST(1 AS INTEGER), CAST(2 AS INTEGER))").fetchall()
+    [(v4,)] = con.sql(
+        "SELECT add_all(CAST(1 AS INTEGER), CAST(2 AS INTEGER), "
+        "CAST(3 AS INTEGER), CAST(4 AS INTEGER))"
+    ).fetchall()
+    assert (v2, v4) == (3, 10)
+
+
+def test_varargs_zero_args():
+    con = ducky.connect()
+    con.create_function(
+        "vempty", lambda *xs: np.zeros(1, dtype=np.int64), varargs="BIGINT", return_type="BIGINT"
+    )
+    [(v,)] = con.sql("SELECT vempty()").fetchall()
+    assert v == 0
+
+
+def test_varargs_conflicts_with_parameters():
+    con = ducky.connect()
+    with pytest.raises(ducky.Error, match="cannot set both"):
+        con.create_function(
+            "bad",
+            lambda *xs: xs[0],
+            parameters=["DOUBLE"],
+            varargs="DOUBLE",
+            return_type="DOUBLE",
+        )
 
 
 def test_works_across_chunk_boundaries():

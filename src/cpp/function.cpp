@@ -119,6 +119,9 @@ struct UDFContext {
     std::vector<std::string> param_names;
     std::vector<const TypeSpec*> param_types;
     const TypeSpec* return_type;
+    // When set, the function takes a variable number of arguments, all of this
+    // type. `param_types` is ignored; arity is read from the input chunk.
+    const TypeSpec* varargs_type = nullptr;
 };
 
 void udf_extra_info_destroy(void* ptr) {
@@ -132,7 +135,8 @@ void udf_trampoline(duckdb_function_info info, duckdb_data_chunk input, duckdb_v
     nb::gil_scoped_acquire gil;
 
     idx_t n = duckdb_data_chunk_get_size(input);
-    idx_t n_params = ctx->param_types.size();
+    idx_t n_params =
+        ctx->varargs_type ? duckdb_data_chunk_get_column_count(input) : ctx->param_types.size();
     size_t shape[1] = {(size_t)n};
 
     try {
@@ -145,8 +149,9 @@ void udf_trampoline(duckdb_function_info info, duckdb_data_chunk input, duckdb_v
             for (idx_t i = 0; i < n_params; ++i) {
                 duckdb_vector v = duckdb_data_chunk_get_vector(input, i);
                 void* data = duckdb_vector_get_data(v);
+                const TypeSpec* t = ctx->varargs_type ? ctx->varargs_type : ctx->param_types[i];
                 args.append(nb::ndarray<nb::numpy, nb::ro>(data, 1, shape, nb::handle(), nullptr,
-                                                           ctx->param_types[i]->dtype()));
+                                                           t->dtype()));
             }
             result = ctx->callable(*nb::tuple(args));
         } else {
@@ -220,15 +225,21 @@ void udf_trampoline(duckdb_function_info info, duckdb_data_chunk input, duckdb_v
 duckdb_type parse_type_name(const std::string& name) { return lookup(name).type; }
 
 void create_scalar_function(Connection& con, const std::string& name, nb::callable fn,
-                            nb::object parameters, nb::object return_type) {
+                            nb::object parameters, nb::object return_type, nb::object varargs) {
     auto ctx = std::make_unique<UDFContext>();
-    if (parameters.is_none()) parameters = infer_parameters(fn);
+    bool has_varargs = !varargs.is_none();
+    if (has_varargs && !parameters.is_none()) {
+        throw DuckyError("ducky: UDF '" + name + "' cannot set both `parameters` and `varargs`");
+    }
+    if (!has_varargs && parameters.is_none()) parameters = infer_parameters(fn);
     std::string rt_name =
         return_type.is_none() ? infer_return_type(fn) : nb::cast<std::string>(return_type);
     ctx->callable = std::move(fn);
     ctx->return_type = &lookup(rt_name);
 
-    if (nb::isinstance<nb::dict>(parameters)) {
+    if (has_varargs) {
+        ctx->varargs_type = &lookup(nb::cast<std::string>(varargs));
+    } else if (nb::isinstance<nb::dict>(parameters)) {
         nb::dict d = nb::cast<nb::dict>(parameters);
         for (auto item : d) {
             ctx->param_names.emplace_back(nb::cast<std::string>(item.first));
@@ -240,12 +251,17 @@ void create_scalar_function(Connection& con, const std::string& name, nb::callab
             ctx->param_types.push_back(&lookup(nb::cast<std::string>(item)));
         }
     }
-    if (ctx->param_types.empty()) {
+    if (!has_varargs && ctx->param_types.empty()) {
         throw DuckyError("ducky: UDF '" + name + "' must declare at least one parameter");
     }
 
     duckdb_scalar_function f = duckdb_create_scalar_function();
     duckdb_scalar_function_set_name(f, name.c_str());
+    if (has_varargs) {
+        duckdb_logical_type lt = duckdb_create_logical_type(ctx->varargs_type->type);
+        duckdb_scalar_function_set_varargs(f, lt);
+        duckdb_destroy_logical_type(&lt);
+    }
     for (const TypeSpec* t : ctx->param_types) {
         duckdb_logical_type lt = duckdb_create_logical_type(t->type);
         duckdb_scalar_function_add_parameter(f, lt);
