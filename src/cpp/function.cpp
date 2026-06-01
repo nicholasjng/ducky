@@ -105,8 +105,21 @@ void udf_trampoline(duckdb_function_info info, duckdb_data_chunk input, duckdb_v
             result = ctx->callable(kwargs);
         }
 
+        // The UDF may return either an ndarray of values, or a (values, mask)
+        // tuple where `mask` is a 1D uint8/bool array (1=valid, 0=null).
+        nb::object values_obj = result;
+        nb::object mask_obj;
+        if (nb::isinstance<nb::tuple>(result)) {
+            nb::tuple t = nb::cast<nb::tuple>(result);
+            if (nb::len(t) != 2) {
+                throw DuckyError("ducky: UDF tuple return must be (values, mask)");
+            }
+            values_obj = t[0];
+            mask_obj = t[1];
+        }
+
         // Validate + memcpy the returned ndarray into the output vector.
-        auto arr = nb::cast<nb::ndarray<nb::numpy>>(result);
+        auto arr = nb::cast<nb::ndarray<nb::numpy>>(values_obj);
         if (arr.ndim() != 1 || arr.shape(0) != n) {
             throw DuckyError("ducky: UDF returned an array of shape != (" + std::to_string(n) +
                              ",)");
@@ -119,6 +132,25 @@ void udf_trampoline(duckdb_function_info info, duckdb_data_chunk input, duckdb_v
         }
         void* out_data = duckdb_vector_get_data(output);
         std::memcpy(out_data, arr.data(), n * ctx->return_type->size);
+
+        if (mask_obj) {
+            auto mask = nb::cast<nb::ndarray<nb::numpy>>(mask_obj);
+            if (mask.ndim() != 1 || mask.shape(0) != n) {
+                throw DuckyError("ducky: UDF mask shape != (" + std::to_string(n) + ",)");
+            }
+            nb::dlpack::dtype mdt = mask.dtype();
+            // Accept uint8 or bool (both 8-bit unsigned in DLPack: code=1, bits=8).
+            if (mdt.bits != 8 || (mdt.code != (uint8_t)nb::dlpack::dtype_code::UInt &&
+                                  mdt.code != (uint8_t)nb::dlpack::dtype_code::Bool)) {
+                throw DuckyError("ducky: UDF mask must be uint8 or bool");
+            }
+            duckdb_vector_ensure_validity_writable(output);
+            uint64_t* validity = duckdb_vector_get_validity(output);
+            const uint8_t* m = (const uint8_t*)mask.data();
+            for (idx_t i = 0; i < n; ++i) {
+                if (!m[i]) duckdb_validity_set_row_invalid(validity, i);
+            }
+        }
     } catch (nb::python_error& e) {
         std::string msg = std::string("ducky UDF error: ") + e.what();
         duckdb_scalar_function_set_error(info, msg.c_str());
@@ -133,7 +165,7 @@ void udf_trampoline(duckdb_function_info info, duckdb_data_chunk input, duckdb_v
 duckdb_type parse_type_name(const std::string& name) { return lookup(name).type; }
 
 void create_scalar_function(Connection& con, const std::string& name, nb::callable fn,
-                            nb::object parameters, const std::string& return_type) {
+                            nb::object parameters, nb::object return_type) {
     auto ctx = std::make_unique<UDFContext>();
     ctx->callable = std::move(fn);
     ctx->return_type = &lookup(return_type);

@@ -11,8 +11,10 @@ Legend: ✅ shipped · 🟡 partially shipped · ⬜ not started.
   `pyarrow.RecordBatch` per call and returns a `pyarrow.Array`. Built on
   DuckDB's existing Arrow stream path, this covers `VARCHAR`, `LIST`,
   `STRUCT`, `DECIMAL`, `MAP` — i.e. anything the ndarray path refuses.
-- ⬜ **Nullable outputs.** Optional `(values, mask)` return convention so UDFs
-  can produce NULLs; wires up to `duckdb_vector_get_validity` on the output.
+- ✅ **Nullable outputs.** A UDF may return `(values, mask)` where `mask` is a
+  1D uint8/bool ndarray (1=valid, 0=null); the trampoline ensures the output
+  validity bitset and flips the null bits via
+  `duckdb_validity_set_row_invalid`.
 - ⬜ **Varargs UDFs** via `duckdb_scalar_function_set_varargs`.
 - ⬜ **Type inference from Python hints.** Optional sugar:
   `def f(x: float, y: int) -> float` infers

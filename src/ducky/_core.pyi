@@ -230,10 +230,14 @@ class Connection:
         """Return the last result as {name: jax.Array}."""
 
     def create_function(
-        self, name: str, fn: Callable, parameters: list[str] | dict[str, str], return_type: str
+        self,
+        name: str,
+        fn: Callable,
+        parameters: list[str] | dict[str, str] | None = None,
+        return_type: str | None = None,
     ) -> None:
         """
-        Register a Python callable as a DuckDB scalar function. `parameters` is a list of type strings (positional call) or a dict of {name: type_string} (dict-style call). Inputs arrive as zero-copy 1-D ndarrays; `fn` must return one ndarray of length chunk_size and matching dtype.
+        Register a Python callable as a DuckDB scalar function. `parameters` is a list of type strings (positional call) or a dict of {name: type_string} (dict-style call). Inputs arrive as zero-copy 1-D ndarrays; `fn` must return one ndarray of length chunk_size and matching dtype. If `parameters` or `return_type` is omitted, they are inferred from `fn`'s annotations (bool/int/float → BOOLEAN/BIGINT/DOUBLE).
         """
 
     def appender(
