@@ -3,6 +3,9 @@ Connection.interrupt(), Connection.progress()."""
 
 from __future__ import annotations
 
+import os
+import signal
+import sys
 import threading
 import time
 
@@ -111,6 +114,71 @@ def test_interrupt_cancels_long_query():
     assert not t.is_alive(), "query did not respond to interrupt within 10s"
     assert err, "expected the interrupted query to raise"
     assert isinstance(err[0], ducky.Error)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="SIGINT-on-self is unreliable on Windows")
+def test_keyboard_interrupt_lands_mid_query():
+    # The pending-execute loop checks PyErr_CheckSignals() between ticks, so
+    # SIGINT delivered to the process raises KeyboardInterrupt out of execute()
+    # rather than parking the main thread until the query finishes. Without the
+    # pending substrate the old gil_scoped_release path could only surface
+    # signals *after* duckdb_execute_prepared returned.
+    con = ducky.connect(threads=2)
+
+    prior = signal.getsignal(signal.SIGINT)
+    signal.signal(signal.SIGINT, signal.default_int_handler)
+    try:
+
+        def kicker():
+            time.sleep(0.05)
+            os.kill(os.getpid(), signal.SIGINT)
+
+        t = threading.Thread(target=kicker)
+        t.start()
+        try:
+            with pytest.raises(KeyboardInterrupt):
+                con.execute(
+                    "SELECT count(*) FROM range(10_000_000_000) t(i) WHERE i % 7 = 0"
+                ).fetchall()
+        finally:
+            t.join()
+    finally:
+        signal.signal(signal.SIGINT, prior)
+
+    # The connection survives an interrupted query — a fresh query still runs.
+    assert con.execute("SELECT 1").fetchone() == (1,)
+
+
+def test_streaming_result_iterates_all_chunks():
+    # Smoke test: streaming=True returns a Result whose chunks are pulled
+    # lazily via duckdb_fetch_chunk. We can't directly observe peak memory in
+    # a unit test, but we can verify the streaming result iterates correctly
+    # and yields every row.
+    con = ducky.connect()
+    n = 50_000  # several chunks at STANDARD_VECTOR_SIZE=2048
+    res = con.execute("SELECT * FROM range(?) t(i)", [n], streaming=True).current_result
+    chunks = 0
+    seen = 0
+    while True:
+        chunk = res.fetch_chunk()
+        if chunk is None:
+            break
+        chunks += 1
+        seen += len(chunk.column("i"))
+    assert seen == n
+    assert chunks > 1, "expected the streaming result to span multiple chunks"
+    # Exhausted streaming result returns None on further fetches.
+    assert res.fetch_chunk() is None
+
+
+def test_streaming_via_prepared_statement():
+    con = ducky.connect()
+    with con.prepare("SELECT * FROM range(?) t(i)") as stmt:
+        res = stmt.execute([20_000], streaming=True)
+        rows = res.fetchall()
+    assert len(rows) == 20_000
+    assert rows[0] == (0,)
+    assert rows[-1] == (19_999,)
 
 
 def test_progress_during_long_query():

@@ -90,9 +90,11 @@ class PreparedStatement {
     PreparedStatement& operator=(const PreparedStatement&) = delete;
 
     // Bind `parameters` (list/tuple positional, dict named, or None) and run
-    // the statement, returning its Result. The GIL is released across the
-    // execution so DuckDB's scheduler (and UDF workers) can run.
-    std::shared_ptr<Result> execute(nb::object parameters);
+    // the statement, returning its Result. The executor is driven one task at
+    // a time with the GIL released between ticks, so KeyboardInterrupt lands
+    // mid-query and DuckDB's scheduler (plus any UDF workers) can run. Pass
+    // `streaming=true` for a lazy chunk-pull result; see Connection::execute.
+    std::shared_ptr<Result> execute(nb::object parameters, bool streaming);
 
     // Run the statement once per parameter set in `seq`, discarding each
     // result. The fast path for batched INSERT/UPDATE/DELETE.

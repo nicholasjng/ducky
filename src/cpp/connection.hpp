@@ -30,11 +30,14 @@ class Connection {
 
     // Runs a query (optionally with positional parameters) and stashes the
     // result for the PEP 249-style fetch* methods. Returns *this so callers can
-    // chain, e.g. con.execute(...).fetchall().
-    Connection& execute(const std::string& query, nb::object parameters);
+    // chain, e.g. con.execute(...).fetchall(). Pass `streaming=true` to receive
+    // a lazy streaming result whose chunks are produced on demand (peak memory
+    // bounded to one chunk; consumed once via the fetch / iter_batches path).
+    Connection& execute(const std::string& query, nb::object parameters, bool streaming);
 
-    // Eagerly runs a query and hands back its Result directly.
-    std::shared_ptr<Result> sql(const std::string& query);
+    // Eagerly runs a query and hands back its Result directly. See execute()
+    // for the `streaming` semantics.
+    std::shared_ptr<Result> sql(const std::string& query, bool streaming);
 
     // Compile `query` once into a PreparedStatement that can be executed
     // repeatedly with different parameters. Raises DuckyError on a parse/bind
@@ -83,7 +86,7 @@ class Connection {
    private:
     void ensure_open() const;
     Result& current();
-    duckdb_result run(const std::string& query, nb::object parameters);
+    duckdb_result run(const std::string& query, nb::object parameters, bool streaming);
     // Wraps a result, sharing ownership of the database/connection handle so the
     // result (and any Arrow stream from it) stays usable after this Connection
     // is closed or dropped.

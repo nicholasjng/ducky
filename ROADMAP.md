@@ -110,10 +110,35 @@ Legend: ✅ shipped · 🟡 partially shipped · ⬜ not started.
     through tqdm when installed and degrades to a minimal stderr
     `desc [####    ]  42.0%` printer otherwise (`use_tqdm=False` forces the
     fallback) — importing the helper never hard-fails on a missing tqdm.
-- ⬜ **Pending / streaming results** (`duckdb_pending_prepared`,
-  `duckdb_execute_pending`, `duckdb_pending_execute_task`). The proper
-  substrate for releasing the GIL during `execute` (see UDF section) and for
-  a true streaming `to_torch` / `to_jax` that avoids the intermediate copy.
+- ✅ **Pending / streaming results** (`duckdb_pending_prepared`,
+  `duckdb_pending_prepared_streaming`, `duckdb_pending_execute_task`,
+  `duckdb_execute_pending`). `Connection.execute` / `Connection.sql` /
+  `PreparedStatement.execute` all route through a single `run_pending` helper
+  in `connection.cpp` that drives the executor one task at a time with the GIL
+  released between ticks. Two wins over the old `gil_scoped_release` wrap of
+  `duckdb_execute_prepared`: (1) `PyErr_CheckSignals()` runs between ticks, so
+  `KeyboardInterrupt` lands mid-query instead of parking until the query
+  finishes — on signal we call `duckdb_interrupt`, drain the pending result,
+  and re-raise; (2) opt-in `streaming=True` on those three entry points
+  returns a streaming `duckdb_result` whose chunks are pulled lazily via
+  `duckdb_fetch_chunk`, so `iter_batches_torch` / `iter_batches_jax` /
+  `iter_batches_mlx` can stay bounded to one chunk of peak memory. The
+  parameterless `duckdb_query` fast path is gone — everything routes through
+  `duckdb_prepare` for one unified pending path; multi-statement strings are
+  deliberately not supported (`duckdb_extract_statements` is the roadmap path
+  if we ever want them back, see *Multi-statement scripts* below).
+  - ⬜ **Auto-streaming for iter_batches\_\* / to_torch / to_jax.** Today the
+    caller has to remember `con.execute(sql, streaming=True).iter_batches_torch()`.
+    A `Connection.iter_torch(sql, ...)` (and friends) that runs the query with
+    `streaming=True` internally would close the ergonomic gap; alternatively,
+    have `iter_batches_*` warn when the source isn't streaming so the bounded-
+    memory claim above stays honest.
+  - ⬜ **`async def execute`.** The per-task tick loop is already an awaitable
+    state machine in disguise — replacing the 1ms `sleep_for` with an
+    `await asyncio.sleep(0)` (and routing the per-tick GIL dance through
+    `loop.run_in_executor`) gives a real `async` execute that cooperates with
+    the event loop instead of parking it. Mostly mechanical once we decide
+    whether to ship a separate `AsyncConnection` or piggyback on the existing one.
 
 ## Dataset / feature API
 

@@ -20,4 +20,5 @@ __pycache__/
 # pointed into ext/duckdb/.
 /scripts/
 !/scripts/init-duckdb.sh
+!/scripts/asan-pytest.sh
 /.github/patches/

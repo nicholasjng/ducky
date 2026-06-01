@@ -55,11 +55,7 @@ metadata.version.input = "src/ducky/__init__.py"
 if.env.DUCKY_ASAN = "1"
 build-dir = "build/asan"
 cmake.build-type = "Debug"
-cmake.args = [
-    "-DCMAKE_CXX_FLAGS=-fsanitize=address -fno-omit-frame-pointer",
-    "-DCMAKE_C_FLAGS=-fsanitize=address -fno-omit-frame-pointer",
-    "-DCMAKE_SHARED_LINKER_FLAGS=-fsanitize=address",
-]
+cmake.args = ["-DDUCKY_ASAN=ON"]
 
 [tool.ruff]
 line-length = 100

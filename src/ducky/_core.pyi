@@ -201,9 +201,11 @@ class PreparedStatement:
     A SQL statement compiled once via Connection.prepare(), executable repeatedly with different parameters without re-parsing the query.
     """
 
-    def execute(self, parameters: list | tuple | dict[str, Any] | None = None) -> Result:
+    def execute(
+        self, parameters: list | tuple | dict[str, Any] | None = None, streaming: bool = False
+    ) -> Result:
         """
-        Bind `parameters` (positional list/tuple, named dict, or None) and run the statement, returning its Result.
+        Bind `parameters` (positional list/tuple, named dict, or None) and run the statement, returning its Result. Pass `streaming=True` for a lazy streaming result whose chunks are produced on demand — peak memory stays bounded to one chunk, useful for iter_batches_torch / iter_batches_jax / iter_batches_mlx on large queries. A streaming result is single-pass; consume it via fetch* or iter_batches*, not both.
         """
 
     def executemany(self, parameters: Iterable[list | tuple | dict[str, Any]]) -> None:
@@ -250,16 +252,19 @@ class Connection:
     """A connection to a DuckDB database."""
 
     def execute(
-        self, query: str, parameters: list | tuple | dict[str, Any] | None = None
+        self,
+        query: str,
+        parameters: list | tuple | dict[str, Any] | None = None,
+        streaming: bool = False,
     ) -> Connection:
         """
-        Execute a query, optionally with positional parameters, and return self for chaining.
+        Execute a query, optionally with positional parameters, and return self for chaining. Pass `streaming=True` for a lazy streaming result whose chunks are produced on demand — peak memory stays bounded to one chunk, useful for iter_batches_torch / iter_batches_jax / iter_batches_mlx on large queries. A streaming result is single-pass; consume it via fetch* or iter_batches*, not both.
         """
 
-    def sql(self, query: str) -> Result:
-        """Run a query and return its Result."""
+    def sql(self, query: str, streaming: bool = False) -> Result:
+        """Run a query and return its Result. See execute() for `streaming`."""
 
-    def query(self, query: str) -> Result:
+    def query(self, query: str, streaming: bool = False) -> Result:
         """Alias for sql()."""
 
     def prepare(self, query: str) -> PreparedStatement:

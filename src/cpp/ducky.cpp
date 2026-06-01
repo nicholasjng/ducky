@@ -259,10 +259,16 @@ NB_MODULE(_core, m) {
         "A SQL statement compiled once via Connection.prepare(), executable "
         "repeatedly with different parameters without re-parsing the query.")
         .def("execute", &PreparedStatement::execute, "parameters"_a = nb::none(),
+             "streaming"_a = false,
              nb::sig("def execute(self, parameters: list | tuple | dict[str, typing.Any] | None = "
-                     "None) -> Result"),
+                     "None, streaming: bool = False) -> Result"),
              "Bind `parameters` (positional list/tuple, named dict, or None) and "
-             "run the statement, returning its Result.")
+             "run the statement, returning its Result. Pass `streaming=True` for "
+             "a lazy streaming result whose chunks are produced on demand — peak "
+             "memory stays bounded to one chunk, useful for iter_batches_torch / "
+             "iter_batches_jax / iter_batches_mlx on large queries. A streaming "
+             "result is single-pass; consume it via fetch* or iter_batches*, not "
+             "both.")
         .def("executemany", &PreparedStatement::executemany, "parameters"_a,
              nb::sig("def executemany(self, parameters: collections.abc.Iterable[list | tuple | "
                      "dict[str, typing.Any]]) -> None"),
@@ -296,15 +302,24 @@ NB_MODULE(_core, m) {
     nb::class_<Connection> conn_cls(m, "Connection", "A connection to a DuckDB database.");
     conn_cls
         .def("execute", &Connection::execute, "query"_a, "parameters"_a = nb::none(),
-             nb::rv_policy::reference,
+             "streaming"_a = false, nb::rv_policy::reference,
              nb::sig("def execute(self, query: str, parameters: list | tuple | "
-                     "dict[str, typing.Any] | None = None) -> Connection"),
+                     "dict[str, typing.Any] | None = None, streaming: bool = False) -> Connection"),
              "Execute a query, optionally with positional parameters, and "
-             "return self for chaining.")
+             "return self for chaining. Pass `streaming=True` for a lazy "
+             "streaming result whose chunks are produced on demand — peak "
+             "memory stays bounded to one chunk, useful for iter_batches_torch "
+             "/ iter_batches_jax / iter_batches_mlx on large queries. A "
+             "streaming result is single-pass; consume it via fetch* or "
+             "iter_batches*, not both.")
         // The returned Result shares the DuckDBHandle, so it keeps the database
         // open on its own — no keep_alive needed.
-        .def("sql", &Connection::sql, "query"_a, "Run a query and return its Result.")
-        .def("query", &Connection::sql, "query"_a, "Alias for sql().")
+        .def("sql", &Connection::sql, "query"_a, "streaming"_a = false,
+             nb::sig("def sql(self, query: str, streaming: bool = False) -> Result"),
+             "Run a query and return its Result. See execute() for `streaming`.")
+        .def("query", &Connection::sql, "query"_a, "streaming"_a = false,
+             nb::sig("def query(self, query: str, streaming: bool = False) -> Result"),
+             "Alias for sql().")
         .def("prepare", &Connection::prepare, "query"_a,
              nb::sig("def prepare(self, query: str) -> PreparedStatement"),
              "Compile `query` once into a PreparedStatement for repeated execution "

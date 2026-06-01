@@ -24,6 +24,23 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
 endif()
 
+# AddressSanitizer build. Driven by -DDUCKY_ASAN=ON (or DUCKY_ASAN=1 in the env
+# from scikit-build-core). The flag goes onto the _core target's COMPILE_OPTIONS
+# / LINK_OPTIONS (not CMAKE_CXX_FLAGS) so nanobind's stubgen sanitizer-detector
+# (nanobind PR #1000) finds it and preloads libclang_rt.asan via DYLD_INSERT_LIBRARIES
+# when importing _core during stub generation — putting the flag on the global
+# CMAKE_CXX_FLAGS works for the compiler but not for the detector, which walks
+# per-target properties only. add_compile_options also covers duckdb_static so
+# its objects stay ASAN-instrumented.
+option(DUCKY_ASAN "Build with AddressSanitizer" OFF)
+if(DEFINED ENV{DUCKY_ASAN} AND NOT DUCKY_ASAN)
+  set(DUCKY_ASAN ON)
+endif()
+if(DUCKY_ASAN)
+  add_compile_options(-fsanitize=address -fno-omit-frame-pointer)
+  add_link_options(-fsanitize=address)
+endif()
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Python + nanobind
 # ──────────────────────────────────────────────────────────────────────────────
@@ -135,6 +152,17 @@ endforeach()
 # producing unresolved __imp_* references when linking the static library.
 # No-op on other platforms.
 target_compile_definitions(_core PRIVATE DUCKDB_STATIC_BUILD)
+
+# Repeat -fsanitize=address on the _core target itself: add_compile_options sets
+# the *directory*'s COMPILE_OPTIONS, but nanobind's stubgen sanitizer detector
+# (PR #1000, see nanobind_sanitizer_preload_env in nanobind-config.cmake) only
+# scans per-target COMPILE_OPTIONS / LINK_OPTIONS. Without this, the detector
+# concludes "no sanitizer" and runs stubgen without preloading libclang_rt.asan,
+# which then aborts at `import _core` with "Interceptors are not working".
+if(DUCKY_ASAN)
+  target_compile_options(_core PRIVATE -fsanitize=address -fno-omit-frame-pointer)
+  target_link_options(_core PRIVATE -fsanitize=address)
+endif()
 
 install(TARGETS _core LIBRARY DESTINATION ducky)
 
