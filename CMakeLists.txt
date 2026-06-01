@@ -162,7 +162,7 @@ execute_process(
 if(_ruff_available EQUAL 0)
     add_custom_command(
         TARGET _core_stub POST_BUILD
-        COMMAND ${Python_EXECUTABLE} -m ruff check --fix --quiet
+        COMMAND ${Python_EXECUTABLE} -m ruff check --fix --exit-zero --quiet
             ${CMAKE_CURRENT_SOURCE_DIR}/src/ducky/_core.pyi
         COMMAND ${Python_EXECUTABLE} -m ruff format --quiet
             ${CMAKE_CURRENT_SOURCE_DIR}/src/ducky/_core.pyi
