@@ -138,23 +138,67 @@ def to_numpy(source: _ChunkSource, columns: Iterable[str] | None = None) -> dict
     return {name: np.concatenate(arrs) for name, arrs in parts.items()}
 
 
+def iter_batches_torch(
+    source: _ChunkSource,
+    columns: Iterable[str] | None = None,
+    device: torch.device | str | int | None = None,
+) -> Iterator[dict[str, torch.Tensor]]:
+    """Yield one dict per chunk: ``{name: torch.Tensor}``.
+
+    Each tensor is derived directly from the chunk's buffer via DLPack
+    (zero-copy on CPU). If ``device`` is given each tensor is moved there
+    before yielding. Chunks are released as soon as the caller advances the
+    iterator, so peak memory is bounded by one chunk at a time.
+    """
+    import torch
+
+    for chunk in chunks(source):
+        names = _select(chunk.columns, columns)
+        batch = {}
+        for n in names:
+            t = torch.from_dlpack(chunk.dlpack(n))
+            if device is not None:
+                t = t.to(device)
+            batch[n] = t
+        yield batch
+
+
 def to_torch(
     source: _ChunkSource,
     columns: Iterable[str] | None = None,
     device: torch.device | str | int | None = None,
 ) -> dict[str, torch.Tensor]:
-    """Like ``to_numpy`` but returns ``torch.Tensor`` values.
+    """Eagerly concatenate all chunks into ``{name: torch.Tensor}``.
 
-    The CPU path goes through ``torch.from_dlpack`` (zero-copy from the numpy
-    buffer); if ``device`` is given the tensor is copied onto that device.
+    Uses ``iter_torch_batches`` internally, so no intermediate numpy
+    materialization occurs; each chunk is converted via DLPack and released
+    before the next is fetched.
     """
     import torch
 
-    arrays = to_numpy(source, columns=columns)
-    out = {name: torch.from_dlpack(arr) for name, arr in arrays.items()}
-    if device is not None:
-        out = {name: t.to(device) for name, t in out.items()}
-    return out
+    parts: dict[str, list[torch.Tensor]] = {}
+    for batch in iter_batches_torch(source, columns=columns, device=device):
+        for name, t in batch.items():
+            parts.setdefault(name, []).append(t)
+    return {name: torch.cat(ts) for name, ts in parts.items()}
+
+
+def iter_batches_jax(
+    source: _ChunkSource,
+    columns: Iterable[str] | None = None,
+    device: jax.Device | None = None,
+) -> Iterator[dict[str, jax.Array]]:
+    """Yield one dict per chunk: ``{name: jax.Array}``.
+
+    Each array is derived directly from the chunk's buffer. On CPU JAX shares
+    the buffer (zero-copy); on accelerators a transfer occurs. Chunks are
+    released as soon as the caller advances the iterator.
+    """
+    import jax.numpy as jnp
+
+    for chunk in chunks(source):
+        names = _select(chunk.columns, columns)
+        yield {n: jnp.asarray(chunk.dlpack(n), device=device) for n in names}
 
 
 def to_jax(
@@ -162,12 +206,15 @@ def to_jax(
     columns: Iterable[str] | None = None,
     device: jax.Device | None = None,
 ) -> dict[str, jax.Array]:
-    """Like ``to_numpy`` but returns ``jax.Array`` values.
+    """Eagerly concatenate all chunks into ``{name: jax.Array}``.
 
-    ``device`` is forwarded to ``jax.numpy.asarray`` (Array-API standard).
-    On CPU JAX shares the numpy buffer; on accelerators the data is copied.
+    Uses ``iter_jax_batches`` internally, so no intermediate numpy
+    materialization occurs.
     """
     import jax.numpy as jnp
 
-    arrays = to_numpy(source, columns=columns)
-    return {name: jnp.asarray(arr, device=device) for name, arr in arrays.items()}
+    parts: dict[str, list[jax.Array]] = {}
+    for batch in iter_batches_jax(source, columns=columns, device=device):
+        for name, arr in batch.items():
+            parts.setdefault(name, []).append(arr)
+    return {name: jnp.concatenate(arrs) for name, arrs in parts.items()}

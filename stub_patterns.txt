@@ -36,7 +36,7 @@ pl:
 
 # iter_batches: dict values are bare ndarrays when with_validity=False,
 # (values, mask) tuples when with_validity=True.
-iter_batches:
+\.iter_batches$:
     @overload
     def iter_batches(self, columns: Iterable[str] | None = None, with_validity: Literal[False] = False) -> Iterator[dict[str, numpy.ndarray]]: ...
     @overload

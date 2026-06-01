@@ -43,6 +43,16 @@ class Chunk:
         Return a uint8 ndarray (1=valid, 0=null) of length len(self), or None if the column has no nulls.
         """
 
+    def decimal_scale(self, key: int | str) -> int:
+        """
+        Return the scale (digits after the decimal point) for a DECIMAL column. Raises Error if the column is not DECIMAL.
+        """
+
+    def dlpack(self, key: int | str) -> Any:
+        """
+        Return the column at `key` as an object implementing the DLPack protocol (__dlpack__ / __dlpack_device__), without going through numpy. Flat numeric/temporal types only.
+        """
+
 class Result:
     """
     A query result. Iterate it, or use the fetch* methods, to pull rows as tuples.
@@ -108,6 +118,18 @@ class Result:
         """
         Yield one dict per chunk: {name: ndarray}, or {name: (values, mask)} if with_validity=True.
         """
+
+    def iter_batches_torch(
+        self, columns: Iterable[str] | None = None, device: torch.device | str | int | None = None
+    ) -> Iterator[dict[str, torch.Tensor]]:
+        """
+        Yield one dict per chunk: {name: torch.Tensor}. Zero-copy on CPU via DLPack.
+        """
+
+    def iter_batches_jax(
+        self, columns: Iterable[str] | None = None, device: jax.Device | None = None
+    ) -> Iterator[dict[str, jax.Array]]:
+        """Yield one dict per chunk: {name: jax.Array}."""
 
     def to_numpy(self, columns: Iterable[str] | None = None) -> dict[str, numpy.ndarray]:
         """Eagerly concatenate all chunks into {name: numpy.ndarray}."""
@@ -215,6 +237,16 @@ class Connection:
         self, columns: Iterable[str] | None = None, with_validity: bool = False
     ) -> Iterator[dict[str, numpy.ndarray] | dict[str, tuple[numpy.ndarray, numpy.ndarray | None]]]:
         """Yield one dict per chunk for the last result."""
+
+    def iter_batches_torch(
+        self, columns: Iterable[str] | None = None, device: torch.device | str | int | None = None
+    ) -> Iterator[dict[str, torch.Tensor]]:
+        """Yield one dict per chunk for the last result: {name: torch.Tensor}."""
+
+    def iter_batches_jax(
+        self, columns: Iterable[str] | None = None, device: jax.Device | None = None
+    ) -> Iterator[dict[str, jax.Array]]:
+        """Yield one dict per chunk for the last result: {name: jax.Array}."""
 
     def to_numpy(self, columns: Iterable[str] | None = None) -> dict[str, numpy.ndarray]:
         """Return the last result as {name: numpy.ndarray}."""
