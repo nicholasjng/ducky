@@ -292,6 +292,13 @@ class Connection:
         Register a Python class as a DuckDB aggregate function. `cls` must have `__init__`, `update(self, *arrays)`, and `finalize(self) -> scalar` methods. An optional `combine(self, other)` method enables parallel aggregate execution.
         """
 
+    def create_table_function(
+        self, name: str, factory: Callable, parameters: list[str], columns: dict[str, str]
+    ) -> None:
+        """
+        Register a Python generator function as a DuckDB table function. `factory` is called with the SQL arguments and must return a generator that yields one tuple per row. `columns` is an ordered dict {column_name: type_string} declaring the output schema.
+        """
+
     def appender(
         self, table: str, schema: str | None = None, catalog: str | None = None
     ) -> Appender:

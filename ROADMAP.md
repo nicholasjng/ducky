@@ -27,8 +27,15 @@ Legend: ✅ shipped · 🟡 partially shipped · ⬜ not started.
   optional; when omitted, `inspect.signature` + `typing.get_type_hints` derive
   them from `fn`'s annotations (`bool`→BOOLEAN, `int`→BIGINT, `float`→DOUBLE).
   Anything else raises a clear error pointing the user at the explicit form.
-- ⬜ **Aggregate and table UDFs** (`duckdb_create_aggregate_function`,
-  `duckdb_create_table_function`). The scalar trampoline is the template.
+- ✅ **Aggregate and table UDFs** (`duckdb_create_aggregate_function`,
+  `duckdb_create_table_function`). `Connection.create_aggregate_function`
+  takes a class with `__init__` / `update(*arrays)` / `finalize()` and an
+  optional `combine(other)` for parallel execution; state is a live Python
+  instance stored as a `PyObject*` in DuckDB's aggregate state slot. Without
+  `combine`, a `__dict__`-copy fallback keeps serial queries correct.
+  `Connection.create_table_function` wraps a Python generator factory: DuckDB
+  calls bind / init / produce; the produce loop drives `next()` up to 2048
+  rows per chunk and writes values into DuckDB vectors via typed dispatch.
 
 ## v2: ndarray export
 
