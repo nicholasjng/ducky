@@ -49,6 +49,16 @@ logging.level = "INFO"
 metadata.version.provider = "scikit_build_core.metadata.regex"
 metadata.version.input = "src/ducky/__init__.py"
 
+[[tool.scikit-build.overrides]]
+if.env.DUCKY_ASAN = "1"
+build-dir = "build/asan"
+cmake.build-type = "Debug"
+cmake.args = [
+    "-DCMAKE_CXX_FLAGS=-fsanitize=address -fno-omit-frame-pointer",
+    "-DCMAKE_C_FLAGS=-fsanitize=address -fno-omit-frame-pointer",
+    "-DCMAKE_SHARED_LINKER_FLAGS=-fsanitize=address",
+]
+
 [tool.ruff]
 line-length = 100
 target-version = "py311"
