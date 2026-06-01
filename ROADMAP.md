@@ -32,14 +32,20 @@ Legend: ✅ shipped · 🟡 partially shipped · ⬜ not started.
 
 ## v2: ndarray export
 
-- ⬜ **Richer dtypes.** `DECIMAL` (as int128 + scale), `HUGEINT` (as a pair of
-  int64), `INTERVAL` (struct of months/days/micros).
-- ⬜ **Streaming `to_torch` / `to_jax`.** Today they materialize via `to_numpy`
-  and concatenate; a chunk-by-chunk variant would avoid the intermediate
-  copy for large results.
-- ⬜ **Direct DLPack export from `Chunk`.** Numpy already exposes `__dlpack__`,
-  so torch / JAX consumers work today via that bridge; a native DLPack
-  capsule would let non-numpy consumers skip the round-trip.
+- ✅ **Richer dtypes.** `HUGEINT` / `UHUGEINT` / `INTERVAL` / `DECIMAL` are
+  now exposed via `Chunk.column()` as numpy structured arrays (zero-copy via
+  `.view()`). `Chunk.decimal_scale()` returns the exponent so callers can
+  reconstruct the exact value.
+- ✅ **Streaming `to_torch` / `to_jax`.** `Result.iter_batches_torch` /
+  `iter_batches_jax` yield one `{name: Tensor/Array}` dict per chunk
+  (zero-copy on CPU via DLPack), keeping peak memory bounded to one chunk.
+  `to_torch` / `to_jax` now use these iterators internally, eliminating the
+  intermediate numpy materialization of the old `to_numpy`-then-convert path.
+- ✅ **Direct DLPack export from `Chunk`.** `Chunk.dlpack(key)` returns a
+  `nanobind.nb_ndarray` with `__dlpack__` / `__dlpack_device__` (using
+  nanobind's `array_api` framework, which requires no external library).
+  `iter_batches_torch` / `iter_batches_jax` use this path, so numpy is no
+  longer in the tensor/array hot path.
 
 ## v2: round-trip data path
 

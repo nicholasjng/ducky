@@ -132,6 +132,48 @@ bool dtype_for(duckdb_type t, nb::dlpack::dtype& out) {
     }
 }
 
+// Lazily-constructed numpy structured dtypes for HUGEINT, UHUGEINT, and
+// INTERVAL. Each is built from Python on first use and intentionally leaked so
+// its destructor never runs at interpreter shutdown (same pattern as
+// bind_types() in connection.cpp).
+struct StructDtypes {
+    nb::object hugeint;   // dtype([('lower','<u8'),('upper','<i8')])
+    nb::object uhugeint;  // dtype([('lower','<u8'),('upper','<u8')])
+    nb::object interval;  // dtype([('months','<i4'),('days','<i4'),('micros','<i8')])
+};
+
+const StructDtypes& struct_dtypes() {
+    static std::atomic<StructDtypes*> cached{nullptr};
+    static nb::ft_mutex mu;
+    if (StructDtypes* p = cached.load()) return *p;
+    nb::module_ np = nb::module_::import_("numpy");
+    auto mk = [&](std::initializer_list<std::pair<const char*, const char*>> fields) {
+        nb::list spec;
+        for (auto& [name, code] : fields) spec.append(nb::make_tuple(name, code));
+        return np.attr("dtype")(spec);
+    };
+    auto* p = new StructDtypes{
+        mk({{"lower", "<u8"}, {"upper", "<i8"}}),
+        mk({{"lower", "<u8"}, {"upper", "<u8"}}),
+        mk({{"months", "<i4"}, {"days", "<i4"}, {"micros", "<i8"}}),
+    };
+    nb::ft_lock_guard lock(mu);
+    if (StructDtypes* q = cached.load()) return *q;
+    cached.store(p);
+    return *p;
+}
+
+// Wrap `data` (n * itemsize bytes) as a zero-copy uint8 ndarray, then call
+// numpy .view(dtype) to reinterpret it as a structured array of n elements.
+// `owner` keeps the underlying buffer alive via nanobind's owner mechanism.
+nb::object make_struct_view(void* data, size_t n, size_t itemsize, nb::object dtype,
+                            nb::handle owner) {
+    size_t byte_count = n * itemsize;
+    nb::object raw = nb::cast(
+        nb::ndarray<nb::numpy, nb::ro>(data, 1, &byte_count, owner, nullptr, nb::dtype<uint8_t>()));
+    return raw.attr("view")(dtype);
+}
+
 }  // namespace
 
 Chunk::Chunk(duckdb_data_chunk chunk, std::vector<std::string> names,
@@ -186,15 +228,65 @@ idx_t Chunk::resolve(nb::object key) const {
 
 nb::object Chunk::column(nb::object key, nb::handle owner) {
     idx_t i = resolve(key);
-    nb::dlpack::dtype dtype;
-    if (!dtype_for(type_ids_[i], dtype)) {
-        throw DuckyError(std::string("ducky: column type ") + type_name(type_ids_[i]) +
-                         " has no flat ndarray representation; use .arrow() for this column");
-    }
     void* data = duckdb_vector_get_data(vectors_[i]);
-    size_t shape[1] = {(size_t)size_};
-    // Read-only view: callers shouldn't mutate DuckDB's chunk buffer.
-    return nb::cast(nb::ndarray<nb::numpy, nb::ro>(data, 1, shape, owner, nullptr, dtype));
+    size_t n = (size_t)size_;
+    duckdb_type tid = type_ids_[i];
+
+    // Primitive / temporal types — zero-copy ndarray.
+    nb::dlpack::dtype dtype;
+    if (dtype_for(tid, dtype)) {
+        size_t shape[1] = {n};
+        return nb::cast(nb::ndarray<nb::numpy, nb::ro>(data, 1, shape, owner, nullptr, dtype));
+    }
+
+    // Structured types — zero-copy uint8 buffer reinterpreted via numpy .view().
+    const StructDtypes& sd = struct_dtypes();
+    if (tid == DUCKDB_TYPE_HUGEINT) {
+        return make_struct_view(data, n, sizeof(duckdb_hugeint), sd.hugeint, owner);
+    }
+    if (tid == DUCKDB_TYPE_UHUGEINT) {
+        return make_struct_view(data, n, sizeof(duckdb_uhugeint), sd.uhugeint, owner);
+    }
+    if (tid == DUCKDB_TYPE_INTERVAL) {
+        return make_struct_view(data, n, sizeof(duckdb_interval), sd.interval, owner);
+    }
+    if (tid == DUCKDB_TYPE_DECIMAL) {
+        duckdb_type internal = duckdb_decimal_internal_type(types_[i]);
+        if (internal == DUCKDB_TYPE_HUGEINT) {
+            return make_struct_view(data, n, sizeof(duckdb_hugeint), sd.hugeint, owner);
+        }
+        nb::dlpack::dtype idtype;
+        (void)dtype_for(internal, idtype);  // internal is always a supported primitive
+        size_t shape[1] = {n};
+        return nb::cast(nb::ndarray<nb::numpy, nb::ro>(data, 1, shape, owner, nullptr, idtype));
+    }
+
+    throw DuckyError(std::string("ducky: column type ") + type_name(tid) +
+                     " has no flat ndarray representation; use .arrow() for this column");
+}
+
+nb::object Chunk::dlpack(nb::object key, nb::handle owner) {
+    idx_t i = resolve(key);
+    void* data = duckdb_vector_get_data(vectors_[i]);
+    size_t n = (size_t)size_;
+    duckdb_type tid = type_ids_[i];
+
+    nb::dlpack::dtype dtype;
+    if (!dtype_for(tid, dtype)) {
+        throw DuckyError(std::string("ducky: column type ") + type_name(tid) +
+                         " has no flat DLPack representation; use .column() for structured types");
+    }
+    size_t shape[1] = {n};
+    return nb::cast(nb::ndarray<nb::array_api, nb::ro>(data, 1, shape, owner, nullptr, dtype));
+}
+
+int Chunk::decimal_scale(nb::object key) {
+    idx_t i = resolve(key);
+    if (type_ids_[i] != DUCKDB_TYPE_DECIMAL) {
+        throw DuckyError(std::string("ducky: decimal_scale() called on non-DECIMAL column '") +
+                         names_[i] + "' (" + type_name(type_ids_[i]) + ")");
+    }
+    return (int)duckdb_decimal_scale(types_[i]);
 }
 
 nb::object Chunk::validity(nb::object key, nb::handle owner) {

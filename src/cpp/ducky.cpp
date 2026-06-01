@@ -77,7 +77,20 @@ NB_MODULE(_core, m) {
             },
             "key"_a, nb::sig("def validity(self, key: int | str) -> numpy.ndarray | None"),
             "Return a uint8 ndarray (1=valid, 0=null) of length len(self), or "
-            "None if the column has no nulls.");
+            "None if the column has no nulls.")
+        .def("decimal_scale", &Chunk::decimal_scale, "key"_a,
+             nb::sig("def decimal_scale(self, key: int | str) -> int"),
+             "Return the scale (digits after the decimal point) for a DECIMAL "
+             "column. Raises Error if the column is not DECIMAL.")
+        .def(
+            "dlpack",
+            [](nb::object self, nb::object key) {
+                return nb::cast<Chunk&>(self).dlpack(key, self);
+            },
+            "key"_a, nb::sig("def dlpack(self, key: int | str) -> typing.Any"),
+            "Return the column at `key` as an object implementing the DLPack "
+            "protocol (__dlpack__ / __dlpack_device__), without going through "
+            "numpy. Flat numeric/temporal types only.");
 
     nb::class_<Result>(m, "Result",
                        "A query result. Iterate it, or use the fetch* methods, "
@@ -135,6 +148,26 @@ NB_MODULE(_core, m) {
                     "dict[str, numpy.ndarray | tuple[numpy.ndarray, numpy.ndarray | None]]]"),
             "Yield one dict per chunk: {name: ndarray}, or {name: (values, mask)} "
             "if with_validity=True.")
+        .def(
+            "iter_batches_torch",
+            [](nb::object self, nb::object columns, nb::object device) {
+                return conversions().attr("iter_batches_torch")(self, columns, device);
+            },
+            "columns"_a = nb::none(), "device"_a = nb::none(),
+            nb::sig("def iter_batches_torch(self, columns: collections.abc.Iterable[str] | None = "
+                    "None, device: torch.device | str | int | None = None) "
+                    "-> collections.abc.Iterator[dict[str, torch.Tensor]]"),
+            "Yield one dict per chunk: {name: torch.Tensor}. Zero-copy on CPU via DLPack.")
+        .def(
+            "iter_batches_jax",
+            [](nb::object self, nb::object columns, nb::object device) {
+                return conversions().attr("iter_batches_jax")(self, columns, device);
+            },
+            "columns"_a = nb::none(), "device"_a = nb::none(),
+            nb::sig("def iter_batches_jax(self, columns: collections.abc.Iterable[str] | None = "
+                    "None, device: jax.Device | None = None) "
+                    "-> collections.abc.Iterator[dict[str, jax.Array]]"),
+            "Yield one dict per chunk: {name: jax.Array}.")
         .def(
             "to_numpy",
             [](nb::object self, nb::object columns) {
@@ -265,6 +298,28 @@ NB_MODULE(_core, m) {
                     "None, with_validity: bool = False) -> collections.abc.Iterator["
                     "dict[str, numpy.ndarray | tuple[numpy.ndarray, numpy.ndarray | None]]]"),
             "Yield one dict per chunk for the last result.")
+        .def(
+            "iter_batches_torch",
+            [](Connection& self, nb::object columns, nb::object device) {
+                return conversions().attr("iter_batches_torch")(nb::cast(self.current_result()),
+                                                                columns, device);
+            },
+            "columns"_a = nb::none(), "device"_a = nb::none(),
+            nb::sig("def iter_batches_torch(self, columns: collections.abc.Iterable[str] | None = "
+                    "None, device: torch.device | str | int | None = None) "
+                    "-> collections.abc.Iterator[dict[str, torch.Tensor]]"),
+            "Yield one dict per chunk for the last result: {name: torch.Tensor}.")
+        .def(
+            "iter_batches_jax",
+            [](Connection& self, nb::object columns, nb::object device) {
+                return conversions().attr("iter_batches_jax")(nb::cast(self.current_result()),
+                                                              columns, device);
+            },
+            "columns"_a = nb::none(), "device"_a = nb::none(),
+            nb::sig("def iter_batches_jax(self, columns: collections.abc.Iterable[str] | None = "
+                    "None, device: jax.Device | None = None) "
+                    "-> collections.abc.Iterator[dict[str, jax.Array]]"),
+            "Yield one dict per chunk for the last result: {name: jax.Array}.")
         .def(
             "to_numpy",
             [](Connection& self, nb::object columns) {
