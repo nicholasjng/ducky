@@ -32,6 +32,97 @@ const nb::module_& conversions() {
     return cached_singleton(cached, mu, [] { return nb::module_::import_("ducky._conversions"); });
 }
 
+// Register the DataFrame/array/Arrow accessors that both Result and Connection
+// expose. Every method just forwards to the matching helper in
+// ducky._conversions; `src` maps the bound object to the Arrow/chunk source the
+// helper consumes — identity for Result, `.current_result()` for Connection.
+// Defining them here once (instead of per class) keeps the two surfaces in
+// lockstep; they stay compiled methods so nanobind's stub generator still emits
+// them into _core.pyi.
+template <typename Cls, typename Src>
+void def_conversions(Cls& cls, Src src) {
+    cls.def(
+        "arrow", [src](nb::object self) { return conversions().attr("arrow")(src(self)); },
+        nb::sig("def arrow(self) -> pyarrow.Table"), "Return the result as a pyarrow.Table.");
+    cls.def(
+        "df", [src](nb::object self) { return conversions().attr("df")(src(self)); },
+        nb::sig("def df(self) -> pandas.DataFrame"), "Return the result as a pandas.DataFrame.");
+    cls.def(
+        "pl",
+        [src](nb::object self, bool lazy) { return conversions().attr("pl")(src(self), lazy); },
+        "lazy"_a = false,
+        nb::sig("def pl(self, lazy: bool = False) -> polars.DataFrame | polars.LazyFrame"),
+        "Return the result as a polars DataFrame (or LazyFrame).");
+    cls.def(
+        "fetchnumpy",
+        [src](nb::object self) { return conversions().attr("fetchnumpy")(src(self)); },
+        nb::sig("def fetchnumpy(self) -> dict[str, numpy.ndarray]"),
+        "Return the result as a dict of column name -> numpy array.");
+    cls.def(
+        "chunks", [src](nb::object self) { return conversions().attr("chunks")(src(self)); },
+        nb::sig("def chunks(self) -> collections.abc.Iterator[Chunk]"),
+        "Iterate over the result one Chunk at a time. Drains the result.");
+    cls.def(
+        "iter_batches",
+        [src](nb::object self, nb::object columns, bool with_validity) {
+            return conversions().attr("iter_batches")(src(self), columns, with_validity);
+        },
+        "columns"_a = nb::none(), "with_validity"_a = false,
+        nb::sig("def iter_batches(self, columns: collections.abc.Iterable[str] | None = "
+                "None, with_validity: bool = False) -> collections.abc.Iterator["
+                "dict[str, numpy.ndarray | tuple[numpy.ndarray, numpy.ndarray | None]]]"),
+        "Yield one dict per chunk: {name: ndarray}, or {name: (values, mask)} "
+        "if with_validity=True.");
+    cls.def(
+        "iter_batches_torch",
+        [src](nb::object self, nb::object columns, nb::object device) {
+            return conversions().attr("iter_batches_torch")(src(self), columns, device);
+        },
+        "columns"_a = nb::none(), "device"_a = nb::none(),
+        nb::sig("def iter_batches_torch(self, columns: collections.abc.Iterable[str] | None = "
+                "None, device: torch.device | str | int | None = None) "
+                "-> collections.abc.Iterator[dict[str, torch.Tensor]]"),
+        "Yield one dict per chunk: {name: torch.Tensor}. Zero-copy on CPU via DLPack.");
+    cls.def(
+        "iter_batches_jax",
+        [src](nb::object self, nb::object columns, nb::object device) {
+            return conversions().attr("iter_batches_jax")(src(self), columns, device);
+        },
+        "columns"_a = nb::none(), "device"_a = nb::none(),
+        nb::sig("def iter_batches_jax(self, columns: collections.abc.Iterable[str] | None = "
+                "None, device: jax.Device | None = None) "
+                "-> collections.abc.Iterator[dict[str, jax.Array]]"),
+        "Yield one dict per chunk: {name: jax.Array}.");
+    cls.def(
+        "to_numpy",
+        [src](nb::object self, nb::object columns) {
+            return conversions().attr("to_numpy")(src(self), columns);
+        },
+        "columns"_a = nb::none(),
+        nb::sig("def to_numpy(self, columns: collections.abc.Iterable[str] | None = None) "
+                "-> dict[str, numpy.ndarray]"),
+        "Eagerly concatenate all chunks into {name: numpy.ndarray}.");
+    cls.def(
+        "to_torch",
+        [src](nb::object self, nb::object columns, nb::object device) {
+            return conversions().attr("to_torch")(src(self), columns, device);
+        },
+        "columns"_a = nb::none(), "device"_a = nb::none(),
+        nb::sig("def to_torch(self, columns: collections.abc.Iterable[str] | None = None, "
+                "device: torch.device | str | int | None = None) "
+                "-> dict[str, torch.Tensor]"),
+        "Eagerly concatenate all chunks into {name: torch.Tensor}.");
+    cls.def(
+        "to_jax",
+        [src](nb::object self, nb::object columns, nb::object device) {
+            return conversions().attr("to_jax")(src(self), columns, device);
+        },
+        "columns"_a = nb::none(), "device"_a = nb::none(),
+        nb::sig("def to_jax(self, columns: collections.abc.Iterable[str] | None = None, "
+                "device: jax.Device | None = None) -> dict[str, jax.Array]"),
+        "Eagerly concatenate all chunks into {name: jax.Array}.");
+}
+
 }  // namespace
 
 NB_MODULE(_core, m) {
@@ -79,10 +170,10 @@ NB_MODULE(_core, m) {
             "protocol (__dlpack__ / __dlpack_device__), without going through "
             "numpy. Flat numeric/temporal types only.");
 
-    nb::class_<Result>(m, "Result",
-                       "A query result. Iterate it, or use the fetch* methods, "
-                       "to pull rows as tuples.")
-        .def_prop_ro("columns", &Result::column_names, "Column names.")
+    nb::class_<Result> result_cls(m, "Result",
+                                  "A query result. Iterate it, or use the fetch* methods, "
+                                  "to pull rows as tuples.");
+    result_cls.def_prop_ro("columns", &Result::column_names, "Column names.")
         .def_prop_ro("types", &Result::column_types, "Column type names.")
         .def_prop_ro("description", &Result::description,
                      nb::sig("def description(self) -> list[tuple] | None"),
@@ -104,85 +195,10 @@ NB_MODULE(_core, m) {
             "requested_schema"_a = nb::none(),
             nb::sig("def __arrow_c_stream__(self, requested_schema: typing.Any = None) "
                     "-> typing.Any"),
-            "Export the result via the Arrow C stream (PyCapsule) interface.")
-        .def(
-            "arrow", [](nb::object self) { return conversions().attr("arrow")(self); },
-            nb::sig("def arrow(self) -> pyarrow.Table"), "Return the result as a pyarrow.Table.")
-        .def(
-            "df", [](nb::object self) { return conversions().attr("df")(self); },
-            nb::sig("def df(self) -> pandas.DataFrame"), "Return the result as a pandas.DataFrame.")
-        .def(
-            "pl", [](nb::object self, bool lazy) { return conversions().attr("pl")(self, lazy); },
-            "lazy"_a = false,
-            nb::sig("def pl(self, lazy: bool = False) -> polars.DataFrame | polars.LazyFrame"),
-            "Return the result as a polars DataFrame (or LazyFrame).")
-        .def(
-            "fetchnumpy", [](nb::object self) { return conversions().attr("fetchnumpy")(self); },
-            nb::sig("def fetchnumpy(self) -> dict[str, numpy.ndarray]"),
-            "Return the result as a dict of column name -> numpy array.")
-        .def(
-            "chunks", [](nb::object self) { return conversions().attr("chunks")(self); },
-            nb::sig("def chunks(self) -> collections.abc.Iterator[Chunk]"),
-            "Iterate over the result one Chunk at a time. Drains the result.")
-        .def(
-            "iter_batches",
-            [](nb::object self, nb::object columns, bool with_validity) {
-                return conversions().attr("iter_batches")(self, columns, with_validity);
-            },
-            "columns"_a = nb::none(), "with_validity"_a = false,
-            nb::sig("def iter_batches(self, columns: collections.abc.Iterable[str] | None = "
-                    "None, with_validity: bool = False) -> collections.abc.Iterator["
-                    "dict[str, numpy.ndarray | tuple[numpy.ndarray, numpy.ndarray | None]]]"),
-            "Yield one dict per chunk: {name: ndarray}, or {name: (values, mask)} "
-            "if with_validity=True.")
-        .def(
-            "iter_batches_torch",
-            [](nb::object self, nb::object columns, nb::object device) {
-                return conversions().attr("iter_batches_torch")(self, columns, device);
-            },
-            "columns"_a = nb::none(), "device"_a = nb::none(),
-            nb::sig("def iter_batches_torch(self, columns: collections.abc.Iterable[str] | None = "
-                    "None, device: torch.device | str | int | None = None) "
-                    "-> collections.abc.Iterator[dict[str, torch.Tensor]]"),
-            "Yield one dict per chunk: {name: torch.Tensor}. Zero-copy on CPU via DLPack.")
-        .def(
-            "iter_batches_jax",
-            [](nb::object self, nb::object columns, nb::object device) {
-                return conversions().attr("iter_batches_jax")(self, columns, device);
-            },
-            "columns"_a = nb::none(), "device"_a = nb::none(),
-            nb::sig("def iter_batches_jax(self, columns: collections.abc.Iterable[str] | None = "
-                    "None, device: jax.Device | None = None) "
-                    "-> collections.abc.Iterator[dict[str, jax.Array]]"),
-            "Yield one dict per chunk: {name: jax.Array}.")
-        .def(
-            "to_numpy",
-            [](nb::object self, nb::object columns) {
-                return conversions().attr("to_numpy")(self, columns);
-            },
-            "columns"_a = nb::none(),
-            nb::sig("def to_numpy(self, columns: collections.abc.Iterable[str] | None = None) "
-                    "-> dict[str, numpy.ndarray]"),
-            "Eagerly concatenate all chunks into {name: numpy.ndarray}.")
-        .def(
-            "to_torch",
-            [](nb::object self, nb::object columns, nb::object device) {
-                return conversions().attr("to_torch")(self, columns, device);
-            },
-            "columns"_a = nb::none(), "device"_a = nb::none(),
-            nb::sig("def to_torch(self, columns: collections.abc.Iterable[str] | None = None, "
-                    "device: torch.device | str | int | None = None) "
-                    "-> dict[str, torch.Tensor]"),
-            "Eagerly concatenate all chunks into {name: torch.Tensor}.")
-        .def(
-            "to_jax",
-            [](nb::object self, nb::object columns, nb::object device) {
-                return conversions().attr("to_jax")(self, columns, device);
-            },
-            "columns"_a = nb::none(), "device"_a = nb::none(),
-            nb::sig("def to_jax(self, columns: collections.abc.Iterable[str] | None = None, "
-                    "device: jax.Device | None = None) -> dict[str, jax.Array]"),
-            "Eagerly concatenate all chunks into {name: jax.Array}.")
+            "Export the result via the Arrow C stream (PyCapsule) interface.");
+    // The Result *is* the Arrow/chunk source the conversion helpers consume.
+    def_conversions(result_cls, [](nb::object self) { return self; });
+    result_cls
         .def(
             "__iter__", [](nb::object self) { return self; },
             nb::sig("def __iter__(self) -> collections.abc.Iterator[tuple]"))
@@ -219,7 +235,8 @@ NB_MODULE(_core, m) {
             nb::sig("def __exit__(self, exc_type: type[BaseException] | None, exc_value: "
                     "BaseException | None, traceback: types.TracebackType | None) -> None"));
 
-    nb::class_<Connection>(m, "Connection", "A connection to a DuckDB database.")
+    nb::class_<Connection> conn_cls(m, "Connection", "A connection to a DuckDB database.");
+    conn_cls
         .def("execute", &Connection::execute, "query"_a, "parameters"_a = nb::none(),
              nb::rv_policy::reference,
              nb::sig("def execute(self, query: str, parameters: list | dict[str, typing.Any] | "
@@ -238,105 +255,17 @@ NB_MODULE(_core, m) {
                      nb::sig("def description(self) -> list[tuple] | None"))
         .def_prop_ro("columns", &Connection::columns,
                      nb::sig("def columns(self) -> list[str] | None"))
-        .def(
-            "arrow",
-            [](Connection& self) {
-                return conversions().attr("arrow")(nb::cast(self.current_result()));
-            },
-            nb::sig("def arrow(self) -> pyarrow.Table"),
-            "Return the last result as a pyarrow.Table.")
-        .def(
-            "df",
-            [](Connection& self) {
-                return conversions().attr("df")(nb::cast(self.current_result()));
-            },
-            nb::sig("def df(self) -> pandas.DataFrame"),
-            "Return the last result as a pandas.DataFrame.")
-        .def(
-            "pl",
-            [](Connection& self, bool lazy) {
-                return conversions().attr("pl")(nb::cast(self.current_result()), lazy);
-            },
-            "lazy"_a = false,
-            nb::sig("def pl(self, lazy: bool = False) -> polars.DataFrame | polars.LazyFrame"),
-            "Return the last result as a polars DataFrame (or LazyFrame).")
-        .def(
-            "fetchnumpy",
-            [](Connection& self) {
-                return conversions().attr("fetchnumpy")(nb::cast(self.current_result()));
-            },
-            nb::sig("def fetchnumpy(self) -> dict[str, numpy.ndarray]"),
-            "Return the last result as a dict of column name -> numpy array.")
-        .def(
-            "chunks",
-            [](Connection& self) {
-                return conversions().attr("chunks")(nb::cast(self.current_result()));
-            },
-            nb::sig("def chunks(self) -> collections.abc.Iterator[Chunk]"),
-            "Iterate over the last result one Chunk at a time.")
-        .def(
-            "iter_batches",
-            [](Connection& self, nb::object columns, bool with_validity) {
-                return conversions().attr("iter_batches")(nb::cast(self.current_result()), columns,
-                                                          with_validity);
-            },
-            "columns"_a = nb::none(), "with_validity"_a = false,
-            nb::sig("def iter_batches(self, columns: collections.abc.Iterable[str] | None = "
-                    "None, with_validity: bool = False) -> collections.abc.Iterator["
-                    "dict[str, numpy.ndarray | tuple[numpy.ndarray, numpy.ndarray | None]]]"),
-            "Yield one dict per chunk for the last result.")
-        .def(
-            "iter_batches_torch",
-            [](Connection& self, nb::object columns, nb::object device) {
-                return conversions().attr("iter_batches_torch")(nb::cast(self.current_result()),
-                                                                columns, device);
-            },
-            "columns"_a = nb::none(), "device"_a = nb::none(),
-            nb::sig("def iter_batches_torch(self, columns: collections.abc.Iterable[str] | None = "
-                    "None, device: torch.device | str | int | None = None) "
-                    "-> collections.abc.Iterator[dict[str, torch.Tensor]]"),
-            "Yield one dict per chunk for the last result: {name: torch.Tensor}.")
-        .def(
-            "iter_batches_jax",
-            [](Connection& self, nb::object columns, nb::object device) {
-                return conversions().attr("iter_batches_jax")(nb::cast(self.current_result()),
-                                                              columns, device);
-            },
-            "columns"_a = nb::none(), "device"_a = nb::none(),
-            nb::sig("def iter_batches_jax(self, columns: collections.abc.Iterable[str] | None = "
-                    "None, device: jax.Device | None = None) "
-                    "-> collections.abc.Iterator[dict[str, jax.Array]]"),
-            "Yield one dict per chunk for the last result: {name: jax.Array}.")
-        .def(
-            "to_numpy",
-            [](Connection& self, nb::object columns) {
-                return conversions().attr("to_numpy")(nb::cast(self.current_result()), columns);
-            },
-            "columns"_a = nb::none(),
-            nb::sig("def to_numpy(self, columns: collections.abc.Iterable[str] | None = None) "
-                    "-> dict[str, numpy.ndarray]"),
-            "Return the last result as {name: numpy.ndarray}.")
-        .def(
-            "to_torch",
-            [](Connection& self, nb::object columns, nb::object device) {
-                return conversions().attr("to_torch")(nb::cast(self.current_result()), columns,
-                                                      device);
-            },
-            "columns"_a = nb::none(), "device"_a = nb::none(),
-            nb::sig("def to_torch(self, columns: collections.abc.Iterable[str] | None = None, "
-                    "device: torch.device | str | int | None = None) "
-                    "-> dict[str, torch.Tensor]"),
-            "Return the last result as {name: torch.Tensor}.")
-        .def(
-            "to_jax",
-            [](Connection& self, nb::object columns, nb::object device) {
-                return conversions().attr("to_jax")(nb::cast(self.current_result()), columns,
-                                                    device);
-            },
-            "columns"_a = nb::none(), "device"_a = nb::none(),
-            nb::sig("def to_jax(self, columns: collections.abc.Iterable[str] | None = None, "
-                    "device: jax.Device | None = None) -> dict[str, jax.Array]"),
-            "Return the last result as {name: jax.Array}.")
+        .def_prop_ro("current_result", &Connection::current_result,
+                     nb::sig("def current_result(self) -> Result"),
+                     "The most recent result produced by execute(); raises Error if no "
+                     "query has run yet. The conversion accessors (arrow/df/pl/...) "
+                     "delegate to it.");
+    // Connection's conversion accessors operate on its most recent result; the
+    // Result itself is the Arrow/chunk source the helpers consume.
+    def_conversions(conn_cls, [](nb::object self) {
+        return nb::cast(nb::cast<Connection&>(self).current_result());
+    });
+    conn_cls
         .def(
             "create_function",
             [](Connection& self, const std::string& name, nb::callable fn, nb::object parameters,

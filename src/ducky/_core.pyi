@@ -206,24 +206,30 @@ class Connection:
     def description(self) -> list[tuple] | None: ...
     @property
     def columns(self) -> list[str] | None: ...
+    @property
+    def current_result(self) -> Result:
+        """
+        The most recent result produced by execute(); raises Error if no query has run yet. The conversion accessors (arrow/df/pl/...) delegate to it.
+        """
+
     def arrow(self) -> pyarrow.Table:
-        """Return the last result as a pyarrow.Table."""
+        """Return the result as a pyarrow.Table."""
 
     def df(self) -> pandas.DataFrame:
-        """Return the last result as a pandas.DataFrame."""
+        """Return the result as a pandas.DataFrame."""
 
     @overload
     def pl(self, lazy: Literal[False] = False) -> _PolarsDataFrame: ...
     @overload
     def pl(self, lazy: Literal[True]) -> _PolarsLazyFrame: ...
     def pl(self, lazy: bool = False) -> _PolarsDataFrame | _PolarsLazyFrame:
-        """Return the last result as a polars DataFrame (or LazyFrame)."""
+        """Return the result as a polars DataFrame (or LazyFrame)."""
 
     def fetchnumpy(self) -> dict[str, numpy.ndarray]:
-        """Return the last result as a dict of column name -> numpy array."""
+        """Return the result as a dict of column name -> numpy array."""
 
     def chunks(self) -> Iterator[Chunk]:
-        """Iterate over the last result one Chunk at a time."""
+        """Iterate over the result one Chunk at a time. Drains the result."""
 
     @overload
     def iter_batches(
@@ -236,30 +242,34 @@ class Connection:
     def iter_batches(
         self, columns: Iterable[str] | None = None, with_validity: bool = False
     ) -> Iterator[dict[str, numpy.ndarray] | dict[str, tuple[numpy.ndarray, numpy.ndarray | None]]]:
-        """Yield one dict per chunk for the last result."""
+        """
+        Yield one dict per chunk: {name: ndarray}, or {name: (values, mask)} if with_validity=True.
+        """
 
     def iter_batches_torch(
         self, columns: Iterable[str] | None = None, device: torch.device | str | int | None = None
     ) -> Iterator[dict[str, torch.Tensor]]:
-        """Yield one dict per chunk for the last result: {name: torch.Tensor}."""
+        """
+        Yield one dict per chunk: {name: torch.Tensor}. Zero-copy on CPU via DLPack.
+        """
 
     def iter_batches_jax(
         self, columns: Iterable[str] | None = None, device: jax.Device | None = None
     ) -> Iterator[dict[str, jax.Array]]:
-        """Yield one dict per chunk for the last result: {name: jax.Array}."""
+        """Yield one dict per chunk: {name: jax.Array}."""
 
     def to_numpy(self, columns: Iterable[str] | None = None) -> dict[str, numpy.ndarray]:
-        """Return the last result as {name: numpy.ndarray}."""
+        """Eagerly concatenate all chunks into {name: numpy.ndarray}."""
 
     def to_torch(
         self, columns: Iterable[str] | None = None, device: torch.device | str | int | None = None
     ) -> dict[str, torch.Tensor]:
-        """Return the last result as {name: torch.Tensor}."""
+        """Eagerly concatenate all chunks into {name: torch.Tensor}."""
 
     def to_jax(
         self, columns: Iterable[str] | None = None, device: jax.Device | None = None
     ) -> dict[str, jax.Array]:
-        """Return the last result as {name: jax.Array}."""
+        """Eagerly concatenate all chunks into {name: jax.Array}."""
 
     def create_function(
         self,
