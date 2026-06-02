@@ -31,6 +31,7 @@ from ._dataset import (
     split,
     target,
 )
+from ._progress import progress_bar
 from ._typing import DuckDBConfig
 
 
@@ -74,6 +75,7 @@ __all__ = [
     "connect",
     "dataset",
     "feature",
+    "progress_bar",
     "split",
     "target",
 ]

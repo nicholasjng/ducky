@@ -103,13 +103,13 @@ Legend: ✅ shipped · 🟡 partially shipped · ⬜ not started.
   Cancel long-running queries and surface progress — big quality-of-life win
   in notebooks and inside training loops where a hung scan currently kills
   the kernel.
-  - ⬜ **Built-in progress-bar helper.** Today, wiring `Connection.progress()`
-    into a tqdm bar takes ~20 lines of threading boilerplate (see
-    `examples/progress_bar.py`). A `Connection.execute_progress(query, ...)`
-    method (or `with ducky.progress_bar(con): ...` context manager) would
-    bake the pattern in. Should degrade gracefully when tqdm isn't
-    installed — fall back to a minimal stderr `[####    ] 42%` printer
-    rather than hard-failing the import.
+  - ✅ **Built-in progress-bar helper.** `with ducky.progress_bar(con): ...`
+    (see `examples/progress_bar.py`) enables progress tracking, suppresses
+    DuckDB's own printed bar, polls `Connection.progress()` from a daemon
+    thread, and restores the connection's progress settings on exit. Renders
+    through tqdm when installed and degrades to a minimal stderr
+    `desc [####    ]  42.0%` printer otherwise (`use_tqdm=False` forces the
+    fallback) — importing the helper never hard-fails on a missing tqdm.
 - ⬜ **Pending / streaming results** (`duckdb_pending_prepared`,
   `duckdb_execute_pending`, `duckdb_pending_execute_task`). The proper
   substrate for releasing the GIL during `execute` (see UDF section) and for
