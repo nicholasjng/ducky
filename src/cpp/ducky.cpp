@@ -95,6 +95,15 @@ void def_conversions(Cls& cls, Src src) {
                 "-> collections.abc.Iterator[dict[str, jax.Array]]"),
         "Yield one dict per chunk: {name: jax.Array}.");
     cls.def(
+        "iter_batches_mlx",
+        [src](nb::object self, nb::object columns) {
+            return conversions().attr("iter_batches_mlx")(src(self), columns);
+        },
+        "columns"_a = nb::none(),
+        nb::sig("def iter_batches_mlx(self, columns: collections.abc.Iterable[str] | None = "
+                "None) -> collections.abc.Iterator[dict[str, mlx.core.array]]"),
+        "Yield one dict per chunk: {name: mlx.core.array}. Zero-copy on CPU via DLPack.");
+    cls.def(
         "to_numpy",
         [src](nb::object self, nb::object columns) {
             return conversions().attr("to_numpy")(src(self), columns);
@@ -122,6 +131,15 @@ void def_conversions(Cls& cls, Src src) {
         nb::sig("def to_jax(self, columns: collections.abc.Iterable[str] | None = None, "
                 "device: jax.Device | None = None) -> dict[str, jax.Array]"),
         "Eagerly concatenate all chunks into {name: jax.Array}.");
+    cls.def(
+        "to_mlx",
+        [src](nb::object self, nb::object columns) {
+            return conversions().attr("to_mlx")(src(self), columns);
+        },
+        "columns"_a = nb::none(),
+        nb::sig("def to_mlx(self, columns: collections.abc.Iterable[str] | None = None) "
+                "-> dict[str, mlx.core.array]"),
+        "Eagerly concatenate all chunks into {name: mlx.core.array}.");
 }
 
 }  // namespace

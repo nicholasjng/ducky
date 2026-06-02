@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 if TYPE_CHECKING:
     import jax
+    import mlx.core as mx
     import numpy as np
     import pandas as pd
     import polars
@@ -131,10 +132,18 @@ def to_numpy(source: _ChunkSource, columns: Iterable[str] | None = None) -> dict
     """
     import numpy as np
 
+    # `chunk.column(n)` is a view over the chunk's buffer, and `chunks()` frees
+    # each chunk as the loop advances — so retain the chunks until after the
+    # concatenate, which is then the single copy into the contiguous output.
+    # (Copying per chunk first would copy every byte twice.) Peak memory is
+    # unchanged: live chunks (1x) + result (1x), the same high-water mark as
+    # holding per-chunk numpy copies (1x) + result (1x).
+    live: list[Chunk] = []
     parts: dict[str, list[np.ndarray]] = {}
-    for batch in iter_batches(source, columns=columns):
-        for name, arr in batch.items():
-            parts.setdefault(name, []).append(np.array(arr, copy=True))
+    for chunk in chunks(source):
+        live.append(chunk)
+        for name in _select(chunk.columns, columns):
+            parts.setdefault(name, []).append(chunk.column(name))
     return {name: np.concatenate(arrs) for name, arrs in parts.items()}
 
 
@@ -218,3 +227,42 @@ def to_jax(
         for name, arr in batch.items():
             parts.setdefault(name, []).append(arr)
     return {name: jnp.concatenate(arrs) for name, arrs in parts.items()}
+
+
+def iter_batches_mlx(
+    source: _ChunkSource,
+    columns: Iterable[str] | None = None,
+) -> Iterator[dict[str, mx.array]]:
+    """Yield one dict per chunk: ``{name: mlx.core.array}``.
+
+    Each array is built directly from the chunk's buffer via DLPack (zero-copy
+    on the CPU backend). MLX uses a unified-memory model, so — unlike the JAX
+    and torch variants — there is no per-array ``device`` argument; set the
+    active device globally with ``mlx.core.set_default_device`` if needed. MLX
+    has no float64, so ``DOUBLE`` columns arrive as float32. Chunks are released
+    as soon as the caller advances the iterator.
+    """
+    import mlx.core as mx
+
+    for chunk in chunks(source):
+        names = _select(chunk.columns, columns)
+        yield {n: mx.array(chunk.dlpack(n)) for n in names}
+
+
+def to_mlx(
+    source: _ChunkSource,
+    columns: Iterable[str] | None = None,
+) -> dict[str, mx.array]:
+    """Eagerly concatenate all chunks into ``{name: mlx.core.array}``.
+
+    Uses ``iter_batches_mlx`` internally, so no intermediate numpy
+    materialization occurs; each chunk is converted via DLPack and released
+    before the next is fetched.
+    """
+    import mlx.core as mx
+
+    parts: dict[str, list[mx.array]] = {}
+    for batch in iter_batches_mlx(source, columns=columns):
+        for name, arr in batch.items():
+            parts.setdefault(name, []).append(arr)
+    return {name: mx.concatenate(arrs) for name, arrs in parts.items()}

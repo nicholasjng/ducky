@@ -5,6 +5,7 @@ from types import TracebackType
 from typing import Any, Literal, overload
 
 import jax
+import mlx.core
 import numpy
 import pandas
 import pyarrow
@@ -131,6 +132,13 @@ class Result:
     ) -> Iterator[dict[str, jax.Array]]:
         """Yield one dict per chunk: {name: jax.Array}."""
 
+    def iter_batches_mlx(
+        self, columns: Iterable[str] | None = None
+    ) -> Iterator[dict[str, mlx.core.array]]:
+        """
+        Yield one dict per chunk: {name: mlx.core.array}. Zero-copy on CPU via DLPack.
+        """
+
     def to_numpy(self, columns: Iterable[str] | None = None) -> dict[str, numpy.ndarray]:
         """Eagerly concatenate all chunks into {name: numpy.ndarray}."""
 
@@ -143,6 +151,9 @@ class Result:
         self, columns: Iterable[str] | None = None, device: jax.Device | None = None
     ) -> dict[str, jax.Array]:
         """Eagerly concatenate all chunks into {name: jax.Array}."""
+
+    def to_mlx(self, columns: Iterable[str] | None = None) -> dict[str, mlx.core.array]:
+        """Eagerly concatenate all chunks into {name: mlx.core.array}."""
 
     def __iter__(self) -> Iterator[tuple]: ...
     def __next__(self) -> tuple: ...
@@ -315,6 +326,13 @@ class Connection:
     ) -> Iterator[dict[str, jax.Array]]:
         """Yield one dict per chunk: {name: jax.Array}."""
 
+    def iter_batches_mlx(
+        self, columns: Iterable[str] | None = None
+    ) -> Iterator[dict[str, mlx.core.array]]:
+        """
+        Yield one dict per chunk: {name: mlx.core.array}. Zero-copy on CPU via DLPack.
+        """
+
     def to_numpy(self, columns: Iterable[str] | None = None) -> dict[str, numpy.ndarray]:
         """Eagerly concatenate all chunks into {name: numpy.ndarray}."""
 
@@ -327,6 +345,9 @@ class Connection:
         self, columns: Iterable[str] | None = None, device: jax.Device | None = None
     ) -> dict[str, jax.Array]:
         """Eagerly concatenate all chunks into {name: jax.Array}."""
+
+    def to_mlx(self, columns: Iterable[str] | None = None) -> dict[str, mlx.core.array]:
+        """Eagerly concatenate all chunks into {name: mlx.core.array}."""
 
     def create_function(
         self,
