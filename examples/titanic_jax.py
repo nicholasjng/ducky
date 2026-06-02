@@ -29,6 +29,9 @@ import ducky
 
 URL = "https://web.stanford.edu/class/archive/cs/cs109/cs109.1166/stuff/titanic.csv"
 
+# Model parameters: a (weights, bias) pair.
+Params = tuple[jax.Array, jax.Array]
+
 
 def load() -> ducky.Dataset:
     return ducky.dataset(
@@ -47,19 +50,19 @@ def load() -> ducky.Dataset:
     )
 
 
-def model(params: tuple[jax.Array, jax.Array], X: jax.Array) -> jax.Array:
+def model(params: Params, X: jax.Array) -> jax.Array:
     w, b = params
     return jax.nn.sigmoid(X @ w + b)
 
 
-def bce(params: tuple[jax.Array, jax.Array], X: jax.Array, y: jax.Array) -> jax.Array:
+def bce(params: Params, X: jax.Array, y: jax.Array) -> jax.Array:
     p = model(params, X)
     eps = 1e-7
     return -jnp.mean(y * jnp.log(p + eps) + (1.0 - y) * jnp.log(1.0 - p + eps))
 
 
 @jax.jit
-def step(params, X, y, lr):
+def step(params: Params, X: jax.Array, y: jax.Array, lr: float) -> Params:
     g = jax.grad(bce)(params, X, y)
     return jax.tree.map(lambda p, gi: p - lr * gi, params, g)
 
