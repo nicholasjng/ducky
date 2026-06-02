@@ -67,7 +67,7 @@ def test_interrupt_cancels_long_query():
             con.execute(
                 "SELECT count(*) FROM range(10_000_000_000) t(i) WHERE i % 7 = 0"
             ).fetchall()
-        except BaseException as e:  # noqa: BLE001
+        except Exception as e:
             err.append(e)
 
     t = threading.Thread(target=runner)

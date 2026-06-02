@@ -48,7 +48,7 @@ def test_with_parameter():
 def test_empty_generator():
     def empty(n):
         return
-        yield  # noqa: unreachable
+        yield
 
     con = ducky.connect()
     con.create_table_function("empty_fn", empty, parameters=["BIGINT"], columns={"v": "BIGINT"})
@@ -117,8 +117,7 @@ def test_invalid_column_type_raises():
 def test_single_value_row():
     # Generator yielding bare scalars (not tuples) should also work.
     def scalars(n):
-        for i in range(n):
-            yield i
+        yield from range(n)
 
     con = ducky.connect()
     con.create_table_function("scalars", scalars, parameters=["BIGINT"], columns={"v": "BIGINT"})
