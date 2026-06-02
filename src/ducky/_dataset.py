@@ -19,26 +19,32 @@ Typical use:
         target=ducky.target("Survived", dtype="f32"),
         drop_nulls=["Age"],
         split=ducky.split(0.8, seed=0),
+        backend="jax",          # materialise folds straight into JAX (numpy default)
     )
-    Xtr, ytr = ds.train.to_jax()
-    Xval, yval = ds.val.to_jax()
+    Xtr, ytr = ds.train.tensors()
+    Xval, yval = ds.val.tensors()
+
+The ``backend`` chooses the array library each fold is materialised into
+("numpy", "jax", "torch", "mlx"). The source is scanned once, streamed into the
+backend via DLPack (zero host copy for the native backends), then each fold is
+split out with an on-device integer gather and stacked into ``(n, d)`` on the
+device. A load targets a single backend; for an unsupported framework, use
+``backend="numpy"`` and convert from numpy at the cost of one copy.
 """
 
 from __future__ import annotations
 
 from collections.abc import Iterator
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Generic, Literal, Protocol, TypeVar, cast, overload
 
-from ._core import Connection, connect
+from ._core import Connection, Result, connect
 
 if TYPE_CHECKING:
     import jax
+    import mlx.core as mx
     import numpy as np
     import torch
-
-
-# ── User-facing spec dataclasses ────────────────────────────────────────────
 
 
 @dataclass(frozen=True)
@@ -146,54 +152,130 @@ def _to_duckdb_dtype(name: str) -> str:
         raise ValueError(f"unknown dtype {name!r}; pick one of {sorted(_DUCKDB_DTYPES)}") from exc
 
 
+# ── Backend dispatch ───────────────────────────────────────────────────────
+# A dataset is materialised into one array library. The heavy lifting (chunk →
+# column) is the streaming DLPack converter in _conversions; the helpers below
+# add the few backend-specific ops the split needs: pulling the bucket column
+# to the host for index maths, an integer row-gather, and an axis-1 stack.
+# Imports are lazy so none of jax/torch/mlx is a hard dependency.
+
+Backend = Literal["numpy", "jax", "torch", "mlx"]
+_BACKENDS: tuple[Backend, ...] = ("numpy", "jax", "torch", "mlx")
+_NO_DEVICE: tuple[Backend, ...] = ("numpy", "mlx")
+
+# Element type of a dataset's arrays — np.ndarray / jax.Array / torch.Tensor /
+# mlx.core.array, depending on the chosen backend. The dataset() overloads map
+# each backend literal to the concrete type so tensors() is precisely typed.
+
+
+class AbstractArray(Protocol):
+    """The minimal array surface ducky relies on across all backends.
+
+    numpy / jax / torch / mlx arrays all satisfy this structurally (it's just
+    ``shape``); it bounds :data:`ArrayT` so generic code can read ``.shape``
+    without knowing the concrete backend type.
+    """
+
+    @property
+    def shape(self) -> tuple[int, ...]: ...
+
+
+ArrayT = TypeVar("ArrayT", bound=AbstractArray)
+
+
+def _materialize(result: Result, backend: Backend, device: Any) -> dict[str, Any]:
+    """Stream `result` into ``{column: array}`` in `backend`.
+
+    Native backends wrap DuckDB's chunk buffers via DLPack with no host copy
+    (numpy goes through a single concatenate); see ``ducky._conversions``.
+    """
+    from . import _conversions as conv
+
+    if backend == "numpy":
+        return conv.to_numpy(result)
+    if backend == "jax":
+        return conv.to_jax(result, device=device)
+    if backend == "torch":
+        return conv.to_torch(result, device=device)
+    return conv.to_mlx(result)
+
+
+def _bucket_to_host(arr: Any, backend: Backend) -> Any:
+    """Return the (small) bucket column as a numpy array for index maths."""
+    import numpy as np
+
+    if backend == "torch":
+        return arr.detach().cpu().numpy()
+    return np.asarray(arr)  # numpy is a no-op; jax/mlx transfer to host
+
+
+def _gather(arr: Any, idx: Any, backend: Backend) -> Any:
+    """Gather rows `idx` (a 1-D numpy int array) from `arr` along axis 0."""
+    if backend == "torch":
+        import torch
+
+        return arr[torch.as_tensor(idx, device=arr.device)]
+    if backend == "mlx":
+        import mlx.core as mx
+
+        return arr[mx.array(idx)]
+    return arr[idx]  # numpy and jax both index with a host ndarray
+
+
+def _stack(cols: list[Any], backend: Backend) -> Any:
+    """Stack 1-D feature columns into an ``(n, len(cols))`` matrix."""
+    if backend == "jax":
+        import jax.numpy as jnp
+
+        return jnp.stack(cols, axis=1)
+    if backend == "torch":
+        import torch
+
+        return torch.stack(cols, dim=1)
+    if backend == "mlx":
+        import mlx.core as mx
+
+        return mx.stack(cols, axis=1)
+    import numpy as np
+
+    return np.stack(cols, axis=1)
+
+
 # ── Output: Fold + Dataset ─────────────────────────────────────────────────
 
 
 @dataclass
-class Fold:
-    """One side of a train/val split — feature ndarrays + target ndarray.
+class Fold(Generic[ArrayT]):
+    """One side of a train/val split — feature columns + target column.
 
-    ``arrays`` is a dict view keyed by feature/target name; ``tensors()``
-    stacks the feature columns into a single ``(n_rows, n_features)`` array.
+    The columns are arrays in the dataset's ``backend`` (numpy/jax/torch/mlx);
+    ``ArrayT`` is that array type. ``arrays`` is a dict view keyed by
+    feature/target name; ``tensors()`` stacks the feature columns into a single
+    ``(n_rows, n_features)`` array on the backend's device.
     """
 
     feature_names: list[str]
     target_name: str
-    _arrays: dict[str, np.ndarray]
+    backend: Backend
+    _arrays: dict[str, ArrayT]
 
     @property
-    def arrays(self) -> dict[str, np.ndarray]:
+    def arrays(self) -> dict[str, ArrayT]:
         return dict(self._arrays)
 
     @property
     def n_rows(self) -> int:
         return int(next(iter(self._arrays.values())).shape[0])
 
-    def tensors(self) -> tuple[np.ndarray, np.ndarray]:
-        """Returns ``(X, y)``: features stacked into ``(n, d)``, target ``(n,)``."""
-        import numpy as np
+    def tensors(self) -> tuple[ArrayT, ArrayT]:
+        """Returns ``(X, y)``: features stacked into ``(n, d)``, target ``(n,)``.
 
-        X = np.stack([self._arrays[name] for name in self.feature_names], axis=1)
+        The stack runs on the backend's device — no host round-trip for the
+        native backends.
+        """
+        X = _stack([self._arrays[name] for name in self.feature_names], self.backend)
         y = self._arrays[self.target_name]
         return X, y
-
-    def to_jax(self, device: jax.Device | None = None) -> tuple[jax.Array, jax.Array]:
-        import jax.numpy as jnp
-
-        X, y = self.tensors()
-        return jnp.asarray(X, device=device), jnp.asarray(y, device=device)
-
-    def to_torch(
-        self, device: torch.device | str | int | None = None
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        import torch
-
-        X, y = self.tensors()
-        Xt = torch.from_numpy(X)
-        yt = torch.from_numpy(y)
-        if device is not None:
-            Xt, yt = Xt.to(device), yt.to(device)
-        return Xt, yt
 
     def batches(
         self,
@@ -202,14 +284,13 @@ class Fold:
         shuffle: bool = False,
         seed: int | None = None,
         drop_last: bool = False,
-    ) -> Iterator[tuple[np.ndarray, np.ndarray]]:
+    ) -> Iterator[tuple[ArrayT, ArrayT]]:
         """Yield ``(X_batch, y_batch)`` slices of ``self.tensors()``.
 
         Materialises the fold into one ``(X, y)`` pair up front (cheap — same
-        memory as ``tensors()``); each batch is then a fancy-index slice.
-        For GPU training loops, prefer ``to_jax()`` / ``to_torch()`` outside
-        the loop and slice the resulting device array yourself — that avoids
-        host→device transfers per batch.
+        memory as ``tensors()``); each batch is then a gather along axis 0 in
+        the dataset's backend. The shuffle permutation is always computed on
+        the host (cheap, deterministic) and applied as a backend gather.
 
         ``shuffle=True`` permutes row order once per call (i.e. once per
         epoch if you wrap this in a ``for epoch in range(...)``). Pass a
@@ -228,18 +309,20 @@ class Fold:
         end = (n // batch_size) * batch_size if drop_last else n
         for start in range(0, end, batch_size):
             idx = indices[start : start + batch_size]
-            yield X[idx], y[idx]
+            yield _gather(X, idx, self.backend), _gather(y, idx, self.backend)
 
     def __repr__(self) -> str:
         return (
-            f"Fold(n_rows={self.n_rows}, features={self.feature_names!r}, "
-            f"target={self.target_name!r})"
+            f"Fold(n_rows={self.n_rows}, backend={self.backend!r}, "
+            f"features={self.feature_names!r}, target={self.target_name!r})"
         )
 
 
 @dataclass
-class Dataset:
+class Dataset(Generic[ArrayT]):
     """A loaded dataset, split into one or more named folds.
+
+    ``ArrayT`` is the array type of the folds (set by the load ``backend``).
 
     The most common access patterns:
 
@@ -251,18 +334,18 @@ class Dataset:
     When the spec includes no split, all rows land in a single ``"train"`` fold.
     """
 
-    folds: dict[str, Fold]
+    folds: dict[str, Fold[ArrayT]]
 
     @property
-    def train(self) -> Fold | None:
+    def train(self) -> Fold[ArrayT] | None:
         return self.folds.get("train")
 
     @property
-    def val(self) -> Fold | None:
+    def val(self) -> Fold[ArrayT] | None:
         return self.folds.get("val")
 
     @property
-    def test(self) -> Fold | None:
+    def test(self) -> Fold[ArrayT] | None:
         return self.folds.get("test")
 
     @property
@@ -273,7 +356,7 @@ class Dataset:
     def target_name(self) -> str:
         return next(iter(self.folds.values())).target_name
 
-    def __getitem__(self, name: str) -> Fold:
+    def __getitem__(self, name: str) -> Fold[ArrayT]:
         return self.folds[name]
 
     def __repr__(self) -> str:
@@ -377,6 +460,66 @@ def _compile_sql(
 # ── Public API ─────────────────────────────────────────────────────────────
 
 
+@overload
+def dataset(
+    source: str,
+    *,
+    columns: dict[str, Feature],
+    target: Target,
+    drop_nulls: list[str] | None = ...,
+    split: Split | None = ...,
+    con: Connection | None = ...,
+    backend: Literal["numpy"] = ...,
+    device: Any = ...,
+) -> Dataset[np.ndarray]: ...
+@overload
+def dataset(
+    source: str,
+    *,
+    columns: dict[str, Feature],
+    target: Target,
+    drop_nulls: list[str] | None = ...,
+    split: Split | None = ...,
+    con: Connection | None = ...,
+    backend: Literal["jax"],
+    device: Any = ...,
+) -> Dataset[jax.Array]: ...
+@overload
+def dataset(
+    source: str,
+    *,
+    columns: dict[str, Feature],
+    target: Target,
+    drop_nulls: list[str] | None = ...,
+    split: Split | None = ...,
+    con: Connection | None = ...,
+    backend: Literal["torch"],
+    device: Any = ...,
+) -> Dataset[torch.Tensor]: ...
+@overload
+def dataset(
+    source: str,
+    *,
+    columns: dict[str, Feature],
+    target: Target,
+    drop_nulls: list[str] | None = ...,
+    split: Split | None = ...,
+    con: Connection | None = ...,
+    backend: Literal["mlx"],
+    device: Any = ...,
+) -> Dataset[mx.array]: ...
+@overload
+def dataset(
+    source: str,
+    *,
+    columns: dict[str, Feature],
+    target: Target,
+    drop_nulls: list[str] | None = ...,
+    split: Split | None = ...,
+    con: Connection | None = ...,
+    backend: str,
+    device: Any = ...,
+) -> Dataset[Any]: ...
 def dataset(
     source: str,
     *,
@@ -385,12 +528,28 @@ def dataset(
     drop_nulls: list[str] | None = None,
     split: Split | None = None,
     con: Connection | None = None,
-) -> Dataset:
+    backend: str = "numpy",
+    device: Any = None,
+) -> Dataset[Any]:
     """Load a remote / local table as a feature-engineered dataset.
 
     ``source`` is a string passed straight into ``FROM '…'`` — URL, local path,
     or anything DuckDB's auto-detection can read (CSV, Parquet, JSON, …).
+
+    ``backend`` selects the array library each fold is materialised into —
+    ``"numpy"`` (default), ``"jax"``, ``"torch"`` or ``"mlx"`` — and fixes the
+    returned ``Dataset``'s element type. The source is scanned once and streamed
+    into the backend via DLPack (zero host copy for the native backends); each
+    fold is then split out with an on-device integer gather. ``device`` is
+    forwarded to the jax/torch converters (DuckDB feeds them from the host, so
+    the chunks land there); ``"numpy"`` and ``"mlx"`` do not take a device.
     """
+    if backend not in _BACKENDS:
+        raise ValueError(f"unknown backend {backend!r}; pick one of {list(_BACKENDS)}")
+    backend = cast(Backend, backend)  # validated above
+    if device is not None and backend in _NO_DEVICE:
+        raise ValueError(f"backend {backend!r} does not take a device argument")
+
     sql, feature_names, target_name, ranges = _compile_sql(
         source, columns, target, drop_nulls, split
     )
@@ -398,18 +557,19 @@ def dataset(
     if own_connection:
         con = connect()
     try:
-        arrays = con.sql(sql).to_numpy()
+        columns_data = _materialize(con.sql(sql), backend, device)
     finally:
         if own_connection:
             con.close()
 
-    bucket = arrays.pop("_bucket")
-    folds: dict[str, Fold] = {}
+    import numpy as np
+
+    # The bucket column is metadata; pull it to the host to compute each fold's
+    # row indices, then gather the feature/target columns on the backend device.
+    bucket = _bucket_to_host(columns_data.pop("_bucket"), backend)
+    folds: dict[str, Fold[Any]] = {}
     for name, lo, hi in ranges:
-        mask = (bucket >= lo) & (bucket < hi)
-        folds[name] = Fold(
-            feature_names,
-            target_name,
-            {k: v[mask] for k, v in arrays.items()},
-        )
+        idx = np.nonzero((bucket >= lo) & (bucket < hi))[0]
+        gathered = {k: _gather(v, idx, backend) for k, v in columns_data.items()}
+        folds[name] = Fold(feature_names, target_name, backend, gathered)
     return Dataset(folds=folds)

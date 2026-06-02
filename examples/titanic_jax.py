@@ -18,7 +18,8 @@ What this shows:
   1. Reading a remote CSV directly into DuckDB (httpfs).
   2. The high-level ``ducky.dataset`` API — column-to-feature mapping, dtype,
      standardisation (with train-fold-only stats), and split — declared once.
-  3. Zero-copy hand-off into JAX via ``Fold.to_jax()``.
+  3. ``backend="jax"`` — folds are streamed straight into JAX (zero host copy
+     via DLPack), so ``Fold.tensors()`` hands back JAX arrays directly.
   4. A tiny logistic-regression training loop in plain JAX.
 """
 
@@ -33,7 +34,7 @@ URL = "https://web.stanford.edu/class/archive/cs/cs109/cs109.1166/stuff/titanic.
 Params = tuple[jax.Array, jax.Array]
 
 
-def load() -> ducky.Dataset:
+def load() -> ducky.Dataset[jax.Array]:
     return ducky.dataset(
         URL,
         columns={
@@ -47,6 +48,7 @@ def load() -> ducky.Dataset:
         target=ducky.target("Survived"),
         drop_nulls=["Age"],
         split=ducky.split(0.8, seed=0),
+        backend="jax",
     )
 
 
@@ -69,8 +71,8 @@ def step(params: Params, X: jax.Array, y: jax.Array, lr: float) -> Params:
 
 def main() -> None:
     ds = load()
-    Xtr, ytr = ds["train"].to_jax()
-    Xval, yval = ds["val"].to_jax()
+    Xtr, ytr = ds["train"].tensors()
+    Xval, yval = ds["val"].tensors()
 
     key = jax.random.PRNGKey(0)
     params = (jax.random.normal(key, (Xtr.shape[1],)) * 0.01, jnp.zeros(()))

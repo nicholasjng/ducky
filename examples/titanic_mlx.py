@@ -21,7 +21,9 @@ What this shows:
   1. Reading a remote CSV directly into DuckDB (httpfs).
   2. The high-level ``ducky.dataset`` API — column-to-feature mapping, dtype,
      standardisation (with train-fold-only stats), and split — declared once.
-  3. Hand-off into MLX via ``Fold.tensors()`` + ``mx.array``.
+  3. ``backend="mlx"`` — folds are streamed straight into MLX via DLPack
+     (zero host copy; the f32 feature dtype lets MLX wrap without converting),
+     so ``Fold.tensors()`` hands back MLX arrays directly.
   4. A tiny logistic-regression training loop in plain MLX.
 """
 
@@ -35,7 +37,7 @@ URL = "https://web.stanford.edu/class/archive/cs/cs109/cs109.1166/stuff/titanic.
 Params = tuple[mx.array, mx.array]
 
 
-def load() -> ducky.Dataset:
+def load() -> ducky.Dataset[mx.array]:
     return ducky.dataset(
         URL,
         columns={
@@ -49,12 +51,8 @@ def load() -> ducky.Dataset:
         target=ducky.target("Survived"),
         drop_nulls=["Age"],
         split=ducky.split(0.8, seed=0),
+        backend="mlx",
     )
-
-
-def to_mlx(fold: ducky.Fold) -> Params:
-    X, y = fold.tensors()
-    return mx.array(X), mx.array(y)
 
 
 def model(params: Params, X: mx.array) -> mx.array:
@@ -70,8 +68,8 @@ def bce(params: Params, X: mx.array, y: mx.array) -> mx.array:
 
 def main() -> None:
     ds = load()
-    Xtr, ytr = to_mlx(ds["train"])
-    Xval, yval = to_mlx(ds["val"])
+    Xtr, ytr = ds["train"].tensors()
+    Xval, yval = ds["val"].tensors()
 
     key = mx.random.key(0)
     params: Params = (mx.random.normal((Xtr.shape[1],), key=key) * 0.01, mx.zeros(()))

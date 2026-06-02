@@ -129,6 +129,50 @@ def test_batches_shuffle_changes_order(csv_path):
     assert not np.array_equal(X_seq, X_shuf)
 
 
+@pytest.mark.parametrize("backend", ["numpy", "jax", "torch", "mlx"])
+def test_backend_materializes_equivalently(csv_path, backend):
+    # Every backend must produce the same split + feature matrix as numpy; only
+    # the array type differs. Skip backends not installed on this platform.
+    if backend != "numpy":
+        pytest.importorskip(backend)
+
+    columns = {"x": ducky.feature("x", standardize=True)}
+    target = ducky.target("y", dtype="f32")
+    split = ducky.split(0.8, seed=0)
+    ref = ducky.dataset(csv_path, columns=columns, target=target, split=split, backend="numpy")
+    ds = ducky.dataset(csv_path, columns=columns, target=target, split=split, backend=backend)
+
+    for name in ref.folds:
+        assert ds[name].backend == backend
+        assert ds[name].n_rows == ref[name].n_rows
+        X, y = ds[name].tensors()
+        Xref, yref = ref[name].tensors()
+        # `np.asarray` brings jax/mlx/torch arrays back to the host for comparison.
+        np.testing.assert_allclose(np.asarray(X), Xref, rtol=1e-5)
+        np.testing.assert_allclose(np.asarray(y), yref, rtol=1e-5)
+
+
+def test_unknown_backend_rejected(csv_path):
+    with pytest.raises(ValueError, match="unknown backend"):
+        ducky.dataset(
+            csv_path,
+            columns={"x": ducky.feature("x")},
+            target=ducky.target("y"),
+            backend="tensorflow",
+        )
+
+
+def test_device_rejected_for_deviceless_backends(csv_path):
+    with pytest.raises(ValueError, match="does not take a device"):
+        ducky.dataset(
+            csv_path,
+            columns={"x": ducky.feature("x")},
+            target=ducky.target("y"),
+            backend="numpy",
+            device="cpu",
+        )
+
+
 def test_no_leak_train_stats_into_val(csv_path):
     # If standardisation accidentally used full-dataset stats, the val fold's
     # mean would be near 0 too. With train-only stats, val gets a non-trivial
