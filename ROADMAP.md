@@ -115,6 +115,17 @@ Legend: ✅ shipped · 🟡 partially shipped · ⬜ not started.
   substrate for releasing the GIL during `execute` (see UDF section) and for
   a true streaming `to_torch` / `to_jax` that avoids the intermediate copy.
 
+## QOL improvements
+
+- ⬜ **`Result.fetchitem()` / `Connection.fetchitem()`.** A scalar-fetch
+  helper that returns the single value of the single result row, raising a
+  clear error if the result isn't exactly 1 row × 1 column. Named after
+  numpy's `ndarray.item()` for the same "collapse a container to its lone
+  scalar" intent. Today `COUNT(*)`-style queries force every call site
+  through `row = ...fetchone(); assert row is not None; (x,) = row` purely to
+  satisfy the type checker (`fetchone() -> tuple | None`); `fetchitem()`
+  makes `n = con.execute(...).fetchitem()` both correct and type-clean.
+
 ## Refactors not gated on v2
 
 - ⬜ Move the `.arrow/.df/.pl/.to_numpy/.to_torch/.to_jax/.chunks/.iter_batches`
