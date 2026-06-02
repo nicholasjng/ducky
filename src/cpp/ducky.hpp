@@ -1,14 +1,61 @@
 #pragma once
 
 #include <duckdb.h>
+#include <nanobind/nanobind.h>
 
+#include <atomic>
 #include <stdexcept>
+#include <utility>
+
+namespace nb = nanobind;
 
 // Exception thrown across the binding layer. Registered with nanobind in
 // ducky.cpp so it surfaces in Python as `ducky.Error`.
 struct DuckyError : std::runtime_error {
     using std::runtime_error::runtime_error;
 };
+
+// Lazily construct a process-wide singleton of type T from `init`, caching it
+// behind an atomic pointer guarded by a free-threading mutex. The instance is
+// intentionally leaked so its destructor never runs at interpreter shutdown,
+// when the Python objects it captures may already be torn down.
+//
+// `init` runs at most once per successful publish and may release the GIL (it
+// typically imports modules); we never hold `mu` across it, so a thread racing
+// in can't deadlock against the importing thread. On a lost race the value we
+// built is discarded. Callers own the `cached`/`mu` statics so each singleton
+// is independent. Requires the GIL on entry (the discard path decrefs T).
+template <typename T, typename Init>
+const T& cached_singleton(std::atomic<T*>& cached, nb::ft_mutex& mu, Init&& init) {
+    if (T* p = cached.load()) return *p;
+    T* built = new T(std::forward<Init>(init)());
+    nb::ft_lock_guard lock(mu);
+    if (T* p = cached.load()) {  // lost the race; discard ours
+        delete built;
+        return *p;
+    }
+    cached.store(built);
+    return *built;
+}
+
+// Run `body()` and funnel any C++ or Python exception into DuckDB's per-callback
+// error channel via `set_error(const char*)`. Returns true when `body` ran to
+// completion, false when it threw (and the error was reported). Used by the UDF
+// / aggregate / table trampolines, which run with the GIL held and must never
+// let an exception unwind across the C ABI boundary back into DuckDB.
+template <typename Body, typename SetError>
+bool guard(Body&& body, SetError&& set_error) {
+    try {
+        std::forward<Body>(body)();
+        return true;
+    } catch (nb::python_error& e) {
+        set_error(e.what());
+        return false;
+    } catch (const std::exception& e) {
+        set_error(e.what());
+        return false;
+    }
+}
 
 inline const char* duckdb_type_name(duckdb_type type) {
     switch (type) {

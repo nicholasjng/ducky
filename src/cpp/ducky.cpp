@@ -22,29 +22,14 @@ using namespace nb::literals;
 
 namespace {
 
-// Cached handle to the ducky._conversions module. Imported once on first use
-// and intentionally leaked so its Py_DECREF doesn't run at interpreter
-// shutdown (matches the pattern in result.cpp's py_types()). Avoids
-// re-acquiring the import lock + redoing the sys.modules lookup on every
-// .arrow() / .to_numpy() / .chunks() call.
-//
-// Care: PyImport_ImportModule may release the GIL (to run Python-level
-// import hooks), so we must not hold any lock across it — otherwise a
-// second thread can re-enter, block on our lock, and deadlock against
-// the importing thread that's now waiting on the GIL. Mirrors LLVM's
-// SafeInit pattern from llvm/llvm-project#160000. Also makes the cache
-// correct under free-threaded Python.
+// Cached handle to the ducky._conversions module, imported once on first use.
+// Avoids re-acquiring the import lock + redoing the sys.modules lookup on every
+// .arrow() / .to_numpy() / .chunks() call. See cached_singleton() in ducky.hpp
+// for the leak + GIL-release rationale.
 const nb::module_& conversions() {
     static std::atomic<nb::module_*> cached{nullptr};
     static nb::ft_mutex mu;
-
-    if (nb::module_* p = cached.load()) return *p;
-    nb::module_ m = nb::module_::import_("ducky._conversions");
-    nb::ft_lock_guard lock(mu);
-    if (nb::module_* p = cached.load()) return *p;  // lost the race
-    auto* p = new nb::module_(std::move(m));
-    cached.store(p);
-    return *p;
+    return cached_singleton(cached, mu, [] { return nb::module_::import_("ducky._conversions"); });
 }
 
 }  // namespace

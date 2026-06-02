@@ -28,21 +28,22 @@ struct PyTypes {
 };
 
 const PyTypes& py_types() {
-    static const PyTypes* types = [] {
-        auto* t = new PyTypes();
+    static std::atomic<PyTypes*> cached{nullptr};
+    static nb::ft_mutex mu;
+    return cached_singleton(cached, mu, [] {
+        PyTypes t;
         nb::module_ datetime = nb::module_::import_("datetime");
-        t->date = datetime.attr("date");
-        t->time = datetime.attr("time");
-        t->datetime = datetime.attr("datetime");
-        t->timedelta = datetime.attr("timedelta");
-        t->timezone_utc = datetime.attr("timezone").attr("utc");
+        t.date = datetime.attr("date");
+        t.time = datetime.attr("time");
+        t.datetime = datetime.attr("datetime");
+        t.timedelta = datetime.attr("timedelta");
+        t.timezone_utc = datetime.attr("timezone").attr("utc");
         nb::module_ decimal = nb::module_::import_("decimal");
-        t->decimal = decimal.attr("Decimal");
-        t->decimal_ctx = decimal.attr("Context")("prec"_a = 40);
-        t->uuid = nb::module_::import_("uuid").attr("UUID");
+        t.decimal = decimal.attr("Decimal");
+        t.decimal_ctx = decimal.attr("Context")("prec"_a = 40);
+        t.uuid = nb::module_::import_("uuid").attr("UUID");
         return t;
-    }();
-    return *types;
+    });
 }
 
 nb::object steal_checked(PyObject* obj) {

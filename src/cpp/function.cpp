@@ -402,7 +402,12 @@ duckdb_logical_type parse_logical_type(duckdb_connection con, const std::string&
     return lt;
 }
 
-duckdb_type parse_type_name(const std::string& name) { return lookup(name).type; }
+const TypeSpec* typespec_for(duckdb_type type) {
+    for (const TypeSpec& t : kTypes) {
+        if (t.type == type) return &t;
+    }
+    return nullptr;
+}
 
 void create_scalar_function(Connection& con, const std::string& name, nb::callable fn,
                             nb::object parameters, nb::object return_type, nb::object varargs) {

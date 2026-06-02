@@ -32,32 +32,29 @@ struct BindTypes {
 const BindTypes& bind_types() {
     static std::atomic<BindTypes*> cached{nullptr};
     static nb::ft_mutex mu;
-    if (BindTypes* p = cached.load()) return *p;
-    nb::module_ dt = nb::module_::import_("datetime");
-    nb::type_object datetime_ty = dt.attr("datetime");
-    nb::object utc = dt.attr("timezone").attr("utc");
-    nb::object epoch_utc = datetime_ty(1970, 1, 1, 0, 0, 0, 0, utc);
-    nb::object two_pow_127 = nb::int_(1).attr("__lshift__")(127);
-    nb::object int128_min = two_pow_127.attr("__neg__")();
-    nb::object two_pow_128 = nb::int_(1).attr("__lshift__")(128);
-    nb::object mask64 = nb::int_(1).attr("__lshift__")(64).attr("__sub__")(nb::int_(1));
-    auto box = new BindTypes{
-        dt.attr("date"),
-        dt.attr("time"),
-        datetime_ty,
-        dt.attr("timedelta"),
-        nb::module_::import_("decimal").attr("Decimal"),
-        nb::module_::import_("uuid").attr("UUID"),
-        std::move(epoch_utc),
-        std::move(int128_min),
-        std::move(two_pow_127),
-        std::move(two_pow_128),
-        std::move(mask64),
-    };
-    nb::ft_lock_guard lock(mu);
-    if (BindTypes* p = cached.load()) return *p;
-    cached.store(box);
-    return *box;
+    return cached_singleton(cached, mu, [] {
+        nb::module_ dt = nb::module_::import_("datetime");
+        nb::type_object datetime_ty = dt.attr("datetime");
+        nb::object utc = dt.attr("timezone").attr("utc");
+        nb::object epoch_utc = datetime_ty(1970, 1, 1, 0, 0, 0, 0, utc);
+        nb::object two_pow_127 = nb::int_(1).attr("__lshift__")(127);
+        nb::object int128_min = two_pow_127.attr("__neg__")();
+        nb::object two_pow_128 = nb::int_(1).attr("__lshift__")(128);
+        nb::object mask64 = nb::int_(1).attr("__lshift__")(64).attr("__sub__")(nb::int_(1));
+        return BindTypes{
+            dt.attr("date"),
+            dt.attr("time"),
+            datetime_ty,
+            dt.attr("timedelta"),
+            nb::module_::import_("decimal").attr("Decimal"),
+            nb::module_::import_("uuid").attr("UUID"),
+            std::move(epoch_utc),
+            std::move(int128_min),
+            std::move(two_pow_127),
+            std::move(two_pow_128),
+            std::move(mask64),
+        };
+    });
 }
 
 // Split a Python int into a 128-bit (lo, hi) pair.
@@ -468,15 +465,12 @@ std::shared_ptr<Result> Connection::sql(const std::string& query) {
     return make_result(run(query, nb::none()));
 }
 
-Result& Connection::current() {
-    if (!last_result_) throw DuckyError("ducky: no result set; call execute() first");
-    return *last_result_;
-}
-
 std::shared_ptr<Result> Connection::current_result() {
     if (!last_result_) throw DuckyError("ducky: no result set; call execute() first");
     return last_result_;
 }
+
+Result& Connection::current() { return *current_result(); }
 
 nb::object Connection::fetchone() { return current().fetchone(); }
 nb::list Connection::fetchmany(int64_t size) { return current().fetchmany(size); }

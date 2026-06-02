@@ -26,6 +26,12 @@ struct TypeSpec {
 // FLOAT, DOUBLE, DATE, TIME, TIMESTAMP variants.
 const TypeSpec& lookup_typespec(const std::string& name);
 
+// Returns the TypeSpec for a DuckDB primitive type id, or nullptr if the type
+// has no flat ndarray representation (VARCHAR, nested, DECIMAL, HUGEINT, ...).
+// Single source of truth for the type → dtype/size mapping shared by the
+// chunk exporter (chunk.cpp) and the columnar appender (appender.cpp).
+const TypeSpec* typespec_for(duckdb_type type);
+
 // Parse a DuckDB type expression via a SQL round-trip. Supports the full type
 // grammar: "VARCHAR", "DECIMAL(10,2)", "LIST(INTEGER)", etc.
 // Returns an owned logical type; caller must destroy with duckdb_destroy_logical_type.
@@ -59,7 +65,3 @@ void create_scalar_function(Connection& con, const std::string& name, nb::callab
 void create_arrow_scalar_function(Connection& con, const std::string& name, nb::callable fn,
                                   nb::object parameters, const std::string& return_type,
                                   bool record_batch);
-
-// Returns the duckdb_type enum for one of our supported primitive type names.
-// Throws DuckyError on unknown names.
-duckdb_type parse_type_name(const std::string& name);

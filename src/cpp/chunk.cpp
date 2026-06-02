@@ -6,63 +6,21 @@
 #include <cstring>
 
 #include "ducky.hpp"
+#include "function.hpp"
 
 namespace {
 
-// Maps DuckDB primitive types to a DLPack/numpy dtype matching the chunk's
-// in-memory layout. Temporal types are returned as their raw integer storage
-// (e.g. DATE -> int32 days since epoch, TIMESTAMP -> int64 microseconds).
-// Non-flat types (VARCHAR, BLOB, LIST, STRUCT, MAP, ARRAY, DECIMAL, HUGEINT,
-// UUID, INTERVAL) return false; callers should raise.
+// Maps a DuckDB primitive type to a DLPack/numpy dtype matching the chunk's
+// in-memory layout (temporal types come back as their raw integer storage:
+// DATE -> int32 days, TIMESTAMP -> int64 micros). Delegates to the shared
+// TypeSpec table in function.cpp. Non-flat types (VARCHAR, BLOB, LIST, STRUCT,
+// MAP, ARRAY, DECIMAL, HUGEINT, UUID, INTERVAL) return false; callers raise.
 bool dtype_for(duckdb_type t, nb::dlpack::dtype& out) {
-    switch (t) {
-        case DUCKDB_TYPE_BOOLEAN:
-            out = nb::dtype<bool>();
-            return true;
-        case DUCKDB_TYPE_TINYINT:
-            out = nb::dtype<int8_t>();
-            return true;
-        case DUCKDB_TYPE_SMALLINT:
-            out = nb::dtype<int16_t>();
-            return true;
-        case DUCKDB_TYPE_INTEGER:
-            out = nb::dtype<int32_t>();
-            return true;
-        case DUCKDB_TYPE_BIGINT:
-            out = nb::dtype<int64_t>();
-            return true;
-        case DUCKDB_TYPE_UTINYINT:
-            out = nb::dtype<uint8_t>();
-            return true;
-        case DUCKDB_TYPE_USMALLINT:
-            out = nb::dtype<uint16_t>();
-            return true;
-        case DUCKDB_TYPE_UINTEGER:
-            out = nb::dtype<uint32_t>();
-            return true;
-        case DUCKDB_TYPE_UBIGINT:
-            out = nb::dtype<uint64_t>();
-            return true;
-        case DUCKDB_TYPE_FLOAT:
-            out = nb::dtype<float>();
-            return true;
-        case DUCKDB_TYPE_DOUBLE:
-            out = nb::dtype<double>();
-            return true;
-        case DUCKDB_TYPE_DATE:
-            out = nb::dtype<int32_t>();
-            return true;
-        case DUCKDB_TYPE_TIME:
-        case DUCKDB_TYPE_TIMESTAMP:
-        case DUCKDB_TYPE_TIMESTAMP_S:
-        case DUCKDB_TYPE_TIMESTAMP_MS:
-        case DUCKDB_TYPE_TIMESTAMP_NS:
-        case DUCKDB_TYPE_TIMESTAMP_TZ:
-            out = nb::dtype<int64_t>();
-            return true;
-        default:
-            return false;
+    if (const TypeSpec* spec = typespec_for(t)) {
+        out = spec->dtype();
+        return true;
     }
+    return false;
 }
 
 // Lazily-constructed numpy structured dtypes for HUGEINT, UHUGEINT, and
@@ -78,22 +36,19 @@ struct StructDtypes {
 const StructDtypes& struct_dtypes() {
     static std::atomic<StructDtypes*> cached{nullptr};
     static nb::ft_mutex mu;
-    if (StructDtypes* p = cached.load()) return *p;
-    nb::module_ np = nb::module_::import_("numpy");
-    auto mk = [&](std::initializer_list<std::pair<const char*, const char*>> fields) {
-        nb::list spec;
-        for (auto& [name, code] : fields) spec.append(nb::make_tuple(name, code));
-        return np.attr("dtype")(spec);
-    };
-    auto* p = new StructDtypes{
-        mk({{"lower", "<u8"}, {"upper", "<i8"}}),
-        mk({{"lower", "<u8"}, {"upper", "<u8"}}),
-        mk({{"months", "<i4"}, {"days", "<i4"}, {"micros", "<i8"}}),
-    };
-    nb::ft_lock_guard lock(mu);
-    if (StructDtypes* q = cached.load()) return *q;
-    cached.store(p);
-    return *p;
+    return cached_singleton(cached, mu, [] {
+        nb::module_ np = nb::module_::import_("numpy");
+        auto mk = [&](std::initializer_list<std::pair<const char*, const char*>> fields) {
+            nb::list spec;
+            for (auto& [name, code] : fields) spec.append(nb::make_tuple(name, code));
+            return np.attr("dtype")(spec);
+        };
+        return StructDtypes{
+            mk({{"lower", "<u8"}, {"upper", "<i8"}}),
+            mk({{"lower", "<u8"}, {"upper", "<u8"}}),
+            mk({{"months", "<i4"}, {"days", "<i4"}, {"micros", "<i8"}}),
+        };
+    });
 }
 
 // Wrap `data` (n * itemsize bytes) as a zero-copy uint8 ndarray, then call
