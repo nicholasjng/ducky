@@ -128,8 +128,102 @@ Legend: ✅ shipped · 🟡 partially shipped · ⬜ not started.
 
 ## Refactors not gated on v2
 
-- ⬜ Move the `.arrow/.df/.pl/.to_numpy/.to_torch/.to_jax/.chunks/.iter_batches`
-  wrappers off the C++ class definitions and into a Python-side mixin, using
-  a Python-visible `Connection.current_result` property. ~80 lines of
-  `ducky.cpp` go away and the Result-vs-Connection duplication collapses.
-  See the discussion attached to step 2.
+- ✅ Collapsed the duplicated `.arrow/.df/.pl/.to_numpy/.to_torch/.to_jax/
+  .chunks/.iter_batches*` wrappers. Rather than a Python-side mixin (which
+  would drop the methods from the auto-generated `_core.pyi`), a single
+  `def_conversions()` template in `ducky.cpp` registers all eleven once and is
+  instantiated for both `Result` and `Connection`, parameterised by a "source
+  extractor" (identity for `Result`, `current_result()` for `Connection`). The
+  methods stay compiled — so the stub generator still emits them — and a
+  Python-visible `Connection.current_result` property was added. Net ~90 lines
+  off `ducky.cpp`.
+
+## Unbound C API: candidates
+
+A survey of `ext/duckdb/src/include/duckdb.h` (≈548 functions) against what the
+bindings call (≈172) leaves ≈379 unbound. Most are low-level plumbing or
+already covered above (pending/streaming results, replacement scans, Arrow
+appender ingest). The items below are the gaps that look worth their weight for
+ducky's data-science / ML audience, roughly highest-value first.
+
+- ✅ **Prepared statements as first-class objects.**
+  `Connection.prepare(sql) -> PreparedStatement` compiles the query once
+  (parse + bind + plan) and exposes `.execute(params) -> Result` /
+  `.executemany(rows)`, so loops over a query reuse the plan instead of
+  re-preparing on every call as `connection.cpp:run()` does for ad-hoc
+  parameterised `execute()`. The execution releases the GIL (same as `run`),
+  reuses the existing `bind_parameters` machinery, and the returned `Result`
+  shares the `DuckDBHandle` so it outlives the connection. Introspection
+  without executing: `num_parameters`, `parameter_name(i)` (1-based),
+  `columns` / `types` (result schema via
+  `duckdb_prepared_statement_column_*`), and `statement_type`
+  (`duckdb_prepared_statement_type`). Context-manager aware. Per-index
+  `param_type` was left out for now — easy to add on top if a use case wants it.
+
+- ⬜ **Query profiling access** (`duckdb_get_profiling_info` +
+  `duckdb_profiling_info_get_metrics` / `_get_value` / `_get_child(_count)`).
+  Programmatic `EXPLAIN ANALYZE`: walk the operator tree and pull timing /
+  cardinality metrics into a Python dict (gated by the `enable_profiling`
+  setting), instead of scraping `EXPLAIN` text. A natural fit for perf tuning
+  in notebooks and inside training loops.
+
+- ⬜ **Table introspection + appender DEFAULTs** (`duckdb_table_description_*`,
+  `duckdb_append_default` / `duckdb_append_default_to_chunk`). The
+  `table_description` API gives column names / types / default-ness directly,
+  letting the appender drop its `SELECT * FROM t LIMIT 0` column-discovery hack
+  (`appender.cpp:discover_column_names`). It also unlocks appending rows that
+  fall back to a column's `DEFAULT` (e.g. autoincrement / `now()` columns)
+  instead of requiring every column — a common ergonomic gap in bulk insert.
+
+- ⬜ **Stateful / volatile / NULL-aware scalar UDFs**
+  (`duckdb_scalar_function_set_bind` / `set_init` / `get_state` /
+  `set_bind_data`, `set_volatile`, `set_special_handling`). Rounds out the v2
+  UDF engine: `set_volatile` marks non-deterministic functions so the optimizer
+  won't fold or cache them (needed for `random`/`now`-style UDFs);
+  `set_special_handling` lets a UDF observe and emit NULLs (current ndarray UDFs
+  are NULL-oblivious — see the NULL-handling note in `_conversions.py`);
+  bind/init add per-statement and per-thread state.
+
+- ⬜ **Faithful table-function parameters** (the `duckdb_value` getter family:
+  `duckdb_get_date` / `_get_timestamp` / `_get_decimal` / `_get_blob` / nested
+  getters). `table.cpp:duckdb_value_to_python` currently decodes only
+  bool/int/float and falls back to `str()` (varchar) for everything else, so a
+  `DATE` / `TIMESTAMP` / `DECIMAL` argument reaches the Python factory as text.
+  A complete `duckdb_value` → Python decoder (shared with the scalar bind path
+  in `connection.cpp`) would pass these through with their real types.
+
+- ⬜ **Multi-statement scripts + statement-type introspection**
+  (`duckdb_extract_statements` / `_error`, `duckdb_prepared_statement_type`,
+  `duckdb_result_statement_type`). Run a multi-statement `.sql` script in one
+  call, and expose the statement kind (SELECT / INSERT / UPDATE / …) so callers
+  can branch — e.g. only materialise a result for statements that produce one.
+
+- ⬜ **DuckDB filesystem access from Python** (`duckdb_file_system_open`,
+  `duckdb_file_handle_read` / `_seek` / `_tell` / `_size` / `_write` / `_close`
+  via `duckdb_connection_get_client_context` →
+  `duckdb_client_context_get_file_system`). Read and write files through
+  DuckDB's *configured* filesystem — including extensions like `httpfs` / S3 —
+  from Python, without a separate IO stack. Note this is a consumer API
+  (open/read/seek on DuckDB's FS); it does not register a Python-backed
+  filesystem, so it complements `fsspec` rather than replacing it.
+
+- ⬜ **Shared in-memory databases via the instance cache**
+  (`duckdb_create_instance_cache`, `duckdb_get_or_create_from_cache`,
+  `duckdb_destroy_instance_cache`). Each ducky `Connection` currently owns its
+  own database, so two `connect(":memory:")` calls are fully isolated (see the
+  note in `connection.hpp`). Routing opens through an instance cache would let
+  several connections share one in-memory database — useful for multi-threaded
+  readers or a writer + reader split over the same transient data.
+
+### Deliberately skipped (niche / high effort)
+
+- **Custom COPY functions** (`duckdb_copy_function_*`, ~30 calls) — Python-backed
+  `COPY TO/FROM` for bespoke import/export formats. Large surface, narrow
+  audience versus just reading/writing Arrow or Parquet.
+- **Custom CAST functions** (`duckdb_create_cast_function` + `duckdb_cast_function_*`)
+  — register Python cast logic between types; rarely needed once UDFs exist.
+- **Custom log storage** (`duckdb_create_log_storage`, `duckdb_log_*`) — pluggable
+  log sinks; operational rather than analytical.
+- **Extension install/load** — the roadmap's "runtime extension loading" item
+  has no matching C API surface in this DuckDB pin (no `duckdb_extension_*`
+  functions in `duckdb.h`); it would need a `PRAGMA`/SQL approach instead.
