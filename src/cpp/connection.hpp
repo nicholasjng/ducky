@@ -12,6 +12,8 @@
 
 namespace nb = nanobind;
 
+class PreparedStatement;
+
 // A DuckDB database handle plus a single connection to it. Each Connection owns
 // its own database, so connecting to ":memory:" yields an isolated in-memory
 // database, matching duckdb.connect() semantics.
@@ -33,6 +35,11 @@ class Connection {
 
     // Eagerly runs a query and hands back its Result directly.
     std::shared_ptr<Result> sql(const std::string& query);
+
+    // Compile `query` once into a PreparedStatement that can be executed
+    // repeatedly with different parameters. Raises DuckyError on a parse/bind
+    // failure. The statement shares this connection's DuckDBHandle.
+    PreparedStatement* prepare(const std::string& query);
 
     nb::object fetchone();
     nb::list fetchmany(int64_t size);

@@ -14,6 +14,7 @@
 #include "connection.hpp"
 #include "duckdb.h"
 #include "function.hpp"
+#include "prepared.hpp"
 #include "result.hpp"
 #include "table.hpp"
 
@@ -235,18 +236,61 @@ NB_MODULE(_core, m) {
             nb::sig("def __exit__(self, exc_type: type[BaseException] | None, exc_value: "
                     "BaseException | None, traceback: types.TracebackType | None) -> None"));
 
+    nb::class_<PreparedStatement>(
+        m, "PreparedStatement",
+        "A SQL statement compiled once via Connection.prepare(), executable "
+        "repeatedly with different parameters without re-parsing the query.")
+        .def("execute", &PreparedStatement::execute, "parameters"_a = nb::none(),
+             nb::sig("def execute(self, parameters: list | tuple | dict[str, typing.Any] | None = "
+                     "None) -> Result"),
+             "Bind `parameters` (positional list/tuple, named dict, or None) and "
+             "run the statement, returning its Result.")
+        .def("executemany", &PreparedStatement::executemany, "parameters"_a,
+             nb::sig("def executemany(self, parameters: collections.abc.Iterable[list | tuple | "
+                     "dict[str, typing.Any]]) -> None"),
+             "Run the statement once per parameter set, discarding each result. "
+             "The fast path for batched INSERT/UPDATE/DELETE.")
+        .def_prop_ro("num_parameters", &PreparedStatement::num_parameters,
+                     "Number of bind parameters in the statement.")
+        .def("parameter_name", &PreparedStatement::parameter_name, "index"_a,
+             nb::sig("def parameter_name(self, index: int) -> str | None"),
+             "Name of the parameter at `index` (1-based), or None if the index is "
+             "out of range or the parameter is positional.")
+        .def_prop_ro("columns", &PreparedStatement::column_names,
+                     "Result column names, known ahead of execution (empty for "
+                     "statements that produce no result set).")
+        .def_prop_ro("types", &PreparedStatement::column_types,
+                     "Result column type names, known ahead of execution.")
+        .def_prop_ro("statement_type", &PreparedStatement::statement_type,
+                     nb::sig("def statement_type(self) -> str"),
+                     "The statement kind: 'SELECT', 'INSERT', 'UPDATE', etc.")
+        .def("close", &PreparedStatement::close, "Destroy the prepared statement.")
+        .def(
+            "__enter__", [](PreparedStatement& self) -> PreparedStatement& { return self; },
+            nb::rv_policy::reference)
+        .def(
+            "__exit__",
+            [](PreparedStatement& self, nb::object, nb::object, nb::object) { self.close(); },
+            "exc_type"_a.none(), "exc_value"_a.none(), "traceback"_a.none(),
+            nb::sig("def __exit__(self, exc_type: type[BaseException] | None, exc_value: "
+                    "BaseException | None, traceback: types.TracebackType | None) -> None"));
+
     nb::class_<Connection> conn_cls(m, "Connection", "A connection to a DuckDB database.");
     conn_cls
         .def("execute", &Connection::execute, "query"_a, "parameters"_a = nb::none(),
              nb::rv_policy::reference,
-             nb::sig("def execute(self, query: str, parameters: list | dict[str, typing.Any] | "
-                     "None = None) -> Connection"),
+             nb::sig("def execute(self, query: str, parameters: list | tuple | "
+                     "dict[str, typing.Any] | None = None) -> Connection"),
              "Execute a query, optionally with positional parameters, and "
              "return self for chaining.")
         // The returned Result shares the DuckDBHandle, so it keeps the database
         // open on its own — no keep_alive needed.
         .def("sql", &Connection::sql, "query"_a, "Run a query and return its Result.")
         .def("query", &Connection::sql, "query"_a, "Alias for sql().")
+        .def("prepare", &Connection::prepare, "query"_a,
+             nb::sig("def prepare(self, query: str) -> PreparedStatement"),
+             "Compile `query` once into a PreparedStatement for repeated execution "
+             "with different parameters, avoiding per-call re-parsing and planning.")
         .def("fetchone", &Connection::fetchone, nb::sig("def fetchone(self) -> tuple | None"))
         .def("fetchmany", &Connection::fetchmany, "size"_a = 1,
              nb::sig("def fetchmany(self, size: int = 1) -> list[tuple]"))

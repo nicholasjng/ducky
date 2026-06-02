@@ -185,10 +185,62 @@ class Appender:
     ) -> None:
         pass
 
+class PreparedStatement:
+    """
+    A SQL statement compiled once via Connection.prepare(), executable repeatedly with different parameters without re-parsing the query.
+    """
+
+    def execute(self, parameters: list | tuple | dict[str, Any] | None = None) -> Result:
+        """
+        Bind `parameters` (positional list/tuple, named dict, or None) and run the statement, returning its Result.
+        """
+
+    def executemany(self, parameters: Iterable[list | tuple | dict[str, Any]]) -> None:
+        """
+        Run the statement once per parameter set, discarding each result. The fast path for batched INSERT/UPDATE/DELETE.
+        """
+
+    @property
+    def num_parameters(self) -> int:
+        """Number of bind parameters in the statement."""
+
+    def parameter_name(self, index: int) -> str | None:
+        """
+        Name of the parameter at `index` (1-based), or None if the index is out of range or the parameter is positional.
+        """
+
+    @property
+    def columns(self) -> list[str]:
+        """
+        Result column names, known ahead of execution (empty for statements that produce no result set).
+        """
+
+    @property
+    def types(self) -> list[str]:
+        """Result column type names, known ahead of execution."""
+
+    @property
+    def statement_type(self) -> str:
+        """The statement kind: 'SELECT', 'INSERT', 'UPDATE', etc."""
+
+    def close(self) -> None:
+        """Destroy the prepared statement."""
+
+    def __enter__(self) -> PreparedStatement: ...
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        pass
+
 class Connection:
     """A connection to a DuckDB database."""
 
-    def execute(self, query: str, parameters: list | dict[str, Any] | None = None) -> Connection:
+    def execute(
+        self, query: str, parameters: list | tuple | dict[str, Any] | None = None
+    ) -> Connection:
         """
         Execute a query, optionally with positional parameters, and return self for chaining.
         """
@@ -198,6 +250,11 @@ class Connection:
 
     def query(self, query: str) -> Result:
         """Alias for sql()."""
+
+    def prepare(self, query: str) -> PreparedStatement:
+        """
+        Compile `query` once into a PreparedStatement for repeated execution with different parameters, avoiding per-call re-parsing and planning.
+        """
 
     def fetchone(self) -> tuple | None: ...
     def fetchmany(self, size: int = 1) -> list[tuple]: ...

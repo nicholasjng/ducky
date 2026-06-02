@@ -7,6 +7,7 @@
 #include <cstring>
 
 #include "ducky.hpp"
+#include "prepared.hpp"
 
 namespace {
 
@@ -465,6 +466,17 @@ std::shared_ptr<Result> Connection::sql(const std::string& query) {
     return make_result(run(query, nb::none()));
 }
 
+PreparedStatement* Connection::prepare(const std::string& query) {
+    ensure_open();
+    duckdb_prepared_statement stmt = nullptr;
+    if (duckdb_prepare(handle_->connection, query.c_str(), &stmt) == DuckDBError) {
+        std::string message = duckdb_prepare_error(stmt);
+        duckdb_destroy_prepare(&stmt);
+        throw DuckyError(message);
+    }
+    return new PreparedStatement(stmt, handle_);
+}
+
 std::shared_ptr<Result> Connection::current_result() {
     if (!last_result_) throw DuckyError("ducky: no result set; call execute() first");
     return last_result_;
@@ -484,4 +496,113 @@ nb::object Connection::description() const {
 nb::object Connection::columns() const {
     if (!last_result_) return nb::none();
     return nb::cast(last_result_->column_names());
+}
+
+// ── PreparedStatement ────────────────────────────────────────────────────────
+// Implemented here (rather than a separate prepared.cpp) to reuse the
+// bind_parameters() machinery in this file's anonymous namespace.
+
+PreparedStatement::PreparedStatement(duckdb_prepared_statement stmt,
+                                     std::shared_ptr<DuckDBHandle> handle)
+    : stmt_(stmt), handle_(std::move(handle)) {}
+
+PreparedStatement::~PreparedStatement() {
+    if (stmt_) duckdb_destroy_prepare(&stmt_);
+}
+
+void PreparedStatement::ensure_valid() const {
+    if (!stmt_) throw DuckyError("ducky: prepared statement is closed");
+}
+
+std::shared_ptr<Result> PreparedStatement::execute(nb::object parameters) {
+    ensure_valid();
+    if (!parameters.is_none()) {
+        // Clear any prior binding so a positional set doesn't linger across calls.
+        if (duckdb_clear_bindings(stmt_) == DuckDBError) {
+            throw DuckyError("ducky: failed to clear prepared-statement bindings");
+        }
+        bind_parameters(stmt_, parameters);
+    }
+    duckdb_result result;
+    duckdb_state state;
+    {
+        // Release the GIL across execution — same rationale as Connection::run.
+        nb::gil_scoped_release release;
+        state = duckdb_execute_prepared(stmt_, &result);
+    }
+    if (state == DuckDBError) {
+        std::string message = duckdb_result_error(&result);
+        duckdb_destroy_result(&result);
+        throw DuckyError(message);
+    }
+    return std::make_shared<Result>(result, handle_);
+}
+
+void PreparedStatement::executemany(nb::object seq) {
+    ensure_valid();
+    for (nb::handle params : seq) {
+        if (duckdb_clear_bindings(stmt_) == DuckDBError) {
+            throw DuckyError("ducky: failed to clear prepared-statement bindings");
+        }
+        bind_parameters(stmt_, params);
+        duckdb_result result;
+        duckdb_state state;
+        {
+            nb::gil_scoped_release release;
+            state = duckdb_execute_prepared(stmt_, &result);
+        }
+        std::string message;
+        if (state == DuckDBError) message = duckdb_result_error(&result);
+        duckdb_destroy_result(&result);
+        if (state == DuckDBError) throw DuckyError(message);
+    }
+}
+
+int64_t PreparedStatement::num_parameters() const {
+    ensure_valid();
+    return (int64_t)duckdb_nparams(stmt_);
+}
+
+nb::object PreparedStatement::parameter_name(int64_t index) const {
+    ensure_valid();
+    const char* name = duckdb_parameter_name(stmt_, (idx_t)index);
+    if (!name) return nb::none();
+    nb::object out = nb::str(name);
+    duckdb_free((void*)name);
+    return out;
+}
+
+std::vector<std::string> PreparedStatement::column_names() const {
+    ensure_valid();
+    idx_t n = duckdb_prepared_statement_column_count(stmt_);
+    std::vector<std::string> out;
+    out.reserve(n);
+    for (idx_t i = 0; i < n; ++i) {
+        const char* name = duckdb_prepared_statement_column_name(stmt_, i);
+        out.emplace_back(name ? name : "");
+        if (name) duckdb_free((void*)name);
+    }
+    return out;
+}
+
+std::vector<std::string> PreparedStatement::column_types() const {
+    ensure_valid();
+    idx_t n = duckdb_prepared_statement_column_count(stmt_);
+    std::vector<std::string> out;
+    out.reserve(n);
+    for (idx_t i = 0; i < n; ++i) {
+        out.emplace_back(duckdb_type_name(duckdb_prepared_statement_column_type(stmt_, i)));
+    }
+    return out;
+}
+
+std::string PreparedStatement::statement_type() const {
+    ensure_valid();
+    return duckdb_statement_type_name(duckdb_prepared_statement_type(stmt_));
+}
+
+void PreparedStatement::close() {
+    if (stmt_) duckdb_destroy_prepare(&stmt_);
+    stmt_ = nullptr;
+    handle_.reset();
 }
