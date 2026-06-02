@@ -14,7 +14,7 @@ import ducky
 
 def main() -> None:
     # threads >= 2 lets DuckDB's scheduler report meaningful progress.
-    con = ducky.connect(threads="4")
+    con = ducky.connect(threads=4)
 
     # Everything inside the block is tracked; the bar finalizes to 100% on exit.
     with ducky.progress_bar(con, desc="counting"):

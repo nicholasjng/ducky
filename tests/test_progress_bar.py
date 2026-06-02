@@ -24,7 +24,7 @@ def test_make_bar_falls_back_when_tqdm_disabled():
 
 
 def test_progress_bar_runs_query_and_finalizes():
-    con = ducky.connect(threads="2")
+    con = ducky.connect(threads=2)
     out = io.StringIO()
     with ducky.progress_bar(con, desc="t", out=out, use_tqdm=False, interval=0.01) as c:
         assert c is con
@@ -57,7 +57,7 @@ def test_progress_bar_restores_settings():
 def test_progress_bar_does_not_print_duckdb_native_bar(capfd):
     # enable_progress_bar_print is forced off, so DuckDB never writes its own
     # bar to stdout — only our handle (here a StringIO) sees output.
-    con = ducky.connect(threads="2")
+    con = ducky.connect(threads=2)
     out = io.StringIO()
     with ducky.progress_bar(con, out=out, use_tqdm=False, interval=0.01):
         con.execute("SELECT count(*) FROM range(20_000_000) t(i) WHERE i % 13 = 0").fetchall()

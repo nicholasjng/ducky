@@ -5,7 +5,7 @@ into a live bar means enabling progress tracking, spawning a poller thread, and
 restoring connection settings afterwards. :func:`progress_bar` bakes that in:
 
     >>> import ducky
-    >>> con = ducky.connect(threads="4")
+    >>> con = ducky.connect(threads=4)
     >>> with ducky.progress_bar(con):
     ...     con.execute("SELECT count(*) FROM range(1_000_000_000) WHERE i % 7 = 0")
 

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import sys
-from typing import cast
 
 if sys.version_info >= (3, 12):
     from typing import Unpack
@@ -41,21 +40,32 @@ def connect(
 ) -> Connection:
     """Open `database` (default in-memory) and return a Connection.
 
-    DuckDB settings are passed as keyword arguments using the keys declared
-    in :class:`DuckDBConfig` (autocomplete-friendly). Any keyword unknown to
-    DuckDB raises :class:`Error` at open time; see :func:`config_options`
-    for the full runtime list.
+    DuckDB settings are passed as keyword arguments using the keys declared in
+    :class:`DuckDBConfig` (autocomplete-friendly), as their natural Python type
+    — `ducky.connect(memory_limit="2GB", threads=4, enable_object_cache=True)`.
+    Values are coerced to strings for DuckDB; any key or value DuckDB rejects
+    raises :class:`Error` at open time. See :func:`config_options` for the full
+    runtime list.
 
     Examples
     --------
-    >>> con = ducky.connect(memory_limit="2GB", threads="4")
+    >>> con = ducky.connect(memory_limit="2GB", threads=4)
     >>> con = ducky.connect("mydb.duckdb", access_mode="READ_ONLY")
     """
-    # `config` is a plain dict at runtime (kwargs collection) — the cast
-    # bridges the TypedDict view to the concrete dict shape that `_connect`
-    # advertises. TypedDicts aren't structurally assignable to dict[str, str]
-    # in PEP 589, so this purely-static narrowing is the cleanest workaround.
-    return _connect(database, cast("dict[str, str]", config) if config else None)
+
+    def coerce(value: object) -> str:
+        # Coerce a config value to the string form duckdb_set_config expects.
+        # bool is checked before int (it is an int subclass) so flags become
+        # DuckDB's "true"/"false" rather than "1"/"0". Strings pass through; any
+        # other scalar is stringified. DuckDB validates the result at open time.
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        if isinstance(value, str):
+            return value
+        return str(value)
+
+    coerced = {key: coerce(value) for key, value in config.items()}
+    return _connect(database, coerced or None)
 
 
 __all__ = [

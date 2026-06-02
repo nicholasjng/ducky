@@ -12,7 +12,7 @@ import ducky
 
 
 def test_config_round_trip():
-    con = ducky.connect(memory_limit="1GB", threads="2")
+    con = ducky.connect(memory_limit="1GB", threads=2)
     row = con.execute(
         "SELECT current_setting('memory_limit'), current_setting('threads')"
     ).fetchone()
@@ -21,6 +21,39 @@ def test_config_round_trip():
     # DuckDB normalises memory_limit; just make sure it didn't ignore us.
     assert "MiB" in mem or "GB" in mem.upper()
     assert threads == 2
+
+
+def test_config_native_types_coerced():
+    # int and bool are coerced to DuckDB's string form; the round-trip confirms
+    # threads=3 (not "3") and the flag arrives as a real boolean (not "1"/"0").
+    con = ducky.connect(threads=3, preserve_insertion_order=False)
+    row = con.execute(
+        "SELECT current_setting('threads'), current_setting('preserve_insertion_order')"
+    ).fetchone()
+    assert row is not None
+    threads, preserve = row
+    assert threads == 3
+    assert preserve is False
+
+
+def test_config_bool_true_coerced():
+    con = ducky.connect(preserve_insertion_order=True)
+    row = con.execute("SELECT current_setting('preserve_insertion_order')").fetchone()
+    assert row is not None
+    assert row[0] is True
+
+
+def test_config_str_value_passes_through():
+    # str values (sizes, enums) are forwarded untouched.
+    con = ducky.connect(memory_limit="512MB", access_mode="READ_WRITE")
+    assert con.execute("SELECT 1").fetchone() == (1,)
+
+
+def test_config_bad_value_still_raises():
+    # Coercion forwards an unparseable string unchanged; DuckDB rejects it,
+    # surfacing as ducky.Error rather than a Python coercion error.
+    with pytest.raises(ducky.Error):
+        ducky.connect(**{"threads": "not_a_number"})  # ty: ignore[invalid-argument-type]
 
 
 def test_config_typed_dict_unpacked():
@@ -58,7 +91,7 @@ def test_progress_on_idle_connection():
 def test_interrupt_cancels_long_query():
     # Force DuckDB to think this query is worth parallelizing — without
     # threads >= 2 it tends to short-circuit before the interrupt arrives.
-    con = ducky.connect(threads="2")
+    con = ducky.connect(threads=2)
 
     err: list[BaseException] = []
 
@@ -81,7 +114,7 @@ def test_interrupt_cancels_long_query():
 
 
 def test_progress_during_long_query():
-    con = ducky.connect(threads="2")
+    con = ducky.connect(threads=2)
 
     samples: list[tuple[float, int, int]] = []
     done = threading.Event()

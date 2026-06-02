@@ -10,26 +10,23 @@ allowed values) and catch typos at static-analysis time.
 Used via :pep:`692` `Unpack[DuckDBConfig]` on the `**config` parameter of
 `ducky.connect`, so call sites read as plain keyword arguments:
 
-    ducky.connect(memory_limit="2GB", threads="4")
+    ducky.connect(memory_limit="2GB", threads=4)
 """
 
 from __future__ import annotations
 
 from typing import Literal, TypedDict
 
-# DuckDB accepts a handful of string spellings for booleans (`true`/`false`,
-# `1`/`0`, `on`/`off`, `yes`/`no`). The TypedDict pins the lower-case
-# `true`/`false` form — autocomplete-friendly and explicit. Pass other
-# spellings via `**{"key": "1"}` if needed.
-BoolStr = Literal["true", "false"]
-
 
 class DuckDBConfig(TypedDict, total=False):
     """A curated subset of DuckDB global configuration options.
 
-    Values are passed verbatim to `duckdb_set_config` and must be strings —
-    e.g. `"2GB"`, `"4"`, `"READ_ONLY"`. See `ducky.config_options()` for the
-    full runtime list of accepted keys.
+    Values are given as their natural Python type — `int` for counts, `bool`
+    for flags, `str` for sizes / paths / enums (e.g. `"2GB"`, `"READ_ONLY"`).
+    `ducky.connect` coerces them to the string form `duckdb_set_config`
+    expects (`True` → `"true"`, `4` → `"4"`); DuckDB itself validates the
+    names and values at open time. See `ducky.config_options()` for the full
+    runtime list of accepted keys.
     """
 
     # ── Closed value sets (Literal) ───────────────────────────────────────
@@ -42,23 +39,30 @@ class DuckDBConfig(TypedDict, total=False):
     default_null_order: Literal["NULLS_FIRST", "NULLS_LAST"]
     """NULL placement in default sort order."""
 
-    preserve_insertion_order: BoolStr
+    preserve_insertion_order: bool
     """Keep result rows in insertion order when possible."""
 
-    enable_object_cache: BoolStr
+    enable_object_cache: bool
     """Cache Parquet metadata across queries."""
 
-    enable_external_access: BoolStr
+    enable_external_access: bool
     """Gate httpfs / s3 / file:// scans."""
 
-    autoload_known_extensions: BoolStr
+    autoload_known_extensions: bool
     """Load extensions on first reference."""
 
-    autoinstall_known_extensions: BoolStr
+    autoinstall_known_extensions: bool
     """Install extensions on first reference."""
 
-    enable_progress_bar: BoolStr
+    enable_progress_bar: bool
     """Show a progress bar for long-running queries."""
+
+    # ── Counts ────────────────────────────────────────────────────────────
+    threads: int
+    """Number of worker threads. `1` disables parallelism."""
+
+    worker_threads: int
+    """Alias of `threads`."""
 
     # ── Free-form string values ───────────────────────────────────────────
     memory_limit: str
@@ -66,12 +70,6 @@ class DuckDBConfig(TypedDict, total=False):
 
     max_memory: str
     """Alias of `memory_limit`."""
-
-    threads: str
-    """Number of worker threads, as a decimal string. `"1"` disables parallelism."""
-
-    worker_threads: str
-    """Alias of `threads`."""
 
     temp_directory: str
     """Directory for spilled intermediates."""
