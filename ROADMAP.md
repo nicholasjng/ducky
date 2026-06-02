@@ -115,6 +115,56 @@ Legend: ✅ shipped · 🟡 partially shipped · ⬜ not started.
   substrate for releasing the GIL during `execute` (see UDF section) and for
   a true streaming `to_torch` / `to_jax` that avoids the intermediate copy.
 
+## Dataset / feature API
+
+- ⬜ **Named output fields (beyond a single `X` / `y`).** `ducky.dataset()`
+  today materialises exactly two output arrays per fold — features stacked into
+  `X` and the target column as `y` (`Fold.tensors()`). The split,
+  standardisation (train-fold stats) and backend materialisation already operate
+  on an arbitrary per-column dict (`Fold._arrays`); only the *assembly* step
+  hardcodes "stack the features → `X`, take the target → `y`". Generalise the
+  output into a dict of named **fields**, each either a **matrix** (several
+  columns stacked into `(n, d)`) or a **vector** (one column → `(n,)`):
+
+  ```python
+  ds = ducky.dataset(
+      source,
+      fields={
+          "X": ducky.matrix({"age": ducky.feature("Age", standardize=True), ...}),
+          "y": ducky.vector("Survived"),
+          "w": ducky.vector("sample_weight"),          # sample weights
+          "ids": ducky.vector("PassengerId", dtype="i64"),
+          # a multi-output target is just another matrix: "Y": ducky.matrix({...})
+      },
+      split=ducky.split(0.8), backend="jax",
+  )
+  Xtr, wtr = ds.train["X"], ds.train["w"]
+  ```
+
+  Unlocks sample weights, multi-output / multi-task targets, group / id columns
+  (passthrough today, and the substrate for future *group-aware* splitting), and
+  separate dense / categorical feature blocks — all as uniform fields, with no
+  per-role special cases.
+
+  **Shape of the change** (mostly assembly, not the SQL / streaming core):
+  - New spec helpers `ducky.matrix(columns)` / `ducky.vector(expr, *, dtype,
+    standardize)` alongside `feature` / `target` / `split`.
+  - `_compile_sql` collects column exprs across *all* fields under
+    field-qualified aliases (e.g. `X__age`, `y`, `w`) so names stay unique;
+    standardisation stats and the hash-bucket split are otherwise unchanged.
+  - Assembly per fold reuses the existing on-device `_stack` / `_gather`: stack a
+    matrix field's columns, take a vector field's lone column. `Fold` holds
+    `_fields: dict[str, ArrayT]` and gains `Fold.__getitem__(name) -> ArrayT`, so
+    `ds["train"]["X"]` reads naturally.
+  - Typing is unaffected: every field is the same backend type `ArrayT` (the
+    `AbstractArray` bound only needs `.shape`), so a 2-D `X` and a 1-D `w` are
+    both members of one `Fold[ArrayT]`, and the `dataset()` backend overloads
+    keep mapping `backend=` → element type.
+  - **Backward compatible.** Keep `columns=` / `target=` as a shorthand that
+    desugars to `fields={"X": matrix(columns), "y": vector(target)}`, and
+    `Fold.tensors()` as sugar returning `(self["X"], self["y"])` when both exist
+    — so existing call sites and the Titanic examples stay untouched.
+
 ## QOL improvements
 
 - ⬜ **`Result.fetchitem()` / `Connection.fetchitem()`.** A scalar-fetch
