@@ -26,15 +26,13 @@ idx_t agg_state_size(duckdb_function_info /*info*/) { return sizeof(PyObject*); 
 void agg_init(duckdb_function_info info, duckdb_aggregate_state state) {
     auto* ctx = (AggregateUDFContext*)duckdb_aggregate_function_get_extra_info(info);
     nb::gil_scoped_acquire gil;
-    try {
-        nb::object inst = ctx->cls();
-        PyObject* raw = inst.release().ptr();
-        state->internal_ptr = (void*)raw;
-    } catch (nb::python_error& e) {
-        duckdb_aggregate_function_set_error(info, e.what());
-    } catch (const std::exception& e) {
-        duckdb_aggregate_function_set_error(info, e.what());
-    }
+    guard(
+        [&] {
+            nb::object inst = ctx->cls();
+            PyObject* raw = inst.release().ptr();
+            state->internal_ptr = (void*)raw;
+        },
+        [&](const char* what) { duckdb_aggregate_function_set_error(info, what); });
 }
 
 void agg_destroy(duckdb_aggregate_state* states, idx_t count) {
@@ -56,64 +54,64 @@ void agg_update(duckdb_function_info info, duckdb_data_chunk input,
 
     idx_t n_cols = (idx_t)ctx->param_types.size();
 
-    try {
-        // Fast path: all rows share one state (common for non-GROUP-BY queries).
-        bool single_state = true;
-        duckdb_aggregate_state first_state = states[0];
-        for (idx_t i = 1; i < n; ++i) {
-            if (states[i] != first_state) {
-                single_state = false;
-                break;
-            }
-        }
-
-        if (single_state) {
-            size_t shape[1] = {(size_t)n};
-            nb::list args;
-            for (idx_t c = 0; c < n_cols; ++c) {
-                duckdb_vector v = duckdb_data_chunk_get_vector(input, c);
-                void* data = duckdb_vector_get_data(v);
-                args.append(nb::ndarray<nb::numpy, nb::ro>(data, 1, shape, nb::handle(), nullptr,
-                                                           ctx->param_types[c]->dtype()));
-            }
-            nb::object inst = nb::borrow((PyObject*)first_state->internal_ptr);
-            inst.attr("update")(*nb::tuple(args));
-            return;
-        }
-
-        // Slow path: group row indices by state address.
-        std::unordered_map<duckdb_aggregate_state, std::vector<idx_t>> groups;
-        groups.reserve(n);
-        for (idx_t i = 0; i < n; ++i) {
-            groups[states[i]].push_back(i);
-        }
-
-        for (auto& [state, rows] : groups) {
-            idx_t group_n = (idx_t)rows.size();
-            size_t shape[1] = {(size_t)group_n};
-            nb::list args;
-            for (idx_t c = 0; c < n_cols; ++c) {
-                duckdb_vector v = duckdb_data_chunk_get_vector(input, c);
-                const uint8_t* src = (const uint8_t*)duckdb_vector_get_data(v);
-                size_t elem_size = ctx->param_types[c]->size;
-                // Gather non-contiguous rows into a contiguous buffer.
-                auto buf = std::make_unique<uint8_t[]>(group_n * elem_size);
-                for (idx_t r = 0; r < group_n; ++r) {
-                    std::memcpy(buf.get() + r * elem_size, src + rows[r] * elem_size, elem_size);
+    guard(
+        [&] {
+            // Fast path: all rows share one state (common for non-GROUP-BY queries).
+            bool single_state = true;
+            duckdb_aggregate_state first_state = states[0];
+            for (idx_t i = 1; i < n; ++i) {
+                if (states[i] != first_state) {
+                    single_state = false;
+                    break;
                 }
-                uint8_t* raw = buf.get();
-                nb::capsule owner(buf.release(), [](void* p) noexcept { delete[] (uint8_t*)p; });
-                args.append(nb::ndarray<nb::numpy, nb::ro>(raw, 1, shape, owner, nullptr,
-                                                           ctx->param_types[c]->dtype()));
             }
-            nb::object inst = nb::borrow((PyObject*)state->internal_ptr);
-            inst.attr("update")(*nb::tuple(args));
-        }
-    } catch (nb::python_error& e) {
-        duckdb_aggregate_function_set_error(info, e.what());
-    } catch (const std::exception& e) {
-        duckdb_aggregate_function_set_error(info, e.what());
-    }
+
+            if (single_state) {
+                size_t shape[1] = {(size_t)n};
+                nb::list args;
+                for (idx_t c = 0; c < n_cols; ++c) {
+                    duckdb_vector v = duckdb_data_chunk_get_vector(input, c);
+                    void* data = duckdb_vector_get_data(v);
+                    args.append(nb::ndarray<nb::numpy, nb::ro>(
+                        data, 1, shape, nb::handle(), nullptr, ctx->param_types[c]->dtype()));
+                }
+                nb::object inst = nb::borrow((PyObject*)first_state->internal_ptr);
+                inst.attr("update")(*nb::tuple(args));
+                return;
+            }
+
+            // Slow path: group row indices by state address.
+            std::unordered_map<duckdb_aggregate_state, std::vector<idx_t>> groups;
+            groups.reserve(n);
+            for (idx_t i = 0; i < n; ++i) {
+                groups[states[i]].push_back(i);
+            }
+
+            for (auto& [state, rows] : groups) {
+                idx_t group_n = (idx_t)rows.size();
+                size_t shape[1] = {(size_t)group_n};
+                nb::list args;
+                for (idx_t c = 0; c < n_cols; ++c) {
+                    duckdb_vector v = duckdb_data_chunk_get_vector(input, c);
+                    const uint8_t* src = (const uint8_t*)duckdb_vector_get_data(v);
+                    size_t elem_size = ctx->param_types[c]->size;
+                    // Gather non-contiguous rows into a contiguous buffer.
+                    auto buf = std::make_unique<uint8_t[]>(group_n * elem_size);
+                    for (idx_t r = 0; r < group_n; ++r) {
+                        std::memcpy(buf.get() + r * elem_size, src + rows[r] * elem_size,
+                                    elem_size);
+                    }
+                    uint8_t* raw = buf.get();
+                    nb::capsule owner(buf.release(),
+                                      [](void* p) noexcept { delete[] (uint8_t*)p; });
+                    args.append(nb::ndarray<nb::numpy, nb::ro>(raw, 1, shape, owner, nullptr,
+                                                               ctx->param_types[c]->dtype()));
+                }
+                nb::object inst = nb::borrow((PyObject*)state->internal_ptr);
+                inst.attr("update")(*nb::tuple(args));
+            }
+        },
+        [&](const char* what) { duckdb_aggregate_function_set_error(info, what); });
 }
 
 // Fallback for aggregates without a Python combine(): copies source's __dict__
@@ -122,33 +120,29 @@ void agg_update(duckdb_function_info info, duckdb_data_chunk input,
 void agg_combine_copy(duckdb_function_info info, duckdb_aggregate_state* source,
                       duckdb_aggregate_state* target, idx_t count) {
     nb::gil_scoped_acquire gil;
-    try {
-        for (idx_t i = 0; i < count; ++i) {
-            nb::object src_inst = nb::borrow((PyObject*)source[i]->internal_ptr);
-            nb::object tgt_inst = nb::borrow((PyObject*)target[i]->internal_ptr);
-            tgt_inst.attr("__dict__").attr("update")(src_inst.attr("__dict__"));
-        }
-    } catch (nb::python_error& e) {
-        duckdb_aggregate_function_set_error(info, e.what());
-    } catch (const std::exception& e) {
-        duckdb_aggregate_function_set_error(info, e.what());
-    }
+    guard(
+        [&] {
+            for (idx_t i = 0; i < count; ++i) {
+                nb::object src_inst = nb::borrow((PyObject*)source[i]->internal_ptr);
+                nb::object tgt_inst = nb::borrow((PyObject*)target[i]->internal_ptr);
+                tgt_inst.attr("__dict__").attr("update")(src_inst.attr("__dict__"));
+            }
+        },
+        [&](const char* what) { duckdb_aggregate_function_set_error(info, what); });
 }
 
 void agg_combine(duckdb_function_info info, duckdb_aggregate_state* source,
                  duckdb_aggregate_state* target, idx_t count) {
     nb::gil_scoped_acquire gil;
-    try {
-        for (idx_t i = 0; i < count; ++i) {
-            nb::object src_inst = nb::borrow((PyObject*)source[i]->internal_ptr);
-            nb::object tgt_inst = nb::borrow((PyObject*)target[i]->internal_ptr);
-            tgt_inst.attr("combine")(src_inst);
-        }
-    } catch (nb::python_error& e) {
-        duckdb_aggregate_function_set_error(info, e.what());
-    } catch (const std::exception& e) {
-        duckdb_aggregate_function_set_error(info, e.what());
-    }
+    guard(
+        [&] {
+            for (idx_t i = 0; i < count; ++i) {
+                nb::object src_inst = nb::borrow((PyObject*)source[i]->internal_ptr);
+                nb::object tgt_inst = nb::borrow((PyObject*)target[i]->internal_ptr);
+                tgt_inst.attr("combine")(src_inst);
+            }
+        },
+        [&](const char* what) { duckdb_aggregate_function_set_error(info, what); });
 }
 
 void agg_finalize(duckdb_function_info info, duckdb_aggregate_state* source, duckdb_vector result,
@@ -160,45 +154,43 @@ void agg_finalize(duckdb_function_info info, duckdb_aggregate_state* source, duc
     size_t elem_size = ctx->return_type->size;
     nb::dlpack::dtype want = ctx->return_type->dtype();
 
-    try {
-        for (idx_t i = 0; i < count; ++i) {
-            nb::object inst = nb::borrow((PyObject*)source[i]->internal_ptr);
-            nb::object val = inst.attr("finalize")();
+    guard(
+        [&] {
+            for (idx_t i = 0; i < count; ++i) {
+                nb::object inst = nb::borrow((PyObject*)source[i]->internal_ptr);
+                nb::object val = inst.attr("finalize")();
 
-            if (val.is_none()) {
-                duckdb_vector_ensure_validity_writable(result);
-                uint64_t* validity = duckdb_vector_get_validity(result);
-                duckdb_validity_set_row_invalid(validity, offset + i);
-                continue;
-            }
+                if (val.is_none()) {
+                    duckdb_vector_ensure_validity_writable(result);
+                    uint64_t* validity = duckdb_vector_get_validity(result);
+                    duckdb_validity_set_row_invalid(validity, offset + i);
+                    continue;
+                }
 
-            // Cast the returned scalar to the right C type and write it.
-            uint8_t* slot = out + (offset + i) * elem_size;
-            if (want.code == (uint8_t)nb::dlpack::dtype_code::Bool && want.bits == 8) {
-                bool v = nb::cast<bool>(val);
-                *slot = v ? 1 : 0;
-            } else if (want.code == (uint8_t)nb::dlpack::dtype_code::Int) {
-                int64_t v = nb::cast<int64_t>(val);
-                std::memcpy(slot, &v, elem_size);
-            } else if (want.code == (uint8_t)nb::dlpack::dtype_code::UInt) {
-                uint64_t v = nb::cast<uint64_t>(val);
-                std::memcpy(slot, &v, elem_size);
-            } else {
-                // Float / Double
-                double v = nb::cast<double>(val);
-                if (elem_size == 4) {
-                    float f = (float)v;
-                    std::memcpy(slot, &f, 4);
+                // Cast the returned scalar to the right C type and write it.
+                uint8_t* slot = out + (offset + i) * elem_size;
+                if (want.code == (uint8_t)nb::dlpack::dtype_code::Bool && want.bits == 8) {
+                    bool v = nb::cast<bool>(val);
+                    *slot = v ? 1 : 0;
+                } else if (want.code == (uint8_t)nb::dlpack::dtype_code::Int) {
+                    int64_t v = nb::cast<int64_t>(val);
+                    std::memcpy(slot, &v, elem_size);
+                } else if (want.code == (uint8_t)nb::dlpack::dtype_code::UInt) {
+                    uint64_t v = nb::cast<uint64_t>(val);
+                    std::memcpy(slot, &v, elem_size);
                 } else {
-                    std::memcpy(slot, &v, 8);
+                    // Float / Double
+                    double v = nb::cast<double>(val);
+                    if (elem_size == 4) {
+                        float f = (float)v;
+                        std::memcpy(slot, &f, 4);
+                    } else {
+                        std::memcpy(slot, &v, 8);
+                    }
                 }
             }
-        }
-    } catch (nb::python_error& e) {
-        duckdb_aggregate_function_set_error(info, e.what());
-    } catch (const std::exception& e) {
-        duckdb_aggregate_function_set_error(info, e.what());
-    }
+        },
+        [&](const char* what) { duckdb_aggregate_function_set_error(info, what); });
 }
 
 }  // namespace

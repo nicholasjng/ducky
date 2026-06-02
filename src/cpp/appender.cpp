@@ -11,59 +11,26 @@
 
 #include "connection.hpp"
 #include "ducky.hpp"
+#include "function.hpp"
 
 namespace {
 
-// Mirrors the dispatch table in chunk.cpp's `dtype_for`: returns the flat
-// dtype + element size for numeric / temporal DuckDB types, or false for
-// non-flat types (VARCHAR / nested / DECIMAL / HUGEINT / INTERVAL).
+// Returns the flat dtype + element size for numeric / temporal DuckDB types,
+// or false for non-flat types (VARCHAR / nested / DECIMAL / HUGEINT / INTERVAL).
+// Delegates to the shared TypeSpec table in function.cpp, the same source the
+// chunk exporter (chunk.cpp) draws its dtype mapping from.
 struct FlatDType {
     nb::dlpack::dtype dtype;
     size_t elem_size;
 };
 
 bool flat_dtype_for(duckdb_type t, FlatDType& out) {
-    auto set = [&](nb::dlpack::dtype d, size_t s) {
-        out.dtype = d;
-        out.elem_size = s;
+    if (const TypeSpec* spec = typespec_for(t)) {
+        out.dtype = spec->dtype();
+        out.elem_size = spec->size;
         return true;
-    };
-    switch (t) {
-        case DUCKDB_TYPE_BOOLEAN:
-            return set(nb::dtype<bool>(), 1);
-        case DUCKDB_TYPE_TINYINT:
-            return set(nb::dtype<int8_t>(), 1);
-        case DUCKDB_TYPE_SMALLINT:
-            return set(nb::dtype<int16_t>(), 2);
-        case DUCKDB_TYPE_INTEGER:
-            return set(nb::dtype<int32_t>(), 4);
-        case DUCKDB_TYPE_BIGINT:
-            return set(nb::dtype<int64_t>(), 8);
-        case DUCKDB_TYPE_UTINYINT:
-            return set(nb::dtype<uint8_t>(), 1);
-        case DUCKDB_TYPE_USMALLINT:
-            return set(nb::dtype<uint16_t>(), 2);
-        case DUCKDB_TYPE_UINTEGER:
-            return set(nb::dtype<uint32_t>(), 4);
-        case DUCKDB_TYPE_UBIGINT:
-            return set(nb::dtype<uint64_t>(), 8);
-        case DUCKDB_TYPE_FLOAT:
-            return set(nb::dtype<float>(), 4);
-        case DUCKDB_TYPE_DOUBLE:
-            return set(nb::dtype<double>(), 8);
-        case DUCKDB_TYPE_DATE:
-            return set(nb::dtype<int32_t>(), 4);  // days since epoch
-        case DUCKDB_TYPE_TIME:
-            return set(nb::dtype<int64_t>(), 8);  // micros since midnight
-        case DUCKDB_TYPE_TIMESTAMP:
-        case DUCKDB_TYPE_TIMESTAMP_S:
-        case DUCKDB_TYPE_TIMESTAMP_MS:
-        case DUCKDB_TYPE_TIMESTAMP_NS:
-        case DUCKDB_TYPE_TIMESTAMP_TZ:
-            return set(nb::dtype<int64_t>(), 8);
-        default:
-            return false;
     }
+    return false;
 }
 
 // Quote a DuckDB identifier for safe embedding in a SQL string.

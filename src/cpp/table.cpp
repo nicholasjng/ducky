@@ -137,27 +137,25 @@ void init_data_destroy(void* ptr) {
 void table_bind(duckdb_bind_info info) {
     auto* ctx = (TableUDFContext*)duckdb_bind_get_extra_info(info);
     nb::gil_scoped_acquire gil;
-    try {
-        idx_t n_params = duckdb_bind_get_parameter_count(info);
-        nb::list python_args;
-        for (idx_t i = 0; i < n_params; ++i) {
-            duckdb_value val = duckdb_bind_get_parameter(info, i);
-            python_args.append(duckdb_value_to_python(val));
-            duckdb_destroy_value(&val);
-        }
+    guard(
+        [&] {
+            idx_t n_params = duckdb_bind_get_parameter_count(info);
+            nb::list python_args;
+            for (idx_t i = 0; i < n_params; ++i) {
+                duckdb_value val = duckdb_bind_get_parameter(info, i);
+                python_args.append(duckdb_value_to_python(val));
+                duckdb_destroy_value(&val);
+            }
 
-        for (idx_t i = 0; i < (idx_t)ctx->col_names.size(); ++i) {
-            duckdb_bind_add_result_column(info, ctx->col_names[i].c_str(), ctx->col_types[i]);
-        }
+            for (idx_t i = 0; i < (idx_t)ctx->col_names.size(); ++i) {
+                duckdb_bind_add_result_column(info, ctx->col_names[i].c_str(), ctx->col_types[i]);
+            }
 
-        auto* bd =
-            new TableUDFBindData{ctx->factory, python_args, ctx->col_type_ids, ctx->col_names};
-        duckdb_bind_set_bind_data(info, bd, &bind_data_destroy);
-    } catch (nb::python_error& e) {
-        duckdb_bind_set_error(info, e.what());
-    } catch (const std::exception& e) {
-        duckdb_bind_set_error(info, e.what());
-    }
+            auto* bd =
+                new TableUDFBindData{ctx->factory, python_args, ctx->col_type_ids, ctx->col_names};
+            duckdb_bind_set_bind_data(info, bd, &bind_data_destroy);
+        },
+        [&](const char* what) { duckdb_bind_set_error(info, what); });
 }
 
 void table_init(duckdb_init_info info) {
@@ -165,15 +163,13 @@ void table_init(duckdb_init_info info) {
     // Single-threaded: Python generators are not thread-safe.
     duckdb_init_set_max_threads(info, 1);
     nb::gil_scoped_acquire gil;
-    try {
-        nb::object gen = bd->factory(*nb::tuple(bd->python_args));
-        auto* id = new TableUDFInitData{std::move(gen)};
-        duckdb_init_set_init_data(info, id, &init_data_destroy);
-    } catch (nb::python_error& e) {
-        duckdb_init_set_error(info, e.what());
-    } catch (const std::exception& e) {
-        duckdb_init_set_error(info, e.what());
-    }
+    guard(
+        [&] {
+            nb::object gen = bd->factory(*nb::tuple(bd->python_args));
+            auto* id = new TableUDFInitData{std::move(gen)};
+            duckdb_init_set_init_data(info, id, &init_data_destroy);
+        },
+        [&](const char* what) { duckdb_init_set_error(info, what); });
 }
 
 void table_main(duckdb_function_info info, duckdb_data_chunk output) {
@@ -189,40 +185,38 @@ void table_main(duckdb_function_info info, duckdb_data_chunk output) {
     idx_t n_cols = (idx_t)bd->col_type_ids.size();
     idx_t rows = 0;
 
-    try {
-        while (rows < 2048) {
-            nb::object row_obj;
-            try {
-                row_obj = nb::object(nb::module_::import_("builtins").attr("next")(id->generator));
-            } catch (nb::python_error& e) {
-                if (e.matches(PyExc_StopIteration)) {
-                    id->exhausted = true;
-                    break;
+    bool ok = guard(
+        [&] {
+            while (rows < 2048) {
+                nb::object row_obj;
+                try {
+                    row_obj =
+                        nb::object(nb::module_::import_("builtins").attr("next")(id->generator));
+                } catch (nb::python_error& e) {
+                    if (e.matches(PyExc_StopIteration)) {
+                        id->exhausted = true;
+                        break;
+                    }
+                    throw;
                 }
-                throw;
-            }
 
-            // Accept single-value non-tuple rows as a 1-element tuple.
-            nb::tuple row;
-            if (nb::isinstance<nb::tuple>(row_obj)) {
-                row = nb::cast<nb::tuple>(row_obj);
-            } else {
-                row = nb::make_tuple(row_obj);
-            }
+                // Accept single-value non-tuple rows as a 1-element tuple.
+                nb::tuple row;
+                if (nb::isinstance<nb::tuple>(row_obj)) {
+                    row = nb::cast<nb::tuple>(row_obj);
+                } else {
+                    row = nb::make_tuple(row_obj);
+                }
 
-            for (idx_t c = 0; c < n_cols; ++c) {
-                duckdb_vector vec = duckdb_data_chunk_get_vector(output, c);
-                write_column_value(vec, rows, row[c], bd->col_type_ids[c]);
+                for (idx_t c = 0; c < n_cols; ++c) {
+                    duckdb_vector vec = duckdb_data_chunk_get_vector(output, c);
+                    write_column_value(vec, rows, row[c], bd->col_type_ids[c]);
+                }
+                ++rows;
             }
-            ++rows;
-        }
-    } catch (nb::python_error& e) {
-        duckdb_function_set_error(info, e.what());
-        return;
-    } catch (const std::exception& e) {
-        duckdb_function_set_error(info, e.what());
-        return;
-    }
+        },
+        [&](const char* what) { duckdb_function_set_error(info, what); });
+    if (!ok) return;
 
     duckdb_data_chunk_set_size(output, rows);
 }
@@ -277,5 +271,6 @@ void create_table_function(Connection& con, const std::string& name, nb::callabl
     if (state == DuckDBError) {
         throw DuckyError("ducky: failed to register table function '" + name + "'");
     }
+    // NOLINTNEXTLINE(bugprone-unused-return-value)
     (void)ctx.release();
 }
