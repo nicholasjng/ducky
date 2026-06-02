@@ -19,4 +19,5 @@ __pycache__/
 # Symlinks staged by CMakeLists.txt for out-of-tree extensions (httpfs etc.);
 # pointed into ext/duckdb/.
 /scripts/
+!/scripts/init-duckdb.sh
 /.github/patches/
