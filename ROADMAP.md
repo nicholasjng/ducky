@@ -110,10 +110,88 @@ Legend: ✅ shipped · 🟡 partially shipped · ⬜ not started.
     through tqdm when installed and degrades to a minimal stderr
     `desc [####    ]  42.0%` printer otherwise (`use_tqdm=False` forces the
     fallback) — importing the helper never hard-fails on a missing tqdm.
-- ⬜ **Pending / streaming results** (`duckdb_pending_prepared`,
-  `duckdb_execute_pending`, `duckdb_pending_execute_task`). The proper
-  substrate for releasing the GIL during `execute` (see UDF section) and for
-  a true streaming `to_torch` / `to_jax` that avoids the intermediate copy.
+- ✅ **Pending / streaming results** (`duckdb_pending_prepared`,
+  `duckdb_pending_prepared_streaming`, `duckdb_pending_execute_task`,
+  `duckdb_execute_pending`). `Connection.execute` / `Connection.sql` /
+  `PreparedStatement.execute` all route through a single `run_pending` helper
+  in `connection.cpp` that drives the executor one task at a time with the GIL
+  released between ticks. Two wins over the old `gil_scoped_release` wrap of
+  `duckdb_execute_prepared`: (1) `PyErr_CheckSignals()` runs between ticks, so
+  `KeyboardInterrupt` lands mid-query instead of parking until the query
+  finishes — on signal we call `duckdb_interrupt`, drain the pending result,
+  and re-raise; (2) opt-in `streaming=True` on those three entry points
+  returns a streaming `duckdb_result` whose chunks are pulled lazily via
+  `duckdb_fetch_chunk`, so `iter_batches_torch` / `iter_batches_jax` /
+  `iter_batches_mlx` can stay bounded to one chunk of peak memory. The
+  parameterless `duckdb_query` fast path is gone — everything routes through
+  `duckdb_prepare` for one unified pending path; multi-statement strings are
+  deliberately not supported (`duckdb_extract_statements` is the roadmap path
+  if we ever want them back, see *Multi-statement scripts* below).
+  - ⬜ **Auto-streaming for iter_batches\_\* / to_torch / to_jax.** Today the
+    caller has to remember `con.execute(sql, streaming=True).iter_batches_torch()`.
+    A `Connection.iter_torch(sql, ...)` (and friends) that runs the query with
+    `streaming=True` internally would close the ergonomic gap; alternatively,
+    have `iter_batches_*` warn when the source isn't streaming so the bounded-
+    memory claim above stays honest.
+  - ⬜ **`async def execute`.** `run_pending` (`connection.cpp`) is already a
+    single-task-at-a-time state machine: `duckdb_pending_execute_task` advances
+    one unit of work with the GIL released, and each iteration re-checks
+    `READY` / `ERROR` / `NO_TASKS_AVAILABLE`. The only blocking bits are the 1 ms
+    `sleep_for` (when workers own the outstanding tasks) and the spin-until-ready
+    itself — that shape is an awaitable coroutine in disguise. The async version
+    keeps the state machine and changes only what happens *between* ticks.
+
+    **Surface.** Add `aexecute` / `asql` (asyncpg / aiosqlite naming) rather than
+    overloading `execute` to sometimes return a coroutine — an
+    `execute(...) -> Result | Coroutine[...]` union is a typing mess and a
+    foot-gun (forget the `await` and you get a coroutine object, not a result).
+    They can live on the existing `Connection`; no separate `AsyncConnection` is
+    needed, since they reuse the prepare + pending machinery and only the drive
+    loop differs.
+
+    **Drive loop (Python).** Expose the pending handle as a small steppable
+    object — `PendingResult.execute_task() -> state` (one tick, GIL released in
+    C++) plus `materialize() -> Result` — and orchestrate from Python:
+
+    ```python
+    async def aexecute(self, sql, params=None, *, streaming=False):
+        pending = self._prepare_pending(sql, params, streaming)   # C++ helper
+        try:
+            while True:
+                state = await asyncio.to_thread(pending.execute_task)  # GIL freed in C++
+                if state is READY:
+                    break
+                if state is ERROR:
+                    raise ducky.Error(pending.error())
+                if state is NO_TASKS_AVAILABLE:
+                    await asyncio.sleep(0)   # yield to the loop instead of sleep_for(1ms)
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            self.interrupt(); pending.drain()   # mirror run_pending's teardown
+            raise
+        return pending.materialize()
+    ```
+
+    The `to_thread` offload is what keeps the event loop unblocked while the
+    GIL-releasing C task runs; `asyncio.sleep(0)` replaces the 1 ms park so the
+    loop schedules other work rather than the coroutine busy-waiting. Per-tick
+    `to_thread` has real handoff overhead, though — if it bites, offload a small
+    batch of ticks per call (a C++ helper that runs up to *K* tasks or until a
+    terminal state) to amortise it.
+
+    **Cancellation = interrupt.** The sync path catches Ctrl-C via
+    `PyErr_CheckSignals` between ticks; the async path instead catches
+    `CancelledError` / `KeyboardInterrupt` and runs the *same* `duckdb_interrupt`
+    + drain-to-terminal teardown, so background workers detach cleanly and no
+    partial result ever leaks to the caller.
+
+    **Caveats.** A DuckDB connection runs one query at a time, so `aexecute` must
+    still serialise per connection (await-and-queue, or raise on a concurrent
+    in-flight query) — async buys event-loop cooperation, not intra-connection
+    parallelism. The natural follow-on is an async streaming pull
+    (`async for batch in con.aiter_torch(sql)`), where each `duckdb_fetch_chunk`
+    is offloaded the same way. No new DuckDB C API is needed — the pending
+    functions are already bound; the work is the steppable-handle surface and the
+    cancellation contract.
 
 ## Dataset / feature API
 

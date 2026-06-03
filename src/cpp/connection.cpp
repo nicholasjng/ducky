@@ -4,7 +4,9 @@
 #include <nanobind/stl/vector.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstring>
+#include <thread>
 
 #include "ducky.hpp"
 #include "prepared.hpp"
@@ -262,6 +264,77 @@ void bind_parameters(duckdb_prepared_statement stmt, nb::handle parameters) {
     }
 }
 
+// Drive duckdb_pending_execute_task in a GIL-releasing loop until the executor is
+// READY (or errors), then materialize the duckdb_result via duckdb_execute_pending.
+// `streaming` switches between the buffered result (duckdb_pending_prepared) and
+// the lazy chunk-pull result (duckdb_pending_prepared_streaming) — the latter
+// keeps peak memory bounded to one chunk for iter_batches_* consumers.
+//
+// Ticking one task at a time (instead of blocking inside duckdb_execute_prepared)
+// gives two things the v1 gil_scoped_release path could not:
+//   - KeyboardInterrupt lands mid-query: PyErr_CheckSignals runs between ticks,
+//     so Ctrl-C triggers duckdb_interrupt + a drained teardown instead of
+//     parking until the query finishes.
+//   - Streaming results are reachable: the materialized fast path through
+//     duckdb_execute_prepared has no streaming counterpart.
+//
+// The prepared statement is not destroyed here — the caller still owns it.
+duckdb_result run_pending(duckdb_connection con, duckdb_prepared_statement stmt, bool streaming) {
+    duckdb_pending_result pending = nullptr;
+    duckdb_state init = streaming ? duckdb_pending_prepared_streaming(stmt, &pending)
+                                  : duckdb_pending_prepared(stmt, &pending);
+    if (init == DuckDBError) {
+        std::string message = duckdb_pending_error(pending);
+        duckdb_destroy_pending(&pending);
+        throw DuckyError(message);
+    }
+
+    for (;;) {
+        duckdb_pending_state state;
+        {
+            nb::gil_scoped_release release;
+            state = duckdb_pending_execute_task(pending);
+            // Workers own the remaining tasks; yield briefly so we don't spin
+            // re-querying state. 1ms keeps Ctrl-C latency imperceptible.
+            if (state == DUCKDB_PENDING_NO_TASKS_AVAILABLE) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        }
+        if (state == DUCKDB_PENDING_ERROR) {
+            std::string message = duckdb_pending_error(pending);
+            duckdb_destroy_pending(&pending);
+            throw DuckyError(message);
+        }
+        if (PyErr_CheckSignals() != 0) {
+            // A Python signal handler raised (typically KeyboardInterrupt).
+            // Interrupt the executor, drain to a terminal state so background
+            // workers detach cleanly, then re-raise. The drained result is
+            // discarded — we never expose a partial result to the caller.
+            duckdb_interrupt(con);
+            duckdb_result drain;
+            if (duckdb_execute_pending(pending, &drain) == DuckDBSuccess) {
+                duckdb_destroy_result(&drain);
+            } else {
+                duckdb_destroy_result(&drain);
+            }
+            duckdb_destroy_pending(&pending);
+            throw nb::python_error();
+        }
+        if (state == DUCKDB_PENDING_RESULT_READY) break;
+        // DUCKDB_PENDING_RESULT_NOT_READY / NO_TASKS_AVAILABLE: keep ticking.
+    }
+
+    duckdb_result result;
+    duckdb_state final_state = duckdb_execute_pending(pending, &result);
+    duckdb_destroy_pending(&pending);
+    if (final_state == DuckDBError) {
+        std::string message = duckdb_result_error(&result);
+        duckdb_destroy_result(&result);
+        throw DuckyError(message);
+    }
+    return result;
+}
+
 }  // namespace
 
 Connection::Connection(const std::string& database, nb::object config) {
@@ -399,57 +472,38 @@ void Connection::ensure_open() const {
     if (!handle_ || !handle_->connection) throw DuckyError("ducky: connection is closed");
 }
 
-duckdb_result Connection::run(const std::string& query, nb::object parameters) {
+duckdb_result Connection::run(const std::string& query, nb::object parameters, bool streaming) {
     ensure_open();
-    duckdb_result result;
     duckdb_connection con = handle_->connection;
 
-    // Fast path: no parameters, run the query directly.
-    // We release the GIL across duckdb_query so DuckDB's parallel scheduler
-    // can run worker threads — in particular, so workers can call back into
-    // Python UDF trampolines (which re-acquire the GIL via nb::gil_scoped_acquire).
-    // Without this release, the main thread holds the GIL while spinning in
-    // Executor::ExecuteTask waiting for workers that themselves block on GIL acquisition,
-    // a deterministic deadlock whenever DuckDB schedules the UDF on a worker.
-    if (parameters.is_none()) {
-        duckdb_state state;
-        {
-            nb::gil_scoped_release release;
-            state = duckdb_query(con, query.c_str(), &result);
-        }
-        if (state == DuckDBError) {
-            std::string message = duckdb_result_error(&result);
-            duckdb_destroy_result(&result);
-            throw DuckyError(message);
-        }
-        return result;
-    }
-
-    // Parameterized path: prepare, bind, execute. Prepare and bind keep the GIL
-    // (they touch Python objects); only execute releases it.
+    // Unified prepare + pending-execute path. Going through prepare even when
+    // there are no parameters costs one extra parse per call (negligible vs the
+    // executor work) but buys us pending semantics — see run_pending() for the
+    // GIL / signal-handling / streaming rationale. Multi-statement strings are
+    // a deliberate non-feature here; the unbound `duckdb_extract_statements`
+    // API is the roadmap path if we ever want them back.
     duckdb_prepared_statement stmt = nullptr;
     if (duckdb_prepare(con, query.c_str(), &stmt) == DuckDBError) {
         std::string message = duckdb_prepare_error(stmt);
         duckdb_destroy_prepare(&stmt);
         throw DuckyError(message);
     }
+    if (!parameters.is_none()) {
+        try {
+            bind_parameters(stmt, parameters);
+        } catch (...) {
+            duckdb_destroy_prepare(&stmt);
+            throw;
+        }
+    }
+    duckdb_result result;
     try {
-        bind_parameters(stmt, parameters);
+        result = run_pending(con, stmt, streaming);
     } catch (...) {
         duckdb_destroy_prepare(&stmt);
         throw;
     }
-    duckdb_state state;
-    {
-        nb::gil_scoped_release release;
-        state = duckdb_execute_prepared(stmt, &result);
-    }
     duckdb_destroy_prepare(&stmt);
-    if (state == DuckDBError) {
-        std::string message = duckdb_result_error(&result);
-        duckdb_destroy_result(&result);
-        throw DuckyError(message);
-    }
     return result;
 }
 
@@ -457,13 +511,13 @@ std::shared_ptr<Result> Connection::make_result(duckdb_result result) {
     return std::make_shared<Result>(result, handle_);
 }
 
-Connection& Connection::execute(const std::string& query, nb::object parameters) {
-    last_result_ = make_result(run(query, parameters));
+Connection& Connection::execute(const std::string& query, nb::object parameters, bool streaming) {
+    last_result_ = make_result(run(query, parameters, streaming));
     return *this;
 }
 
-std::shared_ptr<Result> Connection::sql(const std::string& query) {
-    return make_result(run(query, nb::none()));
+std::shared_ptr<Result> Connection::sql(const std::string& query, bool streaming) {
+    return make_result(run(query, nb::none(), streaming));
 }
 
 PreparedStatement* Connection::prepare(const std::string& query) {
@@ -515,7 +569,7 @@ void PreparedStatement::ensure_valid() const {
     if (!stmt_) throw DuckyError("ducky: prepared statement is closed");
 }
 
-std::shared_ptr<Result> PreparedStatement::execute(nb::object parameters) {
+std::shared_ptr<Result> PreparedStatement::execute(nb::object parameters, bool streaming) {
     ensure_valid();
     if (!parameters.is_none()) {
         // Clear any prior binding so a positional set doesn't linger across calls.
@@ -524,18 +578,7 @@ std::shared_ptr<Result> PreparedStatement::execute(nb::object parameters) {
         }
         bind_parameters(stmt_, parameters);
     }
-    duckdb_result result;
-    duckdb_state state;
-    {
-        // Release the GIL across execution — same rationale as Connection::run.
-        nb::gil_scoped_release release;
-        state = duckdb_execute_prepared(stmt_, &result);
-    }
-    if (state == DuckDBError) {
-        std::string message = duckdb_result_error(&result);
-        duckdb_destroy_result(&result);
-        throw DuckyError(message);
-    }
+    duckdb_result result = run_pending(handle_->connection, stmt_, streaming);
     return std::make_shared<Result>(result, handle_);
 }
 
@@ -546,16 +589,9 @@ void PreparedStatement::executemany(nb::object seq) {
             throw DuckyError("ducky: failed to clear prepared-statement bindings");
         }
         bind_parameters(stmt_, params);
-        duckdb_result result;
-        duckdb_state state;
-        {
-            nb::gil_scoped_release release;
-            state = duckdb_execute_prepared(stmt_, &result);
-        }
-        std::string message;
-        if (state == DuckDBError) message = duckdb_result_error(&result);
+        // Materialized — we discard the result, so streaming buys nothing here.
+        duckdb_result result = run_pending(handle_->connection, stmt_, /*streaming=*/false);
         duckdb_destroy_result(&result);
-        if (state == DuckDBError) throw DuckyError(message);
     }
 }
 
