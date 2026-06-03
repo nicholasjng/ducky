@@ -60,11 +60,19 @@ Legend: ✅ shipped · 🟡 partially shipped · ⬜ not started.
   A natural mirror of `Result.to_numpy`: an appender that consumes an ndarray
   per column closes the loop for writing predictions / eval metrics / feature
   batches back into a table without the prepared-statement round-trip.
-  - ⬜ **Arrow ingest into the appender.** Once the ndarray path lands, extend
-    `Appender.append_columns` to accept any object exposing
-    `__arrow_c_array__` / `__arrow_c_stream__` and forward it through
-    DuckDB's Arrow append path. Subsumes pandas / polars / pyarrow in one
-    code path and covers VARCHAR / LIST / STRUCT for free.
+  - ✅ **Arrow ingest into the appender.** `Appender.append_arrow(source)` takes
+    any object exposing the Arrow PyCapsule interface — `__arrow_c_stream__`
+    (pyarrow `Table` / `RecordBatchReader` / polars / pandas-3 / a ducky
+    `Result`) or `__arrow_c_array__` (a pyarrow `RecordBatch`). Each Arrow batch
+    is converted to a DuckDB data chunk via `duckdb_schema_from_arrow` +
+    `duckdb_data_chunk_from_arrow` and appended with `duckdb_append_data_chunk`
+    (the same conversion the Arrow UDF path uses). Covers VARCHAR / LIST / STRUCT
+    for free. Shipped as a sibling to `append_columns` rather than overloading
+    it — the source's columns must line up positionally with the target and
+    match its types (DuckDB doesn't implicitly cast on append). Ownership of the
+    Arrow C structs follows the capsule protocol (stream path owns its
+    schema/arrays; array path defers to the capsules, nulling `release` after
+    `from_arrow` consumes) — verified clean under ASAN.
 - 🟡 **Replacement scans** (`duckdb_add_replacement_scan`). Lets
   `SELECT * FROM my_df` resolve to a Python object (NumPy / pandas / Arrow).
   Closes the input side the same way the ndarray/Arrow exporters close the
@@ -230,11 +238,27 @@ Legend: ✅ shipped · 🟡 partially shipped · ⬜ not started.
   `threads=N` worker, each doing `gil_scoped_acquire`) run in parallel instead of
   serialising, and result decoding / `to_numpy` / `to_torch` across connections
   overlap. The extension now builds with nanobind's `FREE_THREADED` flag (emits
-  `Py_MOD_GIL_NOT_USED`), and shared caches already use `nb::ft_mutex`. Still
-  open: the thread-safety audit — chiefly that the per-`Connection` /
-  per-`Result` "one thread" contract holds as a *memory*-safety invariant (FT
-  turns those logical races into real ones), e.g. guarding `Result` cursor state
-  and `Connection.last_result_`.
+  `Py_MOD_GIL_NOT_USED`), and shared caches already use `nb::ft_mutex`.
+
+  Mutable-state hardening (so the per-object "one thread" contract is a
+  *memory*-safety invariant, not just etiquette): the `Result` cursor,
+  `Connection` (`execute`/`sql`/`query`/`prepare`/`fetch*`/`current_result`/
+  `register_arrow`/`appender`/`close`) and `Appender` methods now carry
+  `nb::lock_self()`, wrapping each call in a `PyCriticalSection` on the object on
+  FT builds (a no-op under the GIL). `interrupt`/`progress` are deliberately
+  left unguarded — they're thread-safe DuckDB calls meant to run *while* a query
+  holds the connection's section. Verified with 8-thread stress runs
+  (queries/UDFs/`Appender`/`register_arrow`, one connection per thread) under a
+  3.13t interpreter.
+
+  Still open: (1) `PreparedStatement.execute` (mutable `stmt_`) isn't guarded
+  yet; (2) no CI job exercises a free-threaded build, so nothing guards against
+  regressions; (3) no ThreadSanitizer run (ASAN catches use-after-free, not
+  races); (4) the `to_torch`/`to_jax`/`to_mlx` and pyarrow conversion paths are
+  unverified under FT (those wheels may lack 3.13t builds); (5) streaming
+  consumption isn't fully serialized against a concurrent query on the same
+  connection — that remains the documented one-thread-per-connection contract,
+  not something `lock_self` can enforce per-call.
 
 ## Unbound C API: candidates
 

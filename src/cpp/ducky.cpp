@@ -253,21 +253,34 @@ NB_MODULE(_core, m) {
                          "columnar fast path for numeric/temporal ndarrays.")
         .def_prop_ro("columns", &Appender::column_names, "Target column names.")
         .def_prop_ro("types", &Appender::column_types, "Target column type names.")
+        // nb::lock_self(): on free-threaded builds, serialize concurrent calls on
+        // one Appender via a PyCriticalSection so its buffered chunk / handle
+        // state isn't corrupted. A no-op under the GIL.
         .def("append_row", &Appender::append_row,
              nb::sig("def append_row(self, *values: object) -> None"),
-             "Append one row of positional values, matching the target column order.")
+             "Append one row of positional values, matching the target column order.",
+             nb::lock_self())
         .def("append_columns", &Appender::append_columns, "columns"_a, "masks"_a = nb::none(),
              nb::sig("def append_columns(self, columns: dict[str, numpy.ndarray], "
                      "masks: dict[str, numpy.ndarray] | None = None) -> None"),
              "Append a batch of columns. Missing columns are filled with NULL. "
-             "`masks` maps column name -> 1-D bool/uint8 array (True = valid).")
-        .def("flush", &Appender::flush, "Flush pending rows to the table.")
-        .def("close", &Appender::close, "Flush and tear down the appender.")
+             "`masks` maps column name -> 1-D bool/uint8 array (True = valid).",
+             nb::lock_self())
+        .def("append_arrow", &Appender::append_arrow, "source"_a,
+             nb::sig("def append_arrow(self, source: typing.Any) -> None"),
+             "Append from an Arrow PyCapsule object (__arrow_c_stream__ — pyarrow "
+             "Table / RecordBatchReader / polars / pandas-3 / a ducky Result — or "
+             "__arrow_c_array__ — a pyarrow RecordBatch). Columns must line up "
+             "positionally with the target table and match its types. Covers "
+             "VARCHAR / LIST / STRUCT, unlike the ndarray path of append_columns.",
+             nb::lock_self())
+        .def("flush", &Appender::flush, "Flush pending rows to the table.", nb::lock_self())
+        .def("close", &Appender::close, "Flush and tear down the appender.", nb::lock_self())
         .def(
             "__enter__", [](Appender& self) -> Appender& { return self; }, nb::rv_policy::reference)
         .def(
             "__exit__", [](Appender& self, nb::object, nb::object, nb::object) { self.close(); },
-            "exc_type"_a.none(), "exc_value"_a.none(), "traceback"_a.none(),
+            "exc_type"_a.none(), "exc_value"_a.none(), "traceback"_a.none(), nb::lock_self(),
             nb::sig("def __exit__(self, exc_type: type[BaseException] | None, exc_value: "
                     "BaseException | None, traceback: types.TracebackType | None) -> None"));
 
@@ -358,10 +371,10 @@ NB_MODULE(_core, m) {
         // open on its own — no keep_alive needed.
         .def("sql", &Connection::sql, "query"_a, "streaming"_a = false,
              nb::sig("def sql(self, query: str, streaming: bool = False) -> Result"),
-             "Run a query and return its Result. See execute() for `streaming`.")
+             "Run a query and return its Result. See execute() for `streaming`.", nb::lock_self())
         .def("query", &Connection::sql, "query"_a, "streaming"_a = false,
              nb::sig("def query(self, query: str, streaming: bool = False) -> Result"),
-             "Alias for sql().")
+             "Alias for sql().", nb::lock_self())
         .def(
             "aexecute",
             [](nb::object self, const std::string& query, nb::object parameters, bool streaming) {
@@ -394,7 +407,8 @@ NB_MODULE(_core, m) {
         .def("prepare", &Connection::prepare, "query"_a,
              nb::sig("def prepare(self, query: str) -> PreparedStatement"),
              "Compile `query` once into a PreparedStatement for repeated execution "
-             "with different parameters, avoiding per-call re-parsing and planning.")
+             "with different parameters, avoiding per-call re-parsing and planning.",
+             nb::lock_self())
         // lock_self() here guards last_result_ (read by the fetch delegators /
         // current_result, written by execute) against a concurrent swap on
         // free-threaded builds; a no-op under the GIL.
@@ -502,7 +516,11 @@ NB_MODULE(_core, m) {
                     "catalog: str | None = None) -> Appender"),
             "Open an Appender for bulk inserts into `table`. The appender shares "
             "the connection's database handle, so the database stays open until "
-            "the appender is closed.")
+            "the appender is closed.",
+            nb::lock_self())
+        // NB: interrupt() and progress() are intentionally *not* lock_self'd —
+        // they use thread-safe DuckDB C calls and are meant to run from another
+        // thread while execute() holds the connection's critical section.
         .def("interrupt", &Connection::interrupt,
              "Best-effort cancel of any query currently running on this connection. "
              "Safe to call from another thread while execute() is in flight.")
@@ -516,8 +534,9 @@ NB_MODULE(_core, m) {
              "Register a Python object exposing `__arrow_c_stream__` (pyarrow "
              "Table, polars DataFrame, pandas-3 DataFrame, ...) as a table named "
              "`name`. The data is materialized into DuckDB at registration; "
-             "the source object is not retained.")
-        .def("close", &Connection::close, "Close the connection.")
+             "the source object is not retained.",
+             nb::lock_self())
+        .def("close", &Connection::close, "Close the connection.", nb::lock_self())
         .def(
             "__enter__", [](Connection& self) -> Connection& { return self; },
             nb::rv_policy::reference)

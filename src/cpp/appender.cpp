@@ -9,6 +9,7 @@
 #include <cstring>
 #include <string>
 
+#include "arrow_abi.h"
 #include "connection.hpp"
 #include "ducky.hpp"
 #include "function.hpp"
@@ -399,5 +400,127 @@ void Appender::append_columns(nb::dict columns, nb::object masks) {
         duckdb_state state = duckdb_append_data_chunk(handle_, chunk);
         duckdb_destroy_data_chunk(&chunk);
         check_state(state, "append_data_chunk failed");
+    }
+}
+
+namespace {
+
+// Drain a duckdb_error_data into `out`; returns true if it carried an error.
+// (Mirrors the helper on the Arrow UDF path in function.cpp.)
+bool drain_arrow_error(duckdb_error_data err, std::string& out) {
+    if (!err) return false;
+    bool has = duckdb_error_data_has_error(err);
+    if (has) out = duckdb_error_data_message(err);
+    duckdb_destroy_error_data(&err);
+    return has;
+}
+
+// Release-on-scope-exit for an Arrow C struct we *own* (the stream path fills
+// our own stack ArrowSchema/ArrowArray and transfers ownership to us). For the
+// __arrow_c_array__ path the PyCapsules own their structs instead, so we don't
+// wrap those — see append_arrow.
+struct SchemaRelease {
+    ArrowSchema* s;
+    ~SchemaRelease() {
+        if (s && s->release) s->release(s);
+    }
+};
+struct ArrayRelease {
+    ArrowArray* a;
+    ~ArrayRelease() {
+        if (a && a->release) a->release(a);
+    }
+};
+struct ConvertedSchemaRelease {
+    duckdb_arrow_converted_schema c = nullptr;
+    ~ConvertedSchemaRelease() {
+        if (c) duckdb_destroy_arrow_converted_schema(&c);
+    }
+};
+
+}  // namespace
+
+void Appender::append_arrow(nb::object source) {
+    ensure_open();
+    duckdb_connection con = connection_->connection;
+    if (!con) throw DuckyError("ducky: the appender's connection is closed");
+
+    // Convert one Arrow batch (an ArrowArray matching `converted`) into a data
+    // chunk and append it. duckdb_data_chunk_from_arrow takes ownership of the
+    // array's buffers, so we null its release afterward to stop the caller's
+    // RAII / PyCapsule destructor from double-freeing.
+    auto append_batch = [&](duckdb_arrow_converted_schema converted, ArrowArray* array) {
+        std::string err;
+        duckdb_data_chunk chunk = nullptr;
+        if (drain_arrow_error(duckdb_data_chunk_from_arrow(con, array, converted, &chunk), err)) {
+            if (chunk) duckdb_destroy_data_chunk(&chunk);
+            throw DuckyError("ducky: failed to convert Arrow data to a DuckDB chunk: " + err);
+        }
+        array->release = nullptr;
+        duckdb_state st = duckdb_append_data_chunk(handle_, chunk);
+        duckdb_destroy_data_chunk(&chunk);
+        check_state(st, "appending an Arrow batch failed");
+    };
+
+    if (nb::hasattr(source, "__arrow_c_stream__")) {
+        // Stream path: pyarrow Table / RecordBatchReader / polars / pandas-3 /
+        // a ducky Result. The capsule owns the stream and releases it when it
+        // goes out of scope here; the schema and per-batch arrays it hands us,
+        // we own (hence the *Release guards below).
+        nb::object capsule = source.attr("__arrow_c_stream__")();
+        auto* stream = (ArrowArrayStream*)PyCapsule_GetPointer(capsule.ptr(), "arrow_array_stream");
+        if (!stream) {
+            PyErr_Clear();
+            throw DuckyError(
+                "ducky: __arrow_c_stream__ did not return an 'arrow_array_stream' capsule");
+        }
+
+        ArrowSchema schema{};
+        if (stream->get_schema(stream, &schema) != 0) {
+            const char* m = stream->get_last_error ? stream->get_last_error(stream) : nullptr;
+            throw DuckyError(std::string("ducky: Arrow stream get_schema failed") +
+                             (m ? std::string(": ") + m : ""));
+        }
+        SchemaRelease schema_guard{&schema};
+
+        std::string err;
+        ConvertedSchemaRelease conv;
+        if (drain_arrow_error(duckdb_schema_from_arrow(con, &schema, &conv.c), err)) {
+            throw DuckyError("ducky: failed to convert the Arrow schema: " + err);
+        }
+
+        for (;;) {
+            ArrowArray array{};
+            if (stream->get_next(stream, &array) != 0) {
+                const char* m = stream->get_last_error ? stream->get_last_error(stream) : nullptr;
+                throw DuckyError(std::string("ducky: Arrow stream get_next failed") +
+                                 (m ? std::string(": ") + m : ""));
+            }
+            if (!array.release) break;  // end of stream
+            ArrayRelease array_guard{&array};
+            append_batch(conv.c, &array);
+        }
+    } else if (nb::hasattr(source, "__arrow_c_array__")) {
+        // Single-batch path: a pyarrow RecordBatch. The (schema, array) capsules
+        // own their structs and release them when `pair` drops at scope exit, so
+        // we don't add our own guards — append_batch only nulls the array's
+        // release after consuming it, which the array capsule honors.
+        nb::tuple pair = nb::cast<nb::tuple>(source.attr("__arrow_c_array__")());
+        auto* schema = (ArrowSchema*)PyCapsule_GetPointer(pair[0].ptr(), "arrow_schema");
+        auto* array = (ArrowArray*)PyCapsule_GetPointer(pair[1].ptr(), "arrow_array");
+        if (!schema || !array) {
+            PyErr_Clear();
+            throw DuckyError("ducky: __arrow_c_array__ did not return (schema, array) capsules");
+        }
+        std::string err;
+        ConvertedSchemaRelease conv;
+        if (drain_arrow_error(duckdb_schema_from_arrow(con, schema, &conv.c), err)) {
+            throw DuckyError("ducky: failed to convert the Arrow schema: " + err);
+        }
+        append_batch(conv.c, array);
+    } else {
+        throw DuckyError(
+            "ducky: append_arrow() needs an object implementing the Arrow PyCapsule interface "
+            "(__arrow_c_stream__ or __arrow_c_array__)");
     }
 }

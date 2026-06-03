@@ -61,6 +61,15 @@ class Appender {
     // column (True / non-zero = valid).
     void append_columns(nb::dict columns, nb::object masks);
 
+    // Append from any object exposing the Arrow PyCapsule interface
+    // (__arrow_c_stream__ — pyarrow Table / RecordBatchReader / polars / pandas
+    // / a ducky Result — or __arrow_c_array__ — a single pyarrow RecordBatch).
+    // Each Arrow batch is converted to a DuckDB data chunk and appended. The
+    // source's columns must line up positionally with the target table's, and
+    // their types must match (DuckDB does not implicitly cast on append).
+    // Covers VARCHAR / LIST / STRUCT, which the ndarray path can't.
+    void append_arrow(nb::object source);
+
     // Push any pending rows to the underlying table without invalidating
     // the appender. Errors raise DuckyError.
     void flush();

@@ -187,6 +187,11 @@ class Appender:
         Append a batch of columns. Missing columns are filled with NULL. `masks` maps column name -> 1-D bool/uint8 array (True = valid).
         """
 
+    def append_arrow(self, source: Any) -> None:
+        """
+        Append from an Arrow PyCapsule object (__arrow_c_stream__ — pyarrow Table / RecordBatchReader / polars / pandas-3 / a ducky Result — or __arrow_c_array__ — a pyarrow RecordBatch). Columns must line up positionally with the target table and match its types. Covers VARCHAR / LIST / STRUCT, unlike the ndarray path of append_columns.
+        """
+
     def flush(self) -> None:
         """Flush pending rows to the table."""
 
