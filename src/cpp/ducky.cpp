@@ -33,6 +33,14 @@ const nb::module_& conversions() {
     return cached_singleton(cached, mu, [] { return nb::module_::import_("ducky._conversions"); });
 }
 
+// Cached handle to ducky._aio, which holds the async drive loops that
+// Connection.aexecute / asql forward into. Same leak + GIL rationale as above.
+const nb::module_& aio() {
+    static std::atomic<nb::module_*> cached{nullptr};
+    static nb::ft_mutex mu;
+    return cached_singleton(cached, mu, [] { return nb::module_::import_("ducky._aio"); });
+}
+
 // Register the DataFrame/array/Arrow accessors that both Result and Connection
 // expose. Every method just forwards to the matching helper in
 // ducky._conversions; `src` maps the bound object to the Arrow/chunk source the
@@ -303,6 +311,30 @@ NB_MODULE(_core, m) {
             nb::sig("def __exit__(self, exc_type: type[BaseException] | None, exc_value: "
                     "BaseException | None, traceback: types.TracebackType | None) -> None"));
 
+    // Async substrate: the per-task pending state, and the steppable handle the
+    // ducky._aio drive loops advance. End users go through aexecute / asql; the
+    // handle is exposed only so the Python drivers can own the loop.
+    nb::enum_<duckdb_pending_state>(m, "PendingState",
+                                    "State of an async query's executor after a tick.")
+        .value("READY", DUCKDB_PENDING_RESULT_READY, "The result is ready to materialize.")
+        .value("NOT_READY", DUCKDB_PENDING_RESULT_NOT_READY, "More tasks remain; tick again.")
+        .value("ERROR", DUCKDB_PENDING_ERROR, "Execution failed; see .error().")
+        .value("NO_TASKS", DUCKDB_PENDING_NO_TASKS_AVAILABLE,
+               "Workers own the outstanding tasks; yield, then tick again.");
+
+    nb::class_<PendingResult>(m, "PendingResult",
+                              "A steppable handle over an in-flight async query. Internal: built "
+                              "by Connection.make_pending and driven by ducky._aio.")
+        .def("execute_task", &PendingResult::execute_task,
+             nb::sig("def execute_task(self) -> PendingState"),
+             "Advance the executor by one task (GIL released) and return the new state.")
+        .def("error", &PendingResult::error, nb::sig("def error(self) -> str"),
+             "DuckDB's message for the most recent error.")
+        .def("materialize", &PendingResult::materialize, nb::sig("def materialize(self) -> Result"),
+             "Materialize the finished result; call once execute_task reports READY.")
+        .def("drain", &PendingResult::drain, nb::sig("def drain(self) -> None"),
+             "Cancellation teardown: interrupt the query and drain the executor.");
+
     nb::class_<Connection> conn_cls(m, "Connection", "A connection to a DuckDB database.");
     conn_cls
         .def("execute", &Connection::execute, "query"_a, "parameters"_a = nb::none(),
@@ -324,6 +356,35 @@ NB_MODULE(_core, m) {
         .def("query", &Connection::sql, "query"_a, "streaming"_a = false,
              nb::sig("def query(self, query: str, streaming: bool = False) -> Result"),
              "Alias for sql().")
+        .def(
+            "aexecute",
+            [](nb::object self, const std::string& query, nb::object parameters, bool streaming) {
+                return aio().attr("aexecute")(self, query, parameters, streaming);
+            },
+            "query"_a, "parameters"_a = nb::none(), "streaming"_a = false,
+            nb::sig("def aexecute(self, query: str, parameters: list | tuple | "
+                    "dict[str, typing.Any] | None = None, streaming: bool = False) "
+                    "-> collections.abc.Coroutine[typing.Any, typing.Any, Result]"),
+            "Async variant of execute(): drives the query on the event loop, ticking the "
+            "executor one task at a time off-thread so the loop stays responsive and a "
+            "cancelled await interrupts the query. Resolves to the Result directly (it does "
+            "not set current_result). Requires a running event loop.")
+        .def(
+            "asql",
+            [](nb::object self, const std::string& query, bool streaming) {
+                return aio().attr("asql")(self, query, streaming);
+            },
+            "query"_a, "streaming"_a = false,
+            nb::sig("def asql(self, query: str, streaming: bool = False) "
+                    "-> collections.abc.Coroutine[typing.Any, typing.Any, Result]"),
+            "Async variant of sql(); see aexecute().")
+        .def("make_pending", &Connection::make_pending, "query"_a, "parameters"_a = nb::none(),
+             "streaming"_a = false,
+             nb::sig("def make_pending(self, query: str, parameters: list | tuple | "
+                     "dict[str, typing.Any] | None = None, streaming: bool = False) "
+                     "-> PendingResult"),
+             "Low-level: build a steppable PendingResult for the ducky._aio drivers. "
+             "Prefer aexecute() / asql().")
         .def("prepare", &Connection::prepare, "query"_a,
              nb::sig("def prepare(self, query: str) -> PreparedStatement"),
              "Compile `query` once into a PreparedStatement for repeated execution "

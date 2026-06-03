@@ -1,6 +1,7 @@
 """ducky: tiny nanobind bindings for the DuckDB C API"""
 
-from collections.abc import Callable, Iterable, Iterator
+import enum
+from collections.abc import Callable, Coroutine, Iterable, Iterator
 from types import TracebackType
 from typing import Any, Literal, overload
 
@@ -253,6 +254,40 @@ class PreparedStatement:
     ) -> None:
         pass
 
+class PendingState(enum.Enum):
+    """State of an async query's executor after a tick."""
+
+    READY = 0
+    """The result is ready to materialize."""
+
+    NOT_READY = 1
+    """More tasks remain; tick again."""
+
+    ERROR = 2
+    """Execution failed; see .error()."""
+
+    NO_TASKS = 3
+    """Workers own the outstanding tasks; yield, then tick again."""
+
+class PendingResult:
+    """
+    A steppable handle over an in-flight async query. Internal: built by Connection.make_pending and driven by ducky._aio.
+    """
+
+    def execute_task(self) -> PendingState:
+        """
+        Advance the executor by one task (GIL released) and return the new state.
+        """
+
+    def error(self) -> str:
+        """DuckDB's message for the most recent error."""
+
+    def materialize(self) -> Result:
+        """Materialize the finished result; call once execute_task reports READY."""
+
+    def drain(self) -> None:
+        """Cancellation teardown: interrupt the query and drain the executor."""
+
 class Connection:
     """A connection to a DuckDB database."""
 
@@ -271,6 +306,29 @@ class Connection:
 
     def query(self, query: str, streaming: bool = False) -> Result:
         """Alias for sql()."""
+
+    def aexecute(
+        self,
+        query: str,
+        parameters: list | tuple | dict[str, Any] | None = None,
+        streaming: bool = False,
+    ) -> Coroutine[Any, Any, Result]:
+        """
+        Async variant of execute(): drives the query on the event loop, ticking the executor one task at a time off-thread so the loop stays responsive and a cancelled await interrupts the query. Resolves to the Result directly (it does not set current_result). Requires a running event loop.
+        """
+
+    def asql(self, query: str, streaming: bool = False) -> Coroutine[Any, Any, Result]:
+        """Async variant of sql(); see aexecute()."""
+
+    def make_pending(
+        self,
+        query: str,
+        parameters: list | tuple | dict[str, Any] | None = None,
+        streaming: bool = False,
+    ) -> PendingResult:
+        """
+        Low-level: build a steppable PendingResult for the ducky._aio drivers. Prefer aexecute() / asql().
+        """
 
     def prepare(self, query: str) -> PreparedStatement:
         """

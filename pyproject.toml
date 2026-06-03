@@ -28,6 +28,7 @@ dev = [
     "polars>=1.40.1",
     "pyarrow>=24.0.0",
     "pytest>=8",
+    "pytest-asyncio>=1.4.0",
     "torch>=2.12.0",
     "tqdm>=4.66",
 ]
@@ -66,3 +67,4 @@ extend-select = ["I", "UP", "B", "SIM"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+asyncio_mode = "auto"

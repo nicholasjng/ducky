@@ -520,6 +520,114 @@ std::shared_ptr<Result> Connection::sql(const std::string& query, bool streaming
     return make_result(run(query, nb::none(), streaming));
 }
 
+// ── Async substrate: PendingResult + Connection::make_pending ───────────────
+
+PendingResult::PendingResult(duckdb_pending_result pending, duckdb_prepared_statement stmt,
+                             bool owns_stmt, duckdb_connection con,
+                             std::shared_ptr<DuckDBHandle> handle)
+    : pending_(pending),
+      stmt_(stmt),
+      owns_stmt_(owns_stmt),
+      con_(con),
+      handle_(std::move(handle)) {}
+
+void PendingResult::cleanup_locked() {
+    if (pending_) duckdb_destroy_pending(&pending_);
+    if (owns_stmt_ && stmt_) duckdb_destroy_prepare(&stmt_);
+    pending_ = nullptr;
+    stmt_ = nullptr;
+}
+
+PendingResult::~PendingResult() {
+    // Backstop for an abandoned coroutine (never materialized or drained). A
+    // live worker would hold a reference to this object via the bound
+    // execute_task method, so no tick can be in flight here — no lock needed.
+    // Interrupt first so a partially-started query stops promptly.
+    if (pending_) {
+        if (con_) duckdb_interrupt(con_);
+        duckdb_result drained;
+        duckdb_execute_pending(pending_, &drained);
+        duckdb_destroy_result(&drained);
+        cleanup_locked();
+    }
+}
+
+duckdb_pending_state PendingResult::execute_task() {
+    nb::gil_scoped_release release;
+    std::lock_guard<std::mutex> lock(mu_);
+    if (!pending_) throw DuckyError("ducky: pending result already consumed");
+    return duckdb_pending_execute_task(pending_);
+}
+
+std::string PendingResult::error() {
+    std::lock_guard<std::mutex> lock(mu_);
+    return pending_ ? duckdb_pending_error(pending_) : std::string();
+}
+
+std::shared_ptr<Result> PendingResult::materialize() {
+    duckdb_result result;
+    duckdb_state final_state;
+    {
+        nb::gil_scoped_release release;
+        std::lock_guard<std::mutex> lock(mu_);
+        if (!pending_) throw DuckyError("ducky: pending result already consumed");
+        final_state = duckdb_execute_pending(pending_, &result);
+        cleanup_locked();
+    }
+    if (final_state == DuckDBError) {
+        std::string message = duckdb_result_error(&result);
+        duckdb_destroy_result(&result);
+        throw DuckyError(message);
+    }
+    return std::make_shared<Result>(result, handle_);
+}
+
+void PendingResult::drain() {
+    // Interrupt is safe to call from this thread while a worker is mid-tick on
+    // another; it makes that tick return promptly so the lock frees up. Only
+    // then do we take the lock (with the GIL dropped, so the worker can finish
+    // and reacquire the GIL to return) and run the executor to a terminal state.
+    if (con_) duckdb_interrupt(con_);
+    nb::gil_scoped_release release;
+    std::lock_guard<std::mutex> lock(mu_);
+    if (!pending_) return;
+    duckdb_result drained;
+    duckdb_execute_pending(pending_, &drained);
+    duckdb_destroy_result(&drained);
+    cleanup_locked();
+}
+
+PendingResult* Connection::make_pending(const std::string& query, nb::object parameters,
+                                        bool streaming) {
+    ensure_open();
+    duckdb_connection con = handle_->connection;
+
+    duckdb_prepared_statement stmt = nullptr;
+    if (duckdb_prepare(con, query.c_str(), &stmt) == DuckDBError) {
+        std::string message = duckdb_prepare_error(stmt);
+        duckdb_destroy_prepare(&stmt);
+        throw DuckyError(message);
+    }
+    if (!parameters.is_none()) {
+        try {
+            bind_parameters(stmt, parameters);
+        } catch (...) {
+            duckdb_destroy_prepare(&stmt);
+            throw;
+        }
+    }
+    duckdb_pending_result pending = nullptr;
+    duckdb_state init = streaming ? duckdb_pending_prepared_streaming(stmt, &pending)
+                                  : duckdb_pending_prepared(stmt, &pending);
+    if (init == DuckDBError) {
+        std::string message = duckdb_pending_error(pending);
+        duckdb_destroy_pending(&pending);
+        duckdb_destroy_prepare(&stmt);
+        throw DuckyError(message);
+    }
+    return new PendingResult(pending, stmt, /*owns_stmt=*/true, con, handle_);
+}
+
 PreparedStatement* Connection::prepare(const std::string& query) {
     ensure_open();
     duckdb_prepared_statement stmt = nullptr;

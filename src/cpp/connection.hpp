@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 
 #include "database.hpp"
@@ -13,6 +14,55 @@
 namespace nb = nanobind;
 
 class PreparedStatement;
+
+// A steppable handle over a duckdb_pending_result — the substrate for an async
+// execute. Where the synchronous `run_pending` drives the executor to
+// completion in one C++ loop, this lets a Python coroutine own the loop:
+// `execute_task()` advances one task (GIL released), and the coroutine decides
+// what to do between ticks (yield to the event loop, check for cancellation).
+//
+// Concurrency: a tick offloaded via asyncio.to_thread keeps running on its
+// worker thread even after the awaiting task is cancelled, so `drain()` (the
+// cancellation teardown) must not race it. Every method that touches the
+// pending result holds `mu_`; `drain()` first calls duckdb_interrupt (safe from
+// another thread, and what makes the in-flight tick return promptly) and only
+// then takes the lock. All blocking sections release the GIL so the worker
+// thread can finish its tick and let the lock go.
+class PendingResult {
+   public:
+    // Takes ownership of `pending`. If `owns_stmt`, also owns `stmt` and
+    // destroys it once the result is materialized / drained (the Connection
+    // path prepares a throwaway statement); the PreparedStatement path passes
+    // owns_stmt=false since the statement outlives the pending result.
+    PendingResult(duckdb_pending_result pending, duckdb_prepared_statement stmt, bool owns_stmt,
+                  duckdb_connection con, std::shared_ptr<DuckDBHandle> handle);
+    ~PendingResult();
+
+    PendingResult(const PendingResult&) = delete;
+    PendingResult& operator=(const PendingResult&) = delete;
+
+    // Advance the executor by one task and return the resulting state
+    // (READY / NOT_READY / NO_TASKS_AVAILABLE / ERROR). Releases the GIL.
+    duckdb_pending_state execute_task();
+    // DuckDB's message for the most recent error, or "" if the handle is gone.
+    std::string error();
+    // Materialize the finished result (call once execute_task reports READY).
+    // Consumes the pending result; raises DuckyError if the execution errored.
+    std::shared_ptr<Result> materialize();
+    // Cancellation teardown: interrupt the connection, run the executor to a
+    // terminal state so background workers detach, and discard the result.
+    void drain();
+
+   private:
+    void cleanup_locked();
+
+    std::mutex mu_;
+    duckdb_pending_result pending_ = nullptr;
+    duckdb_prepared_statement stmt_ = nullptr;
+    bool owns_stmt_ = false;
+    duckdb_connection con_ = nullptr;
+    std::shared_ptr<DuckDBHandle> handle_;
+};
 
 // A DuckDB database handle plus a single connection to it. Each Connection owns
 // its own database, so connecting to ":memory:" yields an isolated in-memory
@@ -38,6 +88,11 @@ class Connection {
     // Eagerly runs a query and hands back its Result directly. See execute()
     // for the `streaming` semantics.
     std::shared_ptr<Result> sql(const std::string& query, bool streaming);
+
+    // Prepare + bind a query and hand back a steppable PendingResult *without*
+    // driving the executor — the substrate for the async drive loop in
+    // ducky._aio. The returned handle owns a throwaway prepared statement.
+    PendingResult* make_pending(const std::string& query, nb::object parameters, bool streaming);
 
     // Compile `query` once into a PreparedStatement that can be executed
     // repeatedly with different parameters. Raises DuckyError on a parse/bind

@@ -133,65 +133,13 @@ Legend: ✅ shipped · 🟡 partially shipped · ⬜ not started.
     `streaming=True` internally would close the ergonomic gap; alternatively,
     have `iter_batches_*` warn when the source isn't streaming so the bounded-
     memory claim above stays honest.
-  - ⬜ **`async def execute`.** `run_pending` (`connection.cpp`) is already a
-    single-task-at-a-time state machine: `duckdb_pending_execute_task` advances
-    one unit of work with the GIL released, and each iteration re-checks
-    `READY` / `ERROR` / `NO_TASKS_AVAILABLE`. The only blocking bits are the 1 ms
-    `sleep_for` (when workers own the outstanding tasks) and the spin-until-ready
-    itself — that shape is an awaitable coroutine in disguise. The async version
-    keeps the state machine and changes only what happens *between* ticks.
-
-    **Surface.** Add `aexecute` / `asql` (asyncpg / aiosqlite naming) rather than
-    overloading `execute` to sometimes return a coroutine — an
-    `execute(...) -> Result | Coroutine[...]` union is a typing mess and a
-    foot-gun (forget the `await` and you get a coroutine object, not a result).
-    They can live on the existing `Connection`; no separate `AsyncConnection` is
-    needed, since they reuse the prepare + pending machinery and only the drive
-    loop differs.
-
-    **Drive loop (Python).** Expose the pending handle as a small steppable
-    object — `PendingResult.execute_task() -> state` (one tick, GIL released in
-    C++) plus `materialize() -> Result` — and orchestrate from Python:
-
-    ```python
-    async def aexecute(self, sql, params=None, *, streaming=False):
-        pending = self._prepare_pending(sql, params, streaming)   # C++ helper
-        try:
-            while True:
-                state = await asyncio.to_thread(pending.execute_task)  # GIL freed in C++
-                if state is READY:
-                    break
-                if state is ERROR:
-                    raise ducky.Error(pending.error())
-                if state is NO_TASKS_AVAILABLE:
-                    await asyncio.sleep(0)   # yield to the loop instead of sleep_for(1ms)
-        except (asyncio.CancelledError, KeyboardInterrupt):
-            self.interrupt(); pending.drain()   # mirror run_pending's teardown
-            raise
-        return pending.materialize()
-    ```
-
-    The `to_thread` offload is what keeps the event loop unblocked while the
-    GIL-releasing C task runs; `asyncio.sleep(0)` replaces the 1 ms park so the
-    loop schedules other work rather than the coroutine busy-waiting. Per-tick
-    `to_thread` has real handoff overhead, though — if it bites, offload a small
-    batch of ticks per call (a C++ helper that runs up to *K* tasks or until a
-    terminal state) to amortise it.
-
-    **Cancellation = interrupt.** The sync path catches Ctrl-C via
-    `PyErr_CheckSignals` between ticks; the async path instead catches
-    `CancelledError` / `KeyboardInterrupt` and runs the *same* `duckdb_interrupt`
-    + drain-to-terminal teardown, so background workers detach cleanly and no
-    partial result ever leaks to the caller.
-
-    **Caveats.** A DuckDB connection runs one query at a time, so `aexecute` must
-    still serialise per connection (await-and-queue, or raise on a concurrent
-    in-flight query) — async buys event-loop cooperation, not intra-connection
-    parallelism. The natural follow-on is an async streaming pull
-    (`async for batch in con.aiter_torch(sql)`), where each `duckdb_fetch_chunk`
-    is offloaded the same way. No new DuckDB C API is needed — the pending
-    functions are already bound; the work is the steppable-handle surface and the
-    cancellation contract.
+  - ✅ **`async def execute`.** `Connection.aexecute` / `asql` drive the pending
+    executor from a coroutine (`ducky._aio`): each task tick is offloaded via
+    `asyncio.to_thread` (GIL released in C++) with `asyncio.sleep(0)` between
+    ticks so the event loop stays responsive, and `CancelledError` /
+    `KeyboardInterrupt` triggers `duckdb_interrupt` + drain. Built on a steppable
+    `PendingResult` handle (`Connection.make_pending`) whose `std::mutex` keeps
+    the cancellation drain from racing an in-flight worker tick.
 
 ## Dataset / feature API
 
