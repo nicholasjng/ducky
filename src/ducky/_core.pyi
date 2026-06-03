@@ -484,7 +484,7 @@ class Connection:
 
     def register_arrow(self, name: str, obj: Any) -> None:
         """
-        Register a Python object exposing `__arrow_c_stream__` (pyarrow Table, polars DataFrame, pandas-3 DataFrame, ...) as a table named `name`. The data is materialized into DuckDB at registration; the source object is not retained.
+        Register a Python object exposing `__arrow_c_stream__` (pyarrow Table, polars DataFrame, pandas-3 DataFrame, ...) as a table named `name`. Lazy and zero-copy: the source is kept and re-streamed on each query via a replacement scan (so it must support being streamed more than once), not materialized at registration.
         """
 
     def close(self) -> None:

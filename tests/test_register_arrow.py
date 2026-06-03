@@ -72,3 +72,56 @@ def test_rejects_bad_name(name: str) -> None:
     con = ducky.connect()
     with pytest.raises(Exception, match="(?i)(invalid|empty) table name"):
         con.register_arrow(name, pa.Table.from_pydict({"x": [1]}))
+
+
+# ── Lazy replacement-scan behaviors ──────────────────────────────────────────
+
+
+def test_large_scan_spans_many_slices() -> None:
+    # 50k rows forces the table function to emit many vector-size (2048) slices
+    # out of the converted Arrow batches — exercises the produce cursor.
+    con = ducky.connect()
+    con.register_arrow("big", pa.table({"i": pa.array(range(50_000), pa.int64())}))
+    assert con.sql("SELECT count(*) FROM big").fetchitem() == 50_000
+    assert con.sql("SELECT sum(i) FROM big").fetchitem() == sum(range(50_000))
+    assert con.sql("SELECT i FROM big WHERE i % 20000 = 0 ORDER BY i").fetchall() == [
+        (0,),
+        (20000,),
+        (40000,),
+    ]
+
+
+def test_multi_batch_and_nested_types() -> None:
+    con = ducky.connect()
+    b1 = pa.record_batch(
+        {
+            "id": pa.array([1, 2], pa.int64()),
+            "tags": pa.array([["a"], ["b", "c"]], pa.list_(pa.string())),
+        }
+    )
+    b2 = pa.record_batch(
+        {"id": pa.array([3], pa.int64()), "tags": pa.array([[]], pa.list_(pa.string()))}
+    )
+    con.register_arrow("nested", pa.Table.from_batches([b1, b2]))
+    assert con.sql("SELECT id, tags FROM nested ORDER BY id").fetchall() == [
+        (1, ["a"]),
+        (2, ["b", "c"]),
+        (3, []),
+    ]
+
+
+def test_scan_joins_real_table() -> None:
+    con = ducky.connect()
+    con.register_arrow("nums", pa.table({"i": pa.array([1, 2, 3], pa.int64())}))
+    con.execute("CREATE TABLE labels (i BIGINT, label VARCHAR)")
+    con.execute("INSERT INTO labels VALUES (2, 'two')")
+    assert con.sql(
+        "SELECT n.i, l.label FROM nums n JOIN labels l USING (i) ORDER BY n.i"
+    ).fetchall() == [(2, "two")]
+
+
+def test_unknown_table_still_errors() -> None:
+    con = ducky.connect()
+    con.register_arrow("known", pa.table({"i": pa.array([1], pa.int64())}))
+    with pytest.raises(ducky.Error, match="(?i)nonexistent"):
+        con.sql("SELECT * FROM nonexistent").fetchall()

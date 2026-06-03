@@ -14,6 +14,7 @@
 namespace nb = nanobind;
 
 class PreparedStatement;
+struct ArrowRegistry;
 
 // A steppable handle over a duckdb_pending_result — the substrate for an async
 // execute. Where the synchronous `run_pending` drives the executor to
@@ -149,4 +150,9 @@ class Connection {
 
     std::shared_ptr<DuckDBHandle> handle_;
     std::shared_ptr<Result> last_result_;
+    // Lazily created on the first register_arrow; backs the Arrow replacement
+    // scan. Declared last so it's torn down first (its nb::object refs decref
+    // before the database handle closes). ~Connection is defined out-of-line in
+    // connection.cpp, where ArrowRegistry is a complete type.
+    std::unique_ptr<ArrowRegistry> arrow_registry_;
 };

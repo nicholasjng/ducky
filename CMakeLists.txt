@@ -132,6 +132,7 @@ nanobind_add_module(
   src/cpp/function.cpp
   src/cpp/aggregate.cpp
   src/cpp/table.cpp
+  src/cpp/arrow_scan.cpp
   src/cpp/result.cpp)
 
 target_include_directories(_core PRIVATE ${DUCKDB_DIR}/src/include)

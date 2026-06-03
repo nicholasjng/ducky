@@ -245,7 +245,9 @@ NB_MODULE(_core, m) {
                 if (row.is_none()) throw nb::stop_iteration();
                 return row;
             },
-            nb::sig("def __next__(self) -> tuple"));
+            nb::sig("def __next__(self) -> tuple"),
+            // Drives the cursor (via fetchone) — same lock as the fetch* methods.
+            nb::lock_self());
 
     nb::class_<Appender>(m, "Appender",
                          "Bulk-insert handle for a target table. Supports a "
@@ -288,6 +290,11 @@ NB_MODULE(_core, m) {
         m, "PreparedStatement",
         "A SQL statement compiled once via Connection.prepare(), executable "
         "repeatedly with different parameters without re-parsing the query.")
+        // Every method reads or mutates the live stmt_ (which close() frees), so
+        // each carries nb::lock_self(): on free-threaded builds it wraps the call
+        // in a PyCriticalSection on the statement, serializing execute/bind/close
+        // and stopping a getter from reading a stmt_ that another thread is
+        // closing. A no-op under the GIL.
         .def("execute", &PreparedStatement::execute, "parameters"_a = nb::none(),
              "streaming"_a = false,
              nb::sig("def execute(self, parameters: list | tuple | dict[str, typing.Any] | None = "
@@ -298,27 +305,31 @@ NB_MODULE(_core, m) {
              "memory stays bounded to one chunk, useful for iter_batches_torch / "
              "iter_batches_jax / iter_batches_mlx on large queries. A streaming "
              "result is single-pass; consume it via fetch* or iter_batches*, not "
-             "both.")
+             "both.",
+             nb::lock_self())
         .def("executemany", &PreparedStatement::executemany, "parameters"_a,
              nb::sig("def executemany(self, parameters: collections.abc.Iterable[list | tuple | "
                      "dict[str, typing.Any]]) -> None"),
              "Run the statement once per parameter set, discarding each result. "
-             "The fast path for batched INSERT/UPDATE/DELETE.")
+             "The fast path for batched INSERT/UPDATE/DELETE.",
+             nb::lock_self())
         .def_prop_ro("num_parameters", &PreparedStatement::num_parameters,
-                     "Number of bind parameters in the statement.")
+                     "Number of bind parameters in the statement.", nb::lock_self())
         .def("parameter_name", &PreparedStatement::parameter_name, "index"_a,
              nb::sig("def parameter_name(self, index: int) -> str | None"),
              "Name of the parameter at `index` (1-based), or None if the index is "
-             "out of range or the parameter is positional.")
+             "out of range or the parameter is positional.",
+             nb::lock_self())
         .def_prop_ro("columns", &PreparedStatement::column_names,
                      "Result column names, known ahead of execution (empty for "
-                     "statements that produce no result set).")
+                     "statements that produce no result set).",
+                     nb::lock_self())
         .def_prop_ro("types", &PreparedStatement::column_types,
-                     "Result column type names, known ahead of execution.")
+                     "Result column type names, known ahead of execution.", nb::lock_self())
         .def_prop_ro("statement_type", &PreparedStatement::statement_type,
                      nb::sig("def statement_type(self) -> str"),
-                     "The statement kind: 'SELECT', 'INSERT', 'UPDATE', etc.")
-        .def("close", &PreparedStatement::close, "Destroy the prepared statement.")
+                     "The statement kind: 'SELECT', 'INSERT', 'UPDATE', etc.", nb::lock_self())
+        .def("close", &PreparedStatement::close, "Destroy the prepared statement.", nb::lock_self())
         .def(
             "__enter__", [](PreparedStatement& self) -> PreparedStatement& { return self; },
             nb::rv_policy::reference)
@@ -327,7 +338,8 @@ NB_MODULE(_core, m) {
             [](PreparedStatement& self, nb::object, nb::object, nb::object) { self.close(); },
             "exc_type"_a.none(), "exc_value"_a.none(), "traceback"_a.none(),
             nb::sig("def __exit__(self, exc_type: type[BaseException] | None, exc_value: "
-                    "BaseException | None, traceback: types.TracebackType | None) -> None"));
+                    "BaseException | None, traceback: types.TracebackType | None) -> None"),
+            nb::lock_self());
 
     // Async substrate: the per-task pending state, and the steppable handle the
     // ducky._aio drive loops advance. End users go through aexecute / asql; the
@@ -403,7 +415,8 @@ NB_MODULE(_core, m) {
                      "dict[str, typing.Any] | None = None, streaming: bool = False) "
                      "-> PendingResult"),
              "Low-level: build a steppable PendingResult for the ducky._aio drivers. "
-             "Prefer aexecute() / asql().")
+             "Prefer aexecute() / asql().",
+             nb::lock_self())
         .def("prepare", &Connection::prepare, "query"_a,
              nb::sig("def prepare(self, query: str) -> PreparedStatement"),
              "Compile `query` once into a PreparedStatement for repeated execution "
@@ -424,9 +437,9 @@ NB_MODULE(_core, m) {
              "and yields exactly one row.",
              nb::lock_self())
         .def_prop_ro("description", &Connection::description,
-                     nb::sig("def description(self) -> list[tuple] | None"))
+                     nb::sig("def description(self) -> list[tuple] | None"), nb::lock_self())
         .def_prop_ro("columns", &Connection::columns,
-                     nb::sig("def columns(self) -> list[str] | None"))
+                     nb::sig("def columns(self) -> list[str] | None"), nb::lock_self())
         .def_prop_ro("current_result", &Connection::current_result,
                      nb::sig("def current_result(self) -> Result"),
                      "The most recent result produced by execute(); raises Error if no "
@@ -459,7 +472,8 @@ NB_MODULE(_core, m) {
             "omitted, they are inferred from `fn`'s annotations (bool/int/float "
             "→ BOOLEAN/BIGINT/DOUBLE). Pass `varargs=\"TYPE\"` (mutually exclusive "
             "with `parameters`) to register a variable-arity function; `fn` is "
-            "then called as `fn(*args)` with one ndarray per SQL argument.")
+            "then called as `fn(*args)` with one ndarray per SQL argument.",
+            nb::lock_self())
         .def(
             "create_arrow_function",
             [](Connection& self, const std::string& name, nb::callable fn, nb::object parameters,
@@ -477,7 +491,8 @@ NB_MODULE(_core, m) {
             "or a dict of {name: type_string}. By default `fn` is called with one "
             "`pyarrow.Array` per column (positional, or a {name: Array} dict when "
             "`parameters` is a dict). Pass `record_batch=True` to receive a single "
-            "`pyarrow.RecordBatch` instead. `fn` must return a `pyarrow.Array`.")
+            "`pyarrow.RecordBatch` instead. `fn` must return a `pyarrow.Array`.",
+            nb::lock_self())
         .def(
             "create_aggregate_function",
             [](Connection& self, const std::string& name, nb::object cls, nb::object parameters,
@@ -490,7 +505,8 @@ NB_MODULE(_core, m) {
             "Register a Python class as a DuckDB aggregate function. `cls` must "
             "have `__init__`, `update(self, *arrays)`, and `finalize(self) -> scalar` "
             "methods. An optional `combine(self, other)` method enables parallel "
-            "aggregate execution.")
+            "aggregate execution.",
+            nb::lock_self())
         .def(
             "create_table_function",
             [](Connection& self, const std::string& name, nb::callable factory,
@@ -504,7 +520,8 @@ NB_MODULE(_core, m) {
             "Register a Python generator function as a DuckDB table function. "
             "`factory` is called with the SQL arguments and must return a generator "
             "that yields one tuple per row. `columns` is an ordered dict "
-            "{column_name: type_string} declaring the output schema.")
+            "{column_name: type_string} declaring the output schema.",
+            nb::lock_self())
         .def(
             "appender",
             [](Connection& self, const std::string& table, std::optional<std::string> schema,
@@ -533,8 +550,9 @@ NB_MODULE(_core, m) {
              nb::sig("def register_arrow(self, name: str, obj: typing.Any) -> None"),
              "Register a Python object exposing `__arrow_c_stream__` (pyarrow "
              "Table, polars DataFrame, pandas-3 DataFrame, ...) as a table named "
-             "`name`. The data is materialized into DuckDB at registration; "
-             "the source object is not retained.",
+             "`name`. Lazy and zero-copy: the source is kept and re-streamed on "
+             "each query via a replacement scan (so it must support being "
+             "streamed more than once), not materialized at registration.",
              nb::lock_self())
         .def("close", &Connection::close, "Close the connection.", nb::lock_self())
         .def(
@@ -544,7 +562,8 @@ NB_MODULE(_core, m) {
             "__exit__", [](Connection& self, nb::object, nb::object, nb::object) { self.close(); },
             "exc_type"_a.none(), "exc_value"_a.none(), "traceback"_a.none(),
             nb::sig("def __exit__(self, exc_type: type[BaseException] | None, exc_value: "
-                    "BaseException | None, traceback: types.TracebackType | None) -> None"));
+                    "BaseException | None, traceback: types.TracebackType | None) -> None"),
+            nb::lock_self());
 
     m.def(
         "connect",

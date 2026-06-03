@@ -8,6 +8,7 @@
 #include <cstring>
 #include <thread>
 
+#include "arrow_scan.hpp"
 #include "ducky.hpp"
 #include "prepared.hpp"
 
@@ -395,8 +396,8 @@ nb::tuple Connection::progress() const {
 
 void Connection::register_arrow(const std::string& name, nb::object obj) {
     ensure_open();
-    // The name is interpolated into SQL below. Enforce a strict identifier
-    // shape so we never need to quote-escape: [A-Za-z][A-Za-z0-9_]*.
+    // Keep a strict identifier shape so `SELECT * FROM name` resolves unquoted:
+    // [A-Za-z][A-Za-z0-9_]*.
     if (name.empty()) {
         throw DuckyError("ducky: empty table name");
     }
@@ -417,46 +418,13 @@ void Connection::register_arrow(const std::string& name, nb::object obj) {
             "ducky: object does not implement the Arrow PyCapsule interface "
             "(__arrow_c_stream__)");
     }
-    nb::object capsule = obj.attr("__arrow_c_stream__")();
-    void* raw = PyCapsule_GetPointer(capsule.ptr(), "arrow_array_stream");
-    if (!raw) {
-        PyErr_Clear();
-        throw DuckyError(
-            "ducky: __arrow_c_stream__ did not return an 'arrow_array_stream' "
-            "PyCapsule");
-    }
 
-    // The Arrow C stream is single-pass. Stage it as a temporary view, then
-    // materialize into a real table so repeated queries against `name` see
-    // the data. The capsule's destructor calls stream->release after we
-    // return; arrow_scan has nullified `release` by then so it's a no-op.
-    static std::atomic<uint64_t> counter{0};
-    std::string staging = "__ducky_arrow_" + std::to_string(counter.fetch_add(1));
-
-    duckdb_arrow_stream stream = (duckdb_arrow_stream)raw;
-    if (duckdb_arrow_scan(handle_->connection, staging.c_str(), stream) == DuckDBError) {
-        throw DuckyError("ducky: failed to stage Arrow stream");
-    }
-
-    // CREATE OR REPLACE drops any prior table with this name; the temp view
-    // is dropped explicitly to keep the catalog clean even on error.
-    std::string materialize = "CREATE OR REPLACE TABLE " + name + " AS SELECT * FROM " + staging;
-    duckdb_result r;
-    duckdb_state st = duckdb_query(handle_->connection, materialize.c_str(), &r);
-    std::string err;
-    if (st == DuckDBError) {
-        err = duckdb_result_error(&r);
-    }
-    duckdb_destroy_result(&r);
-
-    std::string drop = "DROP VIEW IF EXISTS " + staging;
-    duckdb_result rd;
-    duckdb_query(handle_->connection, drop.c_str(), &rd);
-    duckdb_destroy_result(&rd);
-
-    if (st == DuckDBError) {
-        throw DuckyError("ducky: failed to materialize Arrow stream into '" + name + "': " + err);
-    }
+    // Lazy, zero-copy: stash the source and resolve `SELECT * FROM name` to the
+    // ducky_arrow_scan table function via the replacement scan, re-streaming the
+    // source on each query (so it must support being streamed more than once).
+    if (!arrow_registry_) arrow_registry_ = install_arrow_scan(*this);
+    std::lock_guard<std::mutex> lock(arrow_registry_->mu);
+    arrow_registry_->sources[name] = std::move(obj);  // insert / overwrite (GIL held)
 }
 
 Connection::~Connection() { close(); }

@@ -73,27 +73,26 @@ Legend: ✅ shipped · 🟡 partially shipped · ⬜ not started.
     Arrow C structs follows the capsule protocol (stream path owns its
     schema/arrays; array path defers to the capsules, nulling `release` after
     `from_arrow` consumes) — verified clean under ASAN.
-- 🟡 **Replacement scans** (`duckdb_add_replacement_scan`). Lets
-  `SELECT * FROM my_df` resolve to a Python object (NumPy / pandas / Arrow).
-  Closes the input side the same way the ndarray/Arrow exporters close the
-  output side; today users have to materialize via an explicit register step.
-  - **Status.** `Connection.register_arrow(name, obj)` ships today but
-    materializes via `duckdb_arrow_scan` + `CREATE OR REPLACE TABLE`, paying
-    one full copy at registration. The "real" version is a lazy, zero-copy
-    Arrow ingest exposed as a custom table function registered through
-    `duckdb_create_table_function`, with a replacement scan that calls
-    `__arrow_c_stream__` fresh on every plan so repeated queries replay
-    against the source object. The shortcut (reuse DuckDB's built-in
-    `arrow_scan` with its internal `FactoryGetNext` / `FactoryGetSchema`)
-    is not viable from the C API: those factories live in DuckDB's
-    anonymous C++ namespace
-    (`ext/duckdb/src/main/capi/arrow-c.cpp` ~lines 358 and 392) and their
-    signatures take internal C++ types. The clean path is to implement our
-    own `arrow_scan` table function (~250 LOC: bind / init / produce / cleanup
-    plus Arrow → DuckDB type conversion mirroring `chunk.cpp` in the output
-    direction); the fast path — linking against DuckDB's C++ internals to
-    reuse the factories (~30 LOC) — couples us to an ABI the rest of the
-    binding deliberately avoids.
+- ✅ **Replacement scans** (`duckdb_add_replacement_scan`). `Connection.register_arrow(name, obj)`
+  is now lazy and zero-copy: it stashes the source in a per-connection registry
+  (`src/cpp/arrow_scan.cpp`) and a replacement scan rewrites `SELECT * FROM name`
+  into a custom `ducky_arrow_scan(name)` table function — no `CREATE TABLE`
+  materialization. bind opens the source's `__arrow_c_stream__`, derives the
+  result schema from the first batch (names from the Arrow schema, types from a
+  `duckdb_data_chunk_from_arrow` of that batch); the scan runs single-threaded
+  (`duckdb_init_set_max_threads(1)`) and emits each converted batch in
+  vector-size slices via `duckdb_create_selection_vector` + `duckdb_vector_copy_sel`
+  (which handles every column type, nested included). The source is re-streamed
+  per query, so it must support being streamed more than once (pyarrow Table /
+  polars / pandas-3 all do; a single-pass ducky `Result` works once). The
+  registry holds a strong ref (so the source can be dropped after registering)
+  and is owned by the `Connection`. Verified clean under ASAN. This avoids the
+  built-in `arrow_scan` shortcut (its `FactoryGetNext`/`FactoryGetSchema` live in
+  DuckDB's anonymous C++ namespace and aren't reachable from the C API).
+  - ⬜ **Empty-source schema.** Schema discovery converts the first batch, so a
+    source that yields no batches at all raises rather than binding an empty
+    table; deriving types from the Arrow schema's format strings would close
+    that gap.
 - ✅ **Richer parameter binding.** Today `bind` covers bool/int/float/str/None.
   Add `DATE`/`TIME`/`TIMESTAMP`/`BLOB`/`DECIMAL`/`HUGEINT` and named-parameter
   lookup via `duckdb_bind_parameter_index` to remove a class of surprises at
