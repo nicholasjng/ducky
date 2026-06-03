@@ -44,6 +44,7 @@ class Connection {
     nb::object fetchone();
     nb::list fetchmany(int64_t size);
     nb::list fetchall();
+    nb::object fetchitem();
     nb::object description() const;
     nb::object columns() const;
 

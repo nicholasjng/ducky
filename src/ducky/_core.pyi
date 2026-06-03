@@ -80,6 +80,11 @@ class Result:
     def fetchall(self) -> list[tuple]:
         """Return all remaining rows."""
 
+    def fetchitem(self) -> Any:
+        """
+        Return the lone scalar of a 1-row x 1-column result (e.g. a COUNT(*) query). Raises a ducky.Error unless the result has exactly one column and yields exactly one row.
+        """
+
     def fetch_chunk(self) -> Chunk | None:
         """Pull the next data chunk as a Chunk, or None at end of stream."""
 
@@ -270,6 +275,11 @@ class Connection:
     def fetchone(self) -> tuple | None: ...
     def fetchmany(self, size: int = 1) -> list[tuple]: ...
     def fetchall(self) -> list[tuple]: ...
+    def fetchitem(self) -> Any:
+        """
+        Return the lone scalar of a 1-row x 1-column result (e.g. a COUNT(*) query). Raises a ducky.Error unless the result has exactly one column and yields exactly one row.
+        """
+
     @property
     def description(self) -> list[tuple] | None: ...
     @property

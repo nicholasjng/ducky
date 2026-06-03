@@ -39,6 +39,9 @@ class Result {
     nb::object fetchone();
     nb::list fetchmany(int64_t size);
     nb::list fetchall();
+    // Returns the lone scalar of a 1-row × 1-column result. Raises if the result
+    // does not have exactly one column or does not yield exactly one row.
+    nb::object fetchitem();
 
     // Pulls the next data chunk and returns it as a `Chunk` Python object, or
     // None when the result is exhausted. Each call advances the same underlying

@@ -204,6 +204,10 @@ NB_MODULE(_core, m) {
              "Return up to `size` rows.")
         .def("fetchall", &Result::fetchall, nb::sig("def fetchall(self) -> list[tuple]"),
              "Return all remaining rows.")
+        .def("fetchitem", &Result::fetchitem, nb::sig("def fetchitem(self) -> typing.Any"),
+             "Return the lone scalar of a 1-row x 1-column result (e.g. a COUNT(*) "
+             "query). Raises a ducky.Error unless the result has exactly one column "
+             "and yields exactly one row.")
         .def("fetch_chunk", &Result::fetch_chunk, nb::sig("def fetch_chunk(self) -> Chunk | None"),
              "Pull the next data chunk as a Chunk, or None at end of stream.")
         .def(
@@ -313,6 +317,10 @@ NB_MODULE(_core, m) {
         .def("fetchmany", &Connection::fetchmany, "size"_a = 1,
              nb::sig("def fetchmany(self, size: int = 1) -> list[tuple]"))
         .def("fetchall", &Connection::fetchall, nb::sig("def fetchall(self) -> list[tuple]"))
+        .def("fetchitem", &Connection::fetchitem, nb::sig("def fetchitem(self) -> typing.Any"),
+             "Return the lone scalar of a 1-row x 1-column result (e.g. a COUNT(*) "
+             "query). Raises a ducky.Error unless the result has exactly one column "
+             "and yields exactly one row.")
         .def_prop_ro("description", &Connection::description,
                      nb::sig("def description(self) -> list[tuple] | None"))
         .def_prop_ro("columns", &Connection::columns,

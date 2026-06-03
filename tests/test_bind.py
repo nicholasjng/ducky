@@ -13,9 +13,7 @@ import ducky
 def roundtrip(value, cast: str | None = None):
     con = ducky.connect()
     sql = f"SELECT CAST(? AS {cast})" if cast else "SELECT ?"
-    row = con.execute(sql, [value]).fetchone()
-    assert row is not None
-    return row[0]
+    return con.execute(sql, [value]).fetchitem()
 
 
 def test_bind_bytes():

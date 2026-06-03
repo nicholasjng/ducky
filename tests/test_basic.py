@@ -29,6 +29,29 @@ def test_fetchone_and_fetchmany():
     assert con.fetchone() is None
 
 
+def test_fetchitem():
+    con = ducky.connect()
+    # The 1x1 happy path, on Result and on Connection (via current_result).
+    assert con.sql("SELECT count(*) FROM range(42)").fetchitem() == 42
+    assert con.execute("SELECT 3.5").fetchitem() == 3.5
+    # Scalar decoding goes through the same path as fetchone: strings, NULL.
+    assert con.sql("SELECT 'hi'").fetchitem() == "hi"
+    assert con.sql("SELECT NULL").fetchitem() is None
+
+
+@pytest.mark.parametrize(
+    ("sql", "match"),
+    [
+        ("SELECT 1, 2", "exactly 1 column"),
+        ("SELECT * FROM range(3)", "more"),
+        ("SELECT 1 WHERE false", "empty"),
+    ],
+)
+def test_fetchitem_requires_one_by_one(sql, match):
+    with pytest.raises(ducky.Error, match=match):
+        ducky.connect().sql(sql).fetchitem()
+
+
 def test_description_and_columns():
     res = ducky.connect().sql("SELECT 1 AS a, 'x' AS b")
     assert res.columns == ["a", "b"]

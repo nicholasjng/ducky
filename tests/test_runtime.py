@@ -38,9 +38,7 @@ def test_config_native_types_coerced():
 
 def test_config_bool_true_coerced():
     con = ducky.connect(preserve_insertion_order=True)
-    row = con.execute("SELECT current_setting('preserve_insertion_order')").fetchone()
-    assert row is not None
-    assert row[0] is True
+    assert con.execute("SELECT current_setting('preserve_insertion_order')").fetchitem() is True
 
 
 def test_config_str_value_passes_through():

@@ -470,6 +470,25 @@ nb::list Result::fetchall() {
     return out;
 }
 
+nb::object Result::fetchitem() {
+    if (column_count_ != 1) {
+        throw DuckyError("ducky: fetchitem() requires a result with exactly 1 column; got " +
+                         std::to_string(column_count_));
+    }
+    if (!ensure_row()) {
+        throw DuckyError("ducky: fetchitem() requires exactly 1 row; the result is empty");
+    }
+    // Decode the lone cell, then confirm no second row remains. The value is a
+    // fully materialized Python object, so it survives releasing the chunk that
+    // the follow-up ensure_row() may trigger.
+    idx_t row = cursor_++;
+    nb::object value = convert_value(vectors_[0], column_types_[0], row);
+    if (ensure_row()) {
+        throw DuckyError("ducky: fetchitem() requires exactly 1 row; the result has more");
+    }
+    return value;
+}
+
 nb::object Result::fetch_chunk() {
     duckdb_data_chunk chunk = duckdb_fetch_chunk(result_);
     if (!chunk) return nb::none();

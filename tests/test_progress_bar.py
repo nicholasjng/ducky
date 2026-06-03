@@ -28,9 +28,9 @@ def test_progress_bar_runs_query_and_finalizes():
     out = io.StringIO()
     with ducky.progress_bar(con, desc="t", out=out, use_tqdm=False, interval=0.01) as c:
         assert c is con
-        row = con.execute("SELECT count(*) FROM range(20_000_000) t(i) WHERE i % 13 = 0").fetchone()
-    assert row is not None
-    (count,) = row
+        count: int = con.execute(
+            "SELECT count(*) FROM range(20_000_000) t(i) WHERE i % 13 = 0"
+        ).fetchitem()
     assert count > 0
     rendered = out.getvalue()
     # The fallback bar always finalizes to 100% with a trailing newline.
@@ -42,9 +42,7 @@ def test_progress_bar_restores_settings():
     con = ducky.connect()
 
     def setting(name: str) -> bool:
-        row = con.execute(f"SELECT current_setting('{name}')").fetchone()
-        assert row is not None
-        return bool(row[0])
+        return bool(con.execute(f"SELECT current_setting('{name}')").fetchitem())
 
     assert setting("enable_progress_bar") is False
     with ducky.progress_bar(con, out=io.StringIO(), use_tqdm=False):
@@ -70,6 +68,4 @@ def test_progress_bar_propagates_query_errors():
     with pytest.raises(ducky.Error), ducky.progress_bar(con, out=io.StringIO(), use_tqdm=False):
         con.execute("SELECT * FROM no_such_table").fetchall()
     # Settings are still restored even though the body raised.
-    row = con.execute("SELECT current_setting('enable_progress_bar')").fetchone()
-    assert row is not None
-    assert bool(row[0]) is False
+    assert bool(con.execute("SELECT current_setting('enable_progress_bar')").fetchitem()) is False

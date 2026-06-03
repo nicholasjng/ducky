@@ -167,14 +167,21 @@ Legend: ✅ shipped · 🟡 partially shipped · ⬜ not started.
 
 ## QOL improvements
 
-- ⬜ **`Result.fetchitem()` / `Connection.fetchitem()`.** A scalar-fetch
+- ✅ **`Result.fetchitem()` / `Connection.fetchitem()`.** A scalar-fetch
   helper that returns the single value of the single result row, raising a
-  clear error if the result isn't exactly 1 row × 1 column. Named after
+  clear `ducky.Error` if the result isn't exactly 1 row × 1 column. Named after
   numpy's `ndarray.item()` for the same "collapse a container to its lone
-  scalar" intent. Today `COUNT(*)`-style queries force every call site
+  scalar" intent. `COUNT(*)`-style queries previously forced every call site
   through `row = ...fetchone(); assert row is not None; (x,) = row` purely to
   satisfy the type checker (`fetchone() -> tuple | None`); `fetchitem()`
   makes `n = con.execute(...).fetchitem()` both correct and type-clean.
+  `Result::fetchitem` reuses the existing `convert_value` row decoder (so every
+  type `fetchone` handles works, `NULL`→`None` included), checks
+  `column_count_ == 1`, decodes the lone cell, then confirms no second row
+  remains; `Connection.fetchitem` delegates through `current_result` like the
+  other `fetch*` methods. The `assert ... is not None` + `[0]` dance was removed
+  from the scalar-fetch call sites in `tests/` (aggregate-UDF, bind, runtime,
+  progress-bar).
 
 ## Refactors not gated on v2
 

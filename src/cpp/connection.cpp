@@ -487,6 +487,7 @@ Result& Connection::current() { return *current_result(); }
 nb::object Connection::fetchone() { return current().fetchone(); }
 nb::list Connection::fetchmany(int64_t size) { return current().fetchmany(size); }
 nb::list Connection::fetchall() { return current().fetchall(); }
+nb::object Connection::fetchitem() { return current().fetchitem(); }
 
 nb::object Connection::description() const {
     if (!last_result_) return nb::none();
