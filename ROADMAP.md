@@ -221,6 +221,21 @@ Legend: ✅ shipped · 🟡 partially shipped · ⬜ not started.
   Python-visible `Connection.current_result` property was added. Net ~90 lines
   off `ducky.cpp`.
 
+## Free-threading (CPython 3.13t+)
+
+- 🟡 **Parallel UDFs + concurrent decode on no-GIL builds.** The heavy DuckDB
+  work already runs GIL-free, so the GIL only bottlenecks the Python-side hot
+  paths — and DuckDB already fans those across worker threads. On a free-threaded
+  interpreter, Python scalar / arrow / aggregate UDFs (invoked from every
+  `threads=N` worker, each doing `gil_scoped_acquire`) run in parallel instead of
+  serialising, and result decoding / `to_numpy` / `to_torch` across connections
+  overlap. The extension now builds with nanobind's `FREE_THREADED` flag (emits
+  `Py_MOD_GIL_NOT_USED`), and shared caches already use `nb::ft_mutex`. Still
+  open: the thread-safety audit — chiefly that the per-`Connection` /
+  per-`Result` "one thread" contract holds as a *memory*-safety invariant (FT
+  turns those logical races into real ones), e.g. guarding `Result` cursor state
+  and `Connection.last_result_`.
+
 ## Unbound C API: candidates
 
 A survey of `ext/duckdb/src/include/duckdb.h` (≈548 functions) against what the

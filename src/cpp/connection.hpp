@@ -141,7 +141,6 @@ class Connection {
 
    private:
     void ensure_open() const;
-    Result& current();
     duckdb_result run(const std::string& query, nb::object parameters, bool streaming);
     // Wraps a result, sharing ownership of the database/connection handle so the
     // result (and any Arrow stream from it) stays usable after this Connection

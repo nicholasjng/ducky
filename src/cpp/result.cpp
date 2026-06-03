@@ -453,6 +453,10 @@ nb::object Result::build_row() {
     return nb::steal(tuple);
 }
 
+// The cursor methods below mutate chunk_ / cursor_ / vectors_. They're registered
+// with nb::lock_self() in ducky.cpp, which wraps each call in a PyCriticalSection
+// on the Result on free-threaded builds (no-op under the GIL) — so concurrent
+// calls on the same Result are serialized rather than corrupting cursor state.
 nb::object Result::fetchone() {
     if (!ensure_row()) return nb::none();
     return build_row();

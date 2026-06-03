@@ -640,16 +640,22 @@ PreparedStatement* Connection::prepare(const std::string& query) {
 }
 
 std::shared_ptr<Result> Connection::current_result() {
+    // Returning by value hands back a co-owning shared_ptr, so the Result stays
+    // alive for the caller even if a concurrent execute() replaces last_result_
+    // the instant after. The execute()/fetch*/current_result bindings carry
+    // nb::lock_self() (see ducky.cpp), serializing those last_result_ accesses on
+    // free-threaded builds.
     if (!last_result_) throw DuckyError("ducky: no result set; call execute() first");
     return last_result_;
 }
 
-Result& Connection::current() { return *current_result(); }
-
-nb::object Connection::fetchone() { return current().fetchone(); }
-nb::list Connection::fetchmany(int64_t size) { return current().fetchmany(size); }
-nb::list Connection::fetchall() { return current().fetchall(); }
-nb::object Connection::fetchitem() { return current().fetchitem(); }
+// The fetch delegators go through current_result() (a co-owning shared_ptr)
+// rather than a bare Result& — the temporary keeps the result alive across the
+// call, and Result's own lock_self serializes the cursor mutation.
+nb::object Connection::fetchone() { return current_result()->fetchone(); }
+nb::list Connection::fetchmany(int64_t size) { return current_result()->fetchmany(size); }
+nb::list Connection::fetchall() { return current_result()->fetchall(); }
+nb::object Connection::fetchitem() { return current_result()->fetchitem(); }
 
 nb::object Connection::description() const {
     if (!last_result_) return nb::none();

@@ -205,19 +205,24 @@ NB_MODULE(_core, m) {
         .def_prop_ro("description", &Result::description,
                      nb::sig("def description(self) -> list[tuple] | None"),
                      "PEP 249 result description.")
+        // nb::lock_self(): on free-threaded builds, wrap each call in a
+        // PyCriticalSection on the Result so concurrent cursor mutation
+        // (chunk_/cursor_/vectors_) on one Result is serialized, not corrupting.
+        // A no-op under the GIL.
         .def("fetchone", &Result::fetchone, nb::sig("def fetchone(self) -> tuple | None"),
-             "Return the next row, or None.")
+             "Return the next row, or None.", nb::lock_self())
         .def("fetchmany", &Result::fetchmany, "size"_a = 1,
              nb::sig("def fetchmany(self, size: int = 1) -> list[tuple]"),
-             "Return up to `size` rows.")
+             "Return up to `size` rows.", nb::lock_self())
         .def("fetchall", &Result::fetchall, nb::sig("def fetchall(self) -> list[tuple]"),
-             "Return all remaining rows.")
+             "Return all remaining rows.", nb::lock_self())
         .def("fetchitem", &Result::fetchitem, nb::sig("def fetchitem(self) -> typing.Any"),
              "Return the lone scalar of a 1-row x 1-column result (e.g. a COUNT(*) "
              "query). Raises a ducky.Error unless the result has exactly one column "
-             "and yields exactly one row.")
+             "and yields exactly one row.",
+             nb::lock_self())
         .def("fetch_chunk", &Result::fetch_chunk, nb::sig("def fetch_chunk(self) -> Chunk | None"),
-             "Pull the next data chunk as a Chunk, or None at end of stream.")
+             "Pull the next data chunk as a Chunk, or None at end of stream.", nb::lock_self())
         .def(
             "__arrow_c_stream__",
             [](nb::object self, nb::object) {
@@ -347,7 +352,8 @@ NB_MODULE(_core, m) {
              "memory stays bounded to one chunk, useful for iter_batches_torch "
              "/ iter_batches_jax / iter_batches_mlx on large queries. A "
              "streaming result is single-pass; consume it via fetch* or "
-             "iter_batches*, not both.")
+             "iter_batches*, not both.",
+             nb::lock_self())
         // The returned Result shares the DuckDBHandle, so it keeps the database
         // open on its own — no keep_alive needed.
         .def("sql", &Connection::sql, "query"_a, "streaming"_a = false,
@@ -389,14 +395,20 @@ NB_MODULE(_core, m) {
              nb::sig("def prepare(self, query: str) -> PreparedStatement"),
              "Compile `query` once into a PreparedStatement for repeated execution "
              "with different parameters, avoiding per-call re-parsing and planning.")
-        .def("fetchone", &Connection::fetchone, nb::sig("def fetchone(self) -> tuple | None"))
+        // lock_self() here guards last_result_ (read by the fetch delegators /
+        // current_result, written by execute) against a concurrent swap on
+        // free-threaded builds; a no-op under the GIL.
+        .def("fetchone", &Connection::fetchone, nb::sig("def fetchone(self) -> tuple | None"),
+             nb::lock_self())
         .def("fetchmany", &Connection::fetchmany, "size"_a = 1,
-             nb::sig("def fetchmany(self, size: int = 1) -> list[tuple]"))
-        .def("fetchall", &Connection::fetchall, nb::sig("def fetchall(self) -> list[tuple]"))
+             nb::sig("def fetchmany(self, size: int = 1) -> list[tuple]"), nb::lock_self())
+        .def("fetchall", &Connection::fetchall, nb::sig("def fetchall(self) -> list[tuple]"),
+             nb::lock_self())
         .def("fetchitem", &Connection::fetchitem, nb::sig("def fetchitem(self) -> typing.Any"),
              "Return the lone scalar of a 1-row x 1-column result (e.g. a COUNT(*) "
              "query). Raises a ducky.Error unless the result has exactly one column "
-             "and yields exactly one row.")
+             "and yields exactly one row.",
+             nb::lock_self())
         .def_prop_ro("description", &Connection::description,
                      nb::sig("def description(self) -> list[tuple] | None"))
         .def_prop_ro("columns", &Connection::columns,
@@ -405,7 +417,8 @@ NB_MODULE(_core, m) {
                      nb::sig("def current_result(self) -> Result"),
                      "The most recent result produced by execute(); raises Error if no "
                      "query has run yet. The conversion accessors (arrow/df/pl/...) "
-                     "delegate to it.");
+                     "delegate to it.",
+                     nb::lock_self());
     // Connection's conversion accessors operate on its most recent result; the
     // Result itself is the Arrow/chunk source the helpers consume.
     def_conversions(conn_cls, [](nb::object self) {

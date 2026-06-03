@@ -117,9 +117,14 @@ add_subdirectory(${DUCKDB_DIR} duckdb EXCLUDE_FROM_ALL)
 # ──────────────────────────────────────────────────────────────────────────────
 # The extension module
 # ──────────────────────────────────────────────────────────────────────────────
+# FREE_THREADED opts the module into no-GIL execution on free-threaded CPython
+# (3.13t+): nanobind emits Py_MOD_GIL_NOT_USED so importing it doesn't re-enable
+# the GIL. It's a no-op on regular (GIL-enabled) interpreters. See the
+# free-threading item in ROADMAP.md for the scaling rationale + audit status.
 nanobind_add_module(
   _core
   NB_STATIC
+  FREE_THREADED
   src/cpp/ducky.cpp
   src/cpp/appender.cpp
   src/cpp/connection.cpp
