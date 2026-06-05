@@ -1,28 +1,29 @@
 """Higher-level dataset / feature API for ML pipelines on top of DuckDB.
 
-Sketch — surface plus a minimal SQL compiler. The goal is to demonstrate the
-shape of the API; advanced features (stratified split, fillna='mean', custom
-fold lists, streaming batches) are deliberately left out for now.
-
-Typical use:
+The output is a dict of named **fields**, each either a :class:`Matrix` (several
+columns stacked into ``(n, d)``) or a :class:`Vector` (one column → ``(n,)``):
 
     ds = ducky.dataset(
         "https://…/titanic.csv",
-        columns={
-            "pclass":   ducky.feature("Pclass",                  dtype="f32"),
-            "sex_male": ducky.feature("Sex = 'male'",            dtype="f32"),
-            "age":      ducky.feature("Age",  standardize=True,  dtype="f32"),
-            "sibsp":    ducky.feature('"Siblings/Spouses Aboard"'),
-            "parch":    ducky.feature('"Parents/Children Aboard"'),
-            "fare":     ducky.feature("Fare", standardize=True,  dtype="f32"),
+        fields={
+            "X": ducky.matrix({
+                "pclass":   ducky.feature("Pclass"),
+                "age":      ducky.feature("Age", standardize=True, dtype="f32"),
+                "fare":     ducky.feature("Fare", standardize=True, dtype="f32"),
+            }),
+            "y": ducky.vector("Survived", dtype="f32"),
+            "w": ducky.vector("sample_weight"),          # sample weights
         },
-        target=ducky.target("Survived", dtype="f32"),
         drop_nulls=["Age"],
         split=ducky.split(0.8, seed=0),
         backend="jax",          # materialise folds straight into JAX (numpy default)
     )
-    Xtr, ytr = ds.train.tensors()
-    Xval, yval = ds.val.tensors()
+    Xtr, ytr = ds.train.tensors()       # sugar for ds.train["X"], ds.train["y"]
+    Xval, wval = ds.val["X"], ds.val["w"]
+
+For the classic single-features / single-target case, pass ``columns=`` and
+``target=`` instead of ``fields=`` — they desugar to a ``{"X": matrix(columns),
+"y": vector(target)}`` field spec.
 
 The ``backend`` chooses the array library each fold is materialised into
 ("numpy", "jax", "torch", "mlx"). The source is scanned once, streamed into the
@@ -49,7 +50,7 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True)
 class Feature:
-    """One column in the output table.
+    """One column in a :class:`Matrix` field.
 
     ``expr`` is a SQL expression (not a Python expression) — typically just a
     column name, optionally quoted: ``"Pclass"``, ``'"Siblings/Spouses Aboard"'``,
@@ -67,10 +68,37 @@ class Feature:
 
 @dataclass(frozen=True)
 class Target:
-    """The label column. Always emitted to the result; not included in X."""
+    """Legacy shorthand for a single-column label field.
+
+    Equivalent to :class:`Vector` without ``standardize=``; preserved so the
+    pre-``fields=`` API (``dataset(columns=..., target=...)``) keeps working.
+    """
 
     expr: str
     dtype: str = "f32"
+
+
+@dataclass(frozen=True)
+class Vector:
+    """A one-column field. Materialised as a 1-D array of shape ``(n,)``."""
+
+    expr: str
+    dtype: str = "f32"
+    standardize: bool = False
+
+
+@dataclass(frozen=True)
+class Matrix:
+    """A multi-column field. Materialised as a 2-D array of shape ``(n, d)``.
+
+    ``columns`` maps a short name (used as part of the SQL alias) to a
+    :class:`Feature` spec. The order of columns is preserved in the stack.
+    """
+
+    columns: dict[str, Feature] = field(default_factory=dict)
+
+
+Field = Vector | Matrix
 
 
 @dataclass(frozen=True)
@@ -102,6 +130,18 @@ def feature(expr: str, *, dtype: str = "f32", standardize: bool = False) -> Feat
 def target(expr: str, *, dtype: str = "f32") -> Target:
     """Shorthand for ``Target(expr=..., dtype=...)``."""
     return Target(expr=expr, dtype=dtype)
+
+
+def vector(expr: str, *, dtype: str = "f32", standardize: bool = False) -> Vector:
+    """Shorthand for ``Vector(expr=..., dtype=..., standardize=...)``."""
+    return Vector(expr=expr, dtype=dtype, standardize=standardize)
+
+
+def matrix(columns: dict[str, Feature]) -> Matrix:
+    """Shorthand for ``Matrix(columns=...)``."""
+    if not columns:
+        raise ValueError("matrix() requires at least one column")
+    return Matrix(columns=dict(columns))
 
 
 def split(
@@ -246,36 +286,59 @@ def _stack(cols: list[Any], backend: Backend) -> Any:
 
 @dataclass
 class Fold(Generic[ArrayT]):
-    """One side of a train/val split — feature columns + target column.
+    """One side of a split — a dict of named field arrays.
 
-    The columns are arrays in the dataset's ``backend`` (numpy/jax/torch/mlx);
-    ``ArrayT`` is that array type. ``arrays`` is a dict view keyed by
-    feature/target name; ``tensors()`` stacks the feature columns into a single
-    ``(n_rows, n_features)`` array on the backend's device.
+    Each field is an array in the dataset's ``backend`` (numpy/jax/torch/mlx);
+    ``ArrayT`` is that array type. A :class:`Matrix` field is materialised as a
+    2-D ``(n, d)`` array, a :class:`Vector` field as a 1-D ``(n,)`` array.
+
+    Access fields by name with ``fold["X"]`` or as attributes (``fold.X``).
+    Several single-character field names can be requested at once via a
+    "swizzle" attribute — ``fold.Xy`` returns ``(fold["X"], fold["y"])``.
     """
 
-    feature_names: list[str]
-    target_name: str
     backend: Backend
-    _arrays: dict[str, ArrayT]
+    _fields: dict[str, ArrayT]
 
     @property
-    def arrays(self) -> dict[str, ArrayT]:
-        return dict(self._arrays)
+    def fields(self) -> dict[str, ArrayT]:
+        return dict(self._fields)
 
     @property
     def n_rows(self) -> int:
-        return int(next(iter(self._arrays.values())).shape[0])
+        return int(next(iter(self._fields.values())).shape[0])
+
+    def __getitem__(self, name: str) -> ArrayT:
+        return self._fields[name]
+
+    def __getattr__(self, name: str) -> Any:
+        # __getattr__ only fires when normal lookup misses, so dataclass
+        # attributes like ``backend`` and ``_fields`` aren't routed here.
+        # Skip dunder/private lookups so things like ``__deepcopy__`` raise
+        # cleanly instead of trying to swizzle the leading underscore.
+        if name.startswith("_"):
+            raise AttributeError(name)
+        fields = self.__dict__.get("_fields")
+        if not fields:
+            raise AttributeError(name)
+        if name in fields:
+            return fields[name]
+        # Vector-style swizzle: every char of ``name`` must be a single-char
+        # field name. Returns a tuple in the order written.
+        if len(name) > 1 and all(ch in fields for ch in name):
+            return tuple(fields[ch] for ch in name)
+        raise AttributeError(name)
 
     def tensors(self) -> tuple[ArrayT, ArrayT]:
-        """Returns ``(X, y)``: features stacked into ``(n, d)``, target ``(n,)``.
-
-        The stack runs on the backend's device — no host round-trip for the
-        native backends.
-        """
-        X = _stack([self._arrays[name] for name in self.feature_names], self.backend)
-        y = self._arrays[self.target_name]
-        return X, y
+        """Sugar returning ``(self["X"], self["y"])`` for the classic case."""
+        try:
+            return self._fields["X"], self._fields["y"]
+        except KeyError as exc:
+            missing = exc.args[0]
+            raise AttributeError(
+                f"tensors() requires fields 'X' and 'y'; field {missing!r} not found "
+                f"(available: {sorted(self._fields)})"
+            ) from None
 
     def batches(
         self,
@@ -287,7 +350,7 @@ class Fold(Generic[ArrayT]):
     ) -> Iterator[tuple[ArrayT, ArrayT]]:
         """Yield ``(X_batch, y_batch)`` slices of ``self.tensors()``.
 
-        Materialises the fold into one ``(X, y)`` pair up front (cheap — same
+        Materialises the fold's ``X``/``y`` fields once up front (cheap — same
         memory as ``tensors()``); each batch is then a gather along axis 0 in
         the dataset's backend. The shuffle permutation is always computed on
         the host (cheap, deterministic) and applied as a backend gather.
@@ -312,10 +375,8 @@ class Fold(Generic[ArrayT]):
             yield _gather(X, idx, self.backend), _gather(y, idx, self.backend)
 
     def __repr__(self) -> str:
-        return (
-            f"Fold(n_rows={self.n_rows}, backend={self.backend!r}, "
-            f"features={self.feature_names!r}, target={self.target_name!r})"
-        )
+        shapes = ", ".join(f"{n}={tuple(a.shape)}" for n, a in self._fields.items())
+        return f"Fold(n_rows={self.n_rows}, backend={self.backend!r}, {shapes})"
 
 
 @dataclass
@@ -335,6 +396,7 @@ class Dataset(Generic[ArrayT]):
     """
 
     folds: dict[str, Fold[ArrayT]]
+    field_specs: dict[str, Field] = field(default_factory=dict)
 
     @property
     def train(self) -> Fold[ArrayT] | None:
@@ -349,19 +411,31 @@ class Dataset(Generic[ArrayT]):
         return self.folds.get("test")
 
     @property
+    def field_names(self) -> list[str]:
+        return list(self.field_specs)
+
+    @property
     def feature_names(self) -> list[str]:
-        return next(iter(self.folds.values())).feature_names
+        """Column names of the ``"X"`` matrix field (legacy shorthand path)."""
+        spec = self.field_specs.get("X")
+        if isinstance(spec, Matrix):
+            return list(spec.columns)
+        raise AttributeError("feature_names is only defined when field 'X' is a Matrix")
 
     @property
     def target_name(self) -> str:
-        return next(iter(self.folds.values())).target_name
+        """The expression of the ``"y"`` vector field (legacy shorthand path)."""
+        spec = self.field_specs.get("y")
+        if isinstance(spec, Vector):
+            return spec.expr
+        raise AttributeError("target_name is only defined when field 'y' is a Vector")
 
     def __getitem__(self, name: str) -> Fold[ArrayT]:
         return self.folds[name]
 
     def __repr__(self) -> str:
         parts = ", ".join(f"{name}={f.n_rows}" for name, f in self.folds.items())
-        return f"Dataset({parts} rows, features={self.feature_names!r})"
+        return f"Dataset({parts} rows, fields={list(self.field_specs)!r})"
 
 
 # ── SQL compiler ───────────────────────────────────────────────────────────
@@ -387,25 +461,52 @@ def _fold_ranges(fractions: dict[str, float]) -> list[tuple[str, int, int]]:
     return ranges
 
 
+def _iter_field_columns(
+    fields: dict[str, Field],
+) -> Iterator[tuple[str, str, Feature | Vector]]:
+    """Yield ``(alias, field_name, spec)`` for every materialised column.
+
+    Vectors map to a single column whose alias is the field name; each matrix
+    column ``c`` maps to alias ``{field_name}__{c}`` and its inner Feature.
+    """
+    for field_name, spec in fields.items():
+        if isinstance(spec, Vector):
+            yield field_name, field_name, spec
+        else:
+            for col_name, feat in spec.columns.items():
+                yield f"{field_name}__{col_name}", field_name, feat
+
+
 def _compile_sql(
     source: str,
-    columns: dict[str, Feature],
-    target_spec: Target,
+    fields: dict[str, Field],
     drop_nulls: list[str] | None,
     split_spec: Split | None,
-) -> tuple[str, list[str], str, list[tuple[str, int, int]]]:
+) -> tuple[str, list[tuple[str, int, int]]]:
     """Compile a dataset spec into one SQL query.
 
-    Returns ``(sql, feature_names, target_name, fold_ranges)``. The query emits
-    one row per source row, with feature columns + ``_y`` + ``_bucket`` (in
-    ``[0, _N_BUCKETS)``). Standardisation, when requested, references a
-    ``stats`` CTE computed against the ``"train"`` fold only — never the full
-    dataset.
+    Returns ``(sql, fold_ranges)``. The query emits one row per source row,
+    with one column per (matrix-column / vector) field-qualified alias, plus
+    ``_bucket`` (in ``[0, _N_BUCKETS)``). Standardisation, when requested,
+    references a ``stats`` CTE computed against the ``"train"`` fold only —
+    never the full dataset.
     """
     if not isinstance(source, str):
         raise NotImplementedError("source must be a string URL/path in this sketch")
+    if not fields:
+        raise ValueError("at least one field is required")
+
+    columns = list(_iter_field_columns(fields))
     if not columns:
-        raise ValueError("at least one feature column is required")
+        raise ValueError("fields must contain at least one column")
+
+    aliases = [a for a, _, _ in columns]
+    if len(set(aliases)) != len(aliases):
+        # Aliases are derived from field + sub-column names; collisions only
+        # occur if the user picks a sub-column name with a "__" separator that
+        # mirrors another field's name. Surface it explicitly.
+        dupes = sorted({a for a in aliases if aliases.count(a) > 1})
+        raise ValueError(f"duplicate field/column aliases: {dupes}")
 
     from_clause = f"'{source}'"
 
@@ -421,7 +522,7 @@ def _compile_sql(
     )
     raw_sql = f"SELECT *, {bucket_expr} AS _bucket FROM {from_clause}{null_filter}"
 
-    needs_stats = any(f.standardize for f in columns.values())
+    needs_stats = any(spec.standardize for _, _, spec in columns)
     if needs_stats:
         train_range = next((r for r in ranges if r[0] == "train"), None)
         if train_range is None:
@@ -432,10 +533,10 @@ def _compile_sql(
         _, train_lo, train_hi = train_range
         is_train = f"_bucket >= {train_lo} AND _bucket < {train_hi}"
         stats_cols: list[str] = []
-        for name, feat in columns.items():
-            if feat.standardize:
-                stats_cols.append(f"avg({feat.expr}) AS _{name}_mean")
-                stats_cols.append(f"stddev_pop({feat.expr}) AS _{name}_std")
+        for alias, _, spec in columns:
+            if spec.standardize:
+                stats_cols.append(f"avg({spec.expr}) AS _{alias}_mean")
+                stats_cols.append(f"stddev_pop({spec.expr}) AS _{alias}_std")
         stats_sql = f"SELECT {', '.join(stats_cols)} FROM raw WHERE {is_train}"
         ctes = f"WITH raw AS ({raw_sql}), stats AS ({stats_sql})"
         from_outer = "raw, stats"
@@ -444,28 +545,56 @@ def _compile_sql(
         from_outer = "raw"
 
     select_items: list[str] = []
-    for name, feat in columns.items():
-        if feat.standardize:
-            expr = f"({feat.expr} - stats._{name}_mean) / stats._{name}_std"
+    for alias, _, spec in columns:
+        if spec.standardize:
+            expr = f"({spec.expr} - stats._{alias}_mean) / stats._{alias}_std"
         else:
-            expr = feat.expr
-        select_items.append(f"CAST({expr} AS {_to_duckdb_dtype(feat.dtype)}) AS {name}")
-    select_items.append(f"CAST({target_spec.expr} AS {_to_duckdb_dtype(target_spec.dtype)}) AS _y")
+            expr = spec.expr
+        select_items.append(f"CAST({expr} AS {_to_duckdb_dtype(spec.dtype)}) AS {alias}")
     select_items.append("CAST(_bucket AS BIGINT) AS _bucket")
 
     sql = f"{ctes} SELECT {', '.join(select_items)} FROM {from_outer}"
-    return sql, list(columns.keys()), "_y", ranges
+    return sql, ranges
+
+
+def _assemble_field(name: str, spec: Field, columns_data: dict[str, Any], backend: Backend) -> Any:
+    """Stack a matrix field's columns / return a vector field's lone column."""
+    if isinstance(spec, Vector):
+        return columns_data[name]
+    cols = [columns_data[f"{name}__{c}"] for c in spec.columns]
+    return _stack(cols, backend)
 
 
 # ── Public API ─────────────────────────────────────────────────────────────
+
+
+def _normalize_fields(
+    fields: dict[str, Field] | None,
+    columns: dict[str, Feature] | None,
+    target_spec: Target | None,
+) -> dict[str, Field]:
+    """Resolve the ``fields=`` / ``columns=``+``target=`` alternatives."""
+    if fields is not None:
+        if columns is not None or target_spec is not None:
+            raise ValueError("pass either fields= or columns=/target=, not both")
+        if not fields:
+            raise ValueError("fields must contain at least one entry")
+        return dict(fields)
+    if columns is None or target_spec is None:
+        raise ValueError("either fields= or both columns= and target= are required")
+    return {
+        "X": matrix(columns),
+        "y": Vector(expr=target_spec.expr, dtype=target_spec.dtype),
+    }
 
 
 @overload
 def dataset(
     source: str,
     *,
-    columns: dict[str, Feature],
-    target: Target,
+    fields: dict[str, Field] | None = ...,
+    columns: dict[str, Feature] | None = ...,
+    target: Target | None = ...,
     drop_nulls: list[str] | None = ...,
     split: Split | None = ...,
     con: Connection | None = ...,
@@ -476,8 +605,9 @@ def dataset(
 def dataset(
     source: str,
     *,
-    columns: dict[str, Feature],
-    target: Target,
+    fields: dict[str, Field] | None = ...,
+    columns: dict[str, Feature] | None = ...,
+    target: Target | None = ...,
     drop_nulls: list[str] | None = ...,
     split: Split | None = ...,
     con: Connection | None = ...,
@@ -488,8 +618,9 @@ def dataset(
 def dataset(
     source: str,
     *,
-    columns: dict[str, Feature],
-    target: Target,
+    fields: dict[str, Field] | None = ...,
+    columns: dict[str, Feature] | None = ...,
+    target: Target | None = ...,
     drop_nulls: list[str] | None = ...,
     split: Split | None = ...,
     con: Connection | None = ...,
@@ -500,8 +631,9 @@ def dataset(
 def dataset(
     source: str,
     *,
-    columns: dict[str, Feature],
-    target: Target,
+    fields: dict[str, Field] | None = ...,
+    columns: dict[str, Feature] | None = ...,
+    target: Target | None = ...,
     drop_nulls: list[str] | None = ...,
     split: Split | None = ...,
     con: Connection | None = ...,
@@ -512,8 +644,9 @@ def dataset(
 def dataset(
     source: str,
     *,
-    columns: dict[str, Feature],
-    target: Target,
+    fields: dict[str, Field] | None = ...,
+    columns: dict[str, Feature] | None = ...,
+    target: Target | None = ...,
     drop_nulls: list[str] | None = ...,
     split: Split | None = ...,
     con: Connection | None = ...,
@@ -523,8 +656,9 @@ def dataset(
 def dataset(
     source: str,
     *,
-    columns: dict[str, Feature],
-    target: Target,
+    fields: dict[str, Field] | None = None,
+    columns: dict[str, Feature] | None = None,
+    target: Target | None = None,
     drop_nulls: list[str] | None = None,
     split: Split | None = None,
     con: Connection | None = None,
@@ -535,6 +669,12 @@ def dataset(
 
     ``source`` is a string passed straight into ``FROM '…'`` — URL, local path,
     or anything DuckDB's auto-detection can read (CSV, Parquet, JSON, …).
+
+    The dataset shape is described by ``fields`` — a dict mapping each output
+    field name to either a :class:`Matrix` (several stacked feature columns) or
+    a :class:`Vector` (one column). For the classic single-features /
+    single-target case, ``columns=`` and ``target=`` are kept as shorthand that
+    desugar to ``fields={"X": matrix(columns), "y": vector(target)}``.
 
     ``backend`` selects the array library each fold is materialised into —
     ``"numpy"`` (default), ``"jax"``, ``"torch"`` or ``"mlx"`` — and fixes the
@@ -550,9 +690,9 @@ def dataset(
     if device is not None and backend in _NO_DEVICE:
         raise ValueError(f"backend {backend!r} does not take a device argument")
 
-    sql, feature_names, target_name, ranges = _compile_sql(
-        source, columns, target, drop_nulls, split
-    )
+    field_specs = _normalize_fields(fields, columns, target)
+
+    sql, ranges = _compile_sql(source, field_specs, drop_nulls, split)
     own_connection = con is None
     if own_connection:
         con = connect()
@@ -571,5 +711,9 @@ def dataset(
     for name, lo, hi in ranges:
         idx = np.nonzero((bucket >= lo) & (bucket < hi))[0]
         gathered = {k: _gather(v, idx, backend) for k, v in columns_data.items()}
-        folds[name] = Fold(feature_names, target_name, backend, gathered)
-    return Dataset(folds=folds)
+        assembled = {
+            field_name: _assemble_field(field_name, spec, gathered, backend)
+            for field_name, spec in field_specs.items()
+        }
+        folds[name] = Fold(backend=backend, _fields=assembled)
+    return Dataset(folds=folds, field_specs=field_specs)

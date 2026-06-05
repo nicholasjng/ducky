@@ -24,12 +24,16 @@ from ._dataset import (
     Dataset,
     Feature,
     Fold,
+    Matrix,
     Split,
     Target,
+    Vector,
     dataset,
     feature,
+    matrix,
     split,
     target,
+    vector,
 )
 from ._progress import progress_bar
 from ._typing import DuckDBConfig
@@ -78,18 +82,22 @@ __all__ = [
     "Error",
     "Feature",
     "Fold",
+    "Matrix",
     "PreparedStatement",
     "Result",
     "Split",
     "Target",
+    "Vector",
     "__duckdb_version__",
     "config_options",
     "connect",
     "dataset",
     "feature",
+    "matrix",
     "progress_bar",
     "split",
     "target",
+    "vector",
 ]
 
 __version__ = "0.1.0"

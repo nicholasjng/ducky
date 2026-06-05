@@ -185,7 +185,157 @@ def test_no_leak_train_stats_into_val(csv_path):
     )
     assert ds.train is not None and ds.val is not None
     # Train mean of standardised x must be ~0 (by construction).
-    assert abs(ds.train.arrays["x"].mean()) < 1e-5
+    assert abs(ds.train["X"][:, 0].mean()) < 1e-5
     # Val mean is also small but distinct from train's exact zero — a
     # sentinel for "we used train-only stats" rather than "we used all rows".
-    assert abs(ds.val.arrays["x"].mean()) < 0.2
+    assert abs(ds.val["X"][:, 0].mean()) < 0.2
+
+
+# ── Named fields API ──────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def weighted_csv_path(tmp_path):
+    """Like csv_path but with a `w` sample-weight column and a `gid` group id."""
+    p = tmp_path / "weighted.csv"
+    rng = np.random.default_rng(0)
+    n = 1000
+    x = rng.normal(size=n)
+    y = (x > 0).astype(int)
+    w = rng.uniform(0.5, 1.5, size=n)
+    gid = rng.integers(0, 10, size=n)
+    lines = [f"{xi},{yi},{wi},{gi}" for xi, yi, wi, gi in zip(x, y, w, gid, strict=True)]
+    p.write_text("x,y,w,gid\n" + "\n".join(lines))
+    return str(p)
+
+
+def test_fields_named_outputs(weighted_csv_path):
+    # The full fields= API: an X matrix, y label vector, sample-weight vector,
+    # and a passthrough id vector — each materialised as its own field.
+    ds = ducky.dataset(
+        weighted_csv_path,
+        fields={
+            "X": ducky.matrix({"x": ducky.feature("x", standardize=True)}),
+            "y": ducky.vector("y", dtype="i64"),
+            "w": ducky.vector("w"),
+            "ids": ducky.vector("gid", dtype="i64"),
+        },
+        split=ducky.split(0.8, seed=0),
+    )
+    train = ds.train
+    assert train is not None
+    assert train["X"].shape == (train.n_rows, 1)
+    assert train["y"].shape == (train.n_rows,)
+    assert train["w"].shape == (train.n_rows,)
+    assert train["ids"].shape == (train.n_rows,)
+    # tensors() sugar still works because X and y are present.
+    Xtr, ytr = train.tensors()
+    np.testing.assert_array_equal(np.asarray(Xtr), np.asarray(train["X"]))
+    np.testing.assert_array_equal(np.asarray(ytr), np.asarray(train["y"]))
+
+
+def test_fields_attr_access_and_swizzle(weighted_csv_path):
+    ds = ducky.dataset(
+        weighted_csv_path,
+        fields={
+            "X": ducky.matrix({"x": ducky.feature("x")}),
+            "y": ducky.vector("y", dtype="i64"),
+            "w": ducky.vector("w"),
+        },
+        split=ducky.split(0.8, seed=0),
+    )
+    train = ds.train
+    assert train is not None
+    # Attribute access: single-char field name → array.
+    np.testing.assert_array_equal(train.X, train["X"])
+    np.testing.assert_array_equal(train.y, train["y"])
+    # Swizzle: multi-char attribute is split into one field per char.
+    X, y = train.Xy
+    np.testing.assert_array_equal(X, train["X"])
+    np.testing.assert_array_equal(y, train["y"])
+    X, y, w = train.Xyw
+    np.testing.assert_array_equal(w, train["w"])
+    # Unknown field is an AttributeError, not a silent miss.
+    with pytest.raises(AttributeError):
+        _ = train.Z
+
+
+def test_multi_column_matrix_stack_order(weighted_csv_path):
+    ds = ducky.dataset(
+        weighted_csv_path,
+        fields={
+            "X": ducky.matrix(
+                {
+                    "a": ducky.feature("x"),
+                    "b": ducky.feature("w"),
+                    "c": ducky.feature("gid", dtype="f32"),
+                }
+            ),
+            "y": ducky.vector("y", dtype="i64"),
+        },
+        split=ducky.split(0.8, seed=0),
+    )
+    train = ds.train
+    assert train is not None
+    X = train["X"]
+    assert X.shape == (train.n_rows, 3)
+    # Column order in X matches declaration order in the matrix spec.
+    ref = ducky.dataset(
+        weighted_csv_path,
+        fields={
+            "a": ducky.vector("x"),
+            "b": ducky.vector("w"),
+            "c": ducky.vector("gid", dtype="f32"),
+            "y": ducky.vector("y", dtype="i64"),
+        },
+        split=ducky.split(0.8, seed=0),
+    )
+    rtrain = ref.train
+    assert rtrain is not None
+    np.testing.assert_allclose(X[:, 0], rtrain["a"])
+    np.testing.assert_allclose(X[:, 1], rtrain["b"])
+    np.testing.assert_allclose(X[:, 2], rtrain["c"])
+
+
+def test_standardize_on_vector_field(weighted_csv_path):
+    ds = ducky.dataset(
+        weighted_csv_path,
+        fields={
+            "X": ducky.matrix({"x": ducky.feature("x")}),
+            "y": ducky.vector("y", dtype="f32", standardize=True),
+        },
+        split=ducky.split(0.8, seed=0),
+    )
+    assert ds.train is not None
+    # Standardised y over the train fold has mean ~0.
+    assert abs(np.asarray(ds.train["y"]).mean()) < 1e-5
+
+
+def test_fields_and_columns_mutually_exclusive(csv_path):
+    with pytest.raises(ValueError, match="either fields=|not both"):
+        ducky.dataset(
+            csv_path,
+            fields={"X": ducky.matrix({"x": ducky.feature("x")}), "y": ducky.vector("y")},
+            columns={"x": ducky.feature("x")},
+            target=ducky.target("y"),
+        )
+
+
+def test_dataset_requires_some_spec(csv_path):
+    with pytest.raises(ValueError, match="fields=|columns="):
+        ducky.dataset(csv_path)
+
+
+def test_empty_matrix_rejected():
+    with pytest.raises(ValueError, match="at least one column"):
+        ducky.matrix({})
+
+
+def test_tensors_requires_X_and_y(weighted_csv_path):
+    ds = ducky.dataset(
+        weighted_csv_path,
+        fields={"a": ducky.vector("x"), "b": ducky.vector("y", dtype="i64")},
+    )
+    assert ds.train is not None
+    with pytest.raises(AttributeError, match="tensors\\(\\) requires"):
+        ds.train.tensors()

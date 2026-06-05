@@ -150,7 +150,7 @@ Legend: ✅ shipped · 🟡 partially shipped · ⬜ not started.
 
 ## Dataset / feature API
 
-- ⬜ **Named output fields (beyond a single `X` / `y`).** `ducky.dataset()`
+- ✅ **Named output fields (beyond a single `X` / `y`).** `ducky.dataset()`
   today materialises exactly two output arrays per fold — features stacked into
   `X` and the target column as `y` (`Fold.tensors()`). The split,
   standardisation (train-fold stats) and backend materialisation already operate
@@ -197,6 +197,10 @@ Legend: ✅ shipped · 🟡 partially shipped · ⬜ not started.
     desugars to `fields={"X": matrix(columns), "y": vector(target)}`, and
     `Fold.tensors()` as sugar returning `(self["X"], self["y"])` when both exist
     — so existing call sites and the Titanic examples stay untouched.
+  - **Vector-style swizzle.** `Fold.__getattr__` lets you read a single field as
+    an attribute (`fold.X`, `fold.y`) and splits a multi-char attribute into one
+    field per character when each char is a one-char field name — so
+    `Xtr, ytr = ds.train.Xy` unpacks the classic split without quoting strings.
 
 ## QOL improvements
 
