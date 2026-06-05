@@ -306,3 +306,277 @@ def test_works_across_chunk_boundaries():
     )
     arr = con.sql(f"SELECT sq(i) AS v FROM range({n}) t(i)").to_numpy()["v"]
     np.testing.assert_array_equal(arr, np.arange(n, dtype=np.int64) ** 2)
+
+
+# ── volatile / special_handling / init=state ─────────────────────────────────
+
+
+def test_volatile_function_runs():
+    # Smoke test: volatile=True registers and a query against the function runs.
+    con = ducky.connect()
+    con.create_function(
+        "vmul",
+        lambda x: x * 2.0,
+        parameters=["DOUBLE"],
+        return_type="DOUBLE",
+        volatile=True,
+    )
+    [(v,)] = con.sql("SELECT vmul(CAST(3.0 AS DOUBLE))").fetchall()
+    assert v == 6.0
+
+
+def test_volatile_not_constant_folded():
+    # Two calls with the same literal argument should both invoke the UDF when
+    # marked volatile — without volatile the optimizer is free to evaluate it
+    # once and reuse the result (common subexpression elimination).
+    con = ducky.connect()
+    calls = [0]
+
+    def stamp(x):
+        calls[0] += 1
+        return np.full_like(x, calls[0], dtype=np.int64)
+
+    con.create_function(
+        "stamp",
+        stamp,
+        parameters=["BIGINT"],
+        return_type="BIGINT",
+        volatile=True,
+    )
+    [(a, b)] = con.sql(
+        "SELECT stamp(CAST(1 AS BIGINT)) AS a, stamp(CAST(1 AS BIGINT)) AS b"
+    ).fetchall()
+    assert a != b  # would be equal if the optimizer had folded the two calls
+
+
+def test_special_handling_observes_null_input():
+    # With special_handling=True, the UDF sees the input mask and can produce
+    # a non-NULL output even where the input is NULL — here, coalesce to 0.
+    con = ducky.connect()
+    con.execute("CREATE TABLE t (x BIGINT)")
+    con.execute("INSERT INTO t VALUES (1), (NULL), (3)")
+
+    seen_masks = []
+
+    def coalesce_zero(x):
+        values, mask = x
+        seen_masks.append(mask.copy())
+        out = values.copy()
+        out[mask == 0] = 0
+        return out
+
+    con.create_function(
+        "coalesce0",
+        coalesce_zero,
+        parameters=["BIGINT"],
+        return_type="BIGINT",
+        special_handling=True,
+    )
+    rows = con.sql("SELECT coalesce0(x) FROM t ORDER BY x NULLS LAST").fetchall()
+    assert rows == [(1,), (3,), (0,)]
+    # The UDF actually saw at least one NULL slot via the mask.
+    assert any((m == 0).any() for m in seen_masks)
+
+
+def test_special_handling_all_valid_mask():
+    # With no NULL inputs, the mask passed in must be all-1.
+    con = ducky.connect()
+    seen = []
+
+    def echo(x):
+        values, mask = x
+        seen.append(mask.copy())
+        return values
+
+    con.create_function(
+        "echo",
+        echo,
+        parameters=["BIGINT"],
+        return_type="BIGINT",
+        special_handling=True,
+    )
+    con.sql("SELECT echo(i) FROM range(8) t(i)").fetchall()
+    assert seen and (seen[0] == 1).all()
+
+
+def test_special_handling_dict_style():
+    # Dict-style input under special_handling: each value in the kwargs dict is
+    # a (values, mask) tuple keyed by the parameter name.
+    con = ducky.connect()
+    con.execute("CREATE TABLE t (a BIGINT, b BIGINT)")
+    con.execute("INSERT INTO t VALUES (1, 10), (NULL, 20), (3, NULL)")
+
+    def add_or_zero(kwargs):
+        av, am = kwargs["a"]
+        bv, bm = kwargs["b"]
+        out = np.where(am == 0, 0, av) + np.where(bm == 0, 0, bv)
+        return out.astype(np.int64)
+
+    con.create_function(
+        "add_or_zero",
+        add_or_zero,
+        parameters={"a": "BIGINT", "b": "BIGINT"},
+        return_type="BIGINT",
+        special_handling=True,
+    )
+    rows = con.sql("SELECT add_or_zero(a, b) FROM t ORDER BY a NULLS LAST, b NULLS LAST").fetchall()
+    assert rows == [(11,), (3,), (20,)]
+
+
+def test_init_state_threads_through_call():
+    # The init= callable runs once per worker thread; its return value is
+    # passed as the first positional arg of the UDF on every chunk.
+    con = ducky.connect()
+
+    def factory():
+        return {"calls": 0}
+
+    def stamp(state, x):
+        state["calls"] += 1
+        return np.full_like(x, state["calls"], dtype=np.int64)
+
+    con.create_function(
+        "stamp",
+        stamp,
+        parameters=["BIGINT"],
+        return_type="BIGINT",
+        init=factory,
+        volatile=True,
+    )
+    rows = con.sql("SELECT stamp(i) FROM range(8) t(i)").fetchall()
+    # Single chunk in a small range; state increments to 1 for every row.
+    assert {r[0] for r in rows} == {1}
+
+
+def test_init_state_persists_across_chunks():
+    # With >STANDARD_VECTOR_SIZE rows DuckDB emits multiple chunks; per-thread
+    # state must persist so the counter keeps incrementing.
+    n = 5000
+    con = ducky.connect("", threads=1)
+
+    def factory():
+        return [0]
+
+    def stamp(state, x):
+        state[0] += 1
+        return np.full_like(x, state[0], dtype=np.int64)
+
+    con.create_function(
+        "stamp",
+        stamp,
+        parameters=["BIGINT"],
+        return_type="BIGINT",
+        init=factory,
+        volatile=True,
+    )
+    arr = con.sql(f"SELECT stamp(i) AS v FROM range({n}) t(i)").to_numpy()["v"]
+    # The counter must reach > 1 — at least one chunk boundary was crossed.
+    assert arr.max() > 1
+
+
+def test_init_state_dict_style():
+    # init= + dict-style parameters: fn is called as fn(state, kwargs).
+    con = ducky.connect()
+
+    def factory():
+        return {"mult": 10}
+
+    def mult(state, kwargs):
+        return kwargs["x"] * state["mult"]
+
+    con.create_function(
+        "mult",
+        mult,
+        parameters={"x": "BIGINT"},
+        return_type="BIGINT",
+        init=factory,
+    )
+    rows = con.sql("SELECT mult(i) FROM range(3) t(i)").fetchall()
+    assert rows == [(0,), (10,), (20,)]
+
+
+def test_init_state_with_varargs():
+    # init= + varargs: fn(state, *cols).
+    con = ducky.connect()
+
+    def factory():
+        return 100
+
+    def add_all(state, *cols):
+        return sum(c.astype(np.int64) for c in cols) + state
+
+    con.create_function(
+        "add_all",
+        add_all,
+        varargs="INTEGER",
+        return_type="BIGINT",
+        init=factory,
+    )
+    [(v,)] = con.sql("SELECT add_all(CAST(1 AS INTEGER), CAST(2 AS INTEGER))").fetchall()
+    assert v == 103
+
+
+def test_init_error_propagates():
+    # A failure in init= must surface as a query error, not a silent crash.
+    con = ducky.connect()
+
+    def bad_factory():
+        raise RuntimeError("init failure")
+
+    def use_state(state, x):
+        return x
+
+    con.create_function(
+        "use_state",
+        use_state,
+        parameters=["BIGINT"],
+        return_type="BIGINT",
+        init=bad_factory,
+    )
+    with pytest.raises(ducky.Error, match="init failure"):
+        con.sql("SELECT use_state(i) FROM range(3) t(i)").fetchall()
+
+
+def test_init_not_callable_rejected():
+    con = ducky.connect()
+    with pytest.raises(ducky.Error, match="init= must be a callable"):
+        con.create_function(
+            "f",
+            lambda x: x,
+            parameters=["BIGINT"],
+            return_type="BIGINT",
+            init=42,  # ty: ignore[invalid-argument-type]
+        )
+
+
+def test_special_handling_state_and_mask_combine():
+    # All three features together: a stateful UDF that observes NULL inputs.
+    con = ducky.connect()
+    con.execute("CREATE TABLE t (x BIGINT)")
+    con.execute("INSERT INTO t VALUES (1), (NULL), (3), (NULL), (5)")
+
+    def factory():
+        return [0]  # count of NULLs seen across this thread's lifetime
+
+    def fill_with_null_count(state, x):
+        values, mask = x
+        state[0] += int((mask == 0).sum())
+        out = values.copy()
+        out[mask == 0] = state[0]
+        return out
+
+    con.create_function(
+        "fillnc",
+        fill_with_null_count,
+        parameters=["BIGINT"],
+        return_type="BIGINT",
+        init=factory,
+        special_handling=True,
+        volatile=True,
+    )
+    rows = sorted(r[0] for r in con.sql("SELECT fillnc(x) FROM t").fetchall())
+    # Non-null values pass through (1, 3, 5); the two NULL slots get the
+    # running NULL count (the exact replacement depends on chunk ordering,
+    # but at least one of the NULL-replaced rows must reflect a count >= 1).
+    assert {1, 3, 5}.issubset(set(rows))
+    assert any(r >= 1 and r not in (1, 3, 5) for r in rows)

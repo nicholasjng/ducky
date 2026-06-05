@@ -108,7 +108,8 @@ std::string infer_return_type(nb::callable fn) {
 // Lives in DuckDB's extra_info slot; carries everything the trampoline needs to
 // dispatch one chunk of input to the user's callable.
 struct UDFContext {
-    nb::callable callable;  // owns the Python ref
+    nb::callable callable;       // owns the Python ref
+    nb::callable init_callable;  // optional per-worker-thread state factory
     // If non-empty: dict-style — callable receives one dict {name: ndarray}.
     // If empty: positional — callable receives ndarrays as positional args.
     std::vector<std::string> param_names;
@@ -117,12 +118,64 @@ struct UDFContext {
     // When set, the function takes a variable number of arguments, all of this
     // type. `param_types` is ignored; arity is read from the input chunk.
     const TypeSpec* varargs_type = nullptr;
+    // NULL-aware: each input arg is delivered as a (values, mask) tuple, where
+    // `mask` is a 1-D uint8 ndarray (1=valid, 0=NULL). Output may emit NULLs
+    // via the same (values, mask) return convention.
+    bool special_handling = false;
+};
+
+// Per-worker-thread state for a stateful UDF. Holds the Python object returned
+// by the user's init=callable; freed under GIL at thread teardown.
+struct UDFState {
+    nb::object obj;
 };
 
 void udf_extra_info_destroy(void* ptr) {
     if (!ptr) return;
     nb::gil_scoped_acquire gil;
     delete static_cast<UDFContext*>(ptr);
+}
+
+void udf_state_destroy(void* ptr) {
+    if (!ptr) return;
+    nb::gil_scoped_acquire gil;
+    delete static_cast<UDFState*>(ptr);
+}
+
+// Called once per worker thread when the UDF starts executing. Builds the
+// per-thread state by invoking the user's init=callable.
+void udf_init_trampoline(duckdb_init_info info) {
+    auto* ctx = static_cast<UDFContext*>(duckdb_scalar_function_init_get_extra_info(info));
+    nb::gil_scoped_acquire gil;
+    try {
+        nb::object state = ctx->init_callable();
+        auto* holder = new UDFState{std::move(state)};
+        duckdb_scalar_function_init_set_state(info, holder, &udf_state_destroy);
+    } catch (nb::python_error& e) {
+        std::string msg = std::string("ducky UDF init error: ") + e.what();
+        duckdb_scalar_function_init_set_error(info, msg.c_str());
+    } catch (const std::exception& e) {
+        std::string msg = std::string("ducky UDF init error: ") + e.what();
+        duckdb_scalar_function_init_set_error(info, msg.c_str());
+    }
+}
+
+// Build a uint8 ndarray view (1=valid, 0=NULL) over `mask_buf` for vector `v`.
+// `mask_buf` must outlive the returned ndarray (the trampoline owns it for the
+// duration of the user's callable).
+nb::object build_input_mask(duckdb_vector v, idx_t n, std::vector<uint8_t>& mask_buf) {
+    mask_buf.resize(n);
+    uint64_t* validity = duckdb_vector_get_validity(v);
+    if (!validity) {
+        std::memset(mask_buf.data(), 1, n);
+    } else {
+        for (idx_t i = 0; i < n; ++i) {
+            mask_buf[i] = duckdb_validity_row_is_valid(validity, i) ? 1 : 0;
+        }
+    }
+    size_t shape[1] = {(size_t)n};
+    return nb::cast(nb::ndarray<nb::numpy, nb::ro>(mask_buf.data(), 1, shape, nb::handle(), nullptr,
+                                                   nb::dtype<uint8_t>()));
 }
 
 // Forwards a C++ or Python exception as a DuckDB UDF error string.
@@ -139,32 +192,44 @@ void udf_trampoline(duckdb_function_info info, duckdb_data_chunk input, duckdb_v
     idx_t n_params =
         ctx->varargs_type ? duckdb_data_chunk_get_column_count(input) : ctx->param_types.size();
     size_t shape[1] = {(size_t)n};
+    // Per-arg mask scratch buffers; sized only when special_handling is set.
+    // The (values, mask) ndarrays handed to the callable view this storage, so
+    // it must live until the callable returns.
+    std::vector<std::vector<uint8_t>> mask_bufs(ctx->special_handling ? n_params : 0);
 
     guard(
         [&] {
             // Build input ndarray views over the chunk's vectors. Owner is empty:
             // the arrays are valid only for the duration of this call. Capturing
             // them past the call is undefined — same hazard as Chunk.column views.
+            auto build_values = [&](idx_t i) {
+                duckdb_vector v = duckdb_data_chunk_get_vector(input, i);
+                void* data = duckdb_vector_get_data(v);
+                const TypeSpec* t = ctx->varargs_type ? ctx->varargs_type : ctx->param_types[i];
+                nb::object values = nb::cast(nb::ndarray<nb::numpy, nb::ro>(
+                    data, 1, shape, nb::handle(), nullptr, t->dtype()));
+                if (!ctx->special_handling) return values;
+                nb::object mask = build_input_mask(v, n, mask_bufs[i]);
+                return (nb::object)nb::make_tuple(values, mask);
+            };
+
+            // Per-worker-thread state set by init=callable; borrowed reference
+            // (the holder owns it until thread teardown).
+            auto* state_holder = static_cast<UDFState*>(duckdb_scalar_function_get_state(info));
+            nb::handle state = state_holder ? nb::handle(state_holder->obj) : nb::handle();
+
             nb::object result;
             if (ctx->param_names.empty()) {
                 nb::list args;
-                for (idx_t i = 0; i < n_params; ++i) {
-                    duckdb_vector v = duckdb_data_chunk_get_vector(input, i);
-                    void* data = duckdb_vector_get_data(v);
-                    const TypeSpec* t = ctx->varargs_type ? ctx->varargs_type : ctx->param_types[i];
-                    args.append(nb::ndarray<nb::numpy, nb::ro>(data, 1, shape, nb::handle(),
-                                                               nullptr, t->dtype()));
-                }
+                if (state) args.append(state);
+                for (idx_t i = 0; i < n_params; ++i) args.append(build_values(i));
                 result = ctx->callable(*nb::tuple(args));
             } else {
                 nb::dict kwargs;
                 for (idx_t i = 0; i < n_params; ++i) {
-                    duckdb_vector v = duckdb_data_chunk_get_vector(input, i);
-                    void* data = duckdb_vector_get_data(v);
-                    kwargs[ctx->param_names[i].c_str()] = nb::ndarray<nb::numpy, nb::ro>(
-                        data, 1, shape, nb::handle(), nullptr, ctx->param_types[i]->dtype());
+                    kwargs[ctx->param_names[i].c_str()] = build_values(i);
                 }
-                result = ctx->callable(kwargs);
+                result = state ? ctx->callable(state, kwargs) : ctx->callable(kwargs);
             }
 
             // The UDF may return either an ndarray of values, or a (values, mask)
@@ -407,7 +472,8 @@ const TypeSpec* typespec_for(duckdb_type type) {
 }
 
 void create_scalar_function(Connection& con, const std::string& name, nb::callable fn,
-                            nb::object parameters, nb::object return_type, nb::object varargs) {
+                            nb::object parameters, nb::object return_type, nb::object varargs,
+                            nb::object init, bool is_volatile, bool special_handling) {
     auto ctx = std::make_unique<UDFContext>();
     bool has_varargs = !varargs.is_none();
     if (has_varargs && !parameters.is_none()) {
@@ -418,6 +484,14 @@ void create_scalar_function(Connection& con, const std::string& name, nb::callab
         return_type.is_none() ? infer_return_type(fn) : nb::cast<std::string>(return_type);
     ctx->callable = std::move(fn);
     ctx->return_type = &lookup(rt_name);
+    ctx->special_handling = special_handling;
+    if (!init.is_none()) {
+        try {
+            ctx->init_callable = nb::cast<nb::callable>(init);
+        } catch (const nb::cast_error&) {
+            throw DuckyError("ducky: UDF '" + name + "' init= must be a callable");
+        }
+    }
 
     if (has_varargs) {
         ctx->varargs_type = &lookup(nb::cast<std::string>(varargs));
@@ -453,6 +527,9 @@ void create_scalar_function(Connection& con, const std::string& name, nb::callab
     duckdb_scalar_function_set_return_type(f, rt);
     duckdb_destroy_logical_type(&rt);
     duckdb_scalar_function_set_function(f, &udf_trampoline);
+    if (is_volatile) duckdb_scalar_function_set_volatile(f);
+    if (special_handling) duckdb_scalar_function_set_special_handling(f);
+    if (ctx->init_callable) duckdb_scalar_function_set_init(f, &udf_init_trampoline);
     // DuckDB takes ownership of ctx via the destroy callback; release on success.
     duckdb_scalar_function_set_extra_info(f, ctx.get(), &udf_extra_info_destroy);
 

@@ -300,7 +300,7 @@ ducky's data-science / ML audience, roughly highest-value first.
   fall back to a column's `DEFAULT` (e.g. autoincrement / `now()` columns)
   instead of requiring every column — a common ergonomic gap in bulk insert.
 
-- ⬜ **Stateful / volatile / NULL-aware scalar UDFs**
+- 🟡 **Stateful / volatile / NULL-aware scalar UDFs**
   (`duckdb_scalar_function_set_bind` / `set_init` / `get_state` /
   `set_bind_data`, `set_volatile`, `set_special_handling`). Rounds out the v2
   UDF engine: `set_volatile` marks non-deterministic functions so the optimizer
@@ -308,6 +308,18 @@ ducky's data-science / ML audience, roughly highest-value first.
   `set_special_handling` lets a UDF observe and emit NULLs (current ndarray UDFs
   are NULL-oblivious — see the NULL-handling note in `_conversions.py`);
   bind/init add per-statement and per-thread state.
+
+  Landed: `Connection.create_function(..., init=, volatile=, special_handling=)`.
+  `init=factory` runs once per worker thread; its return value is threaded as
+  the first positional argument of `fn` on every chunk (`fn(state, *args)` or
+  `fn(state, kwargs)` in dict mode). `volatile=True` plumbs through
+  `duckdb_scalar_function_set_volatile`. `special_handling=True` switches to
+  NULL-aware input: each argument becomes a `(values, mask)` tuple (mask is a
+  1-D uint8 ndarray, 1=valid, 0=NULL), and the UDF is responsible for emitting
+  NULL outputs via the same `(values, mask)` return form. Init failures surface
+  as a `ducky.Error` at query time. Still open: bind-time state
+  (`set_bind` / `set_bind_data`) for per-statement state and argument-expression
+  introspection — deferred since it's the least-used of the four.
 
 - ⬜ **Faithful table-function parameters** (the `duckdb_value` getter family:
   `duckdb_get_date` / `_get_timestamp` / `_get_decimal` / `_get_blob` / nested

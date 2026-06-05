@@ -47,11 +47,20 @@ duckdb_logical_type parse_logical_type(duckdb_connection con, const std::string&
 //   * a dict of {name: type_string} — `fn` is called with a single dict
 //     {name: ndarray}. Names are Python-side labels only.
 //
-// NULL handling: input ndarrays are raw buffers (NULL slots hold garbage);
-// filter with SQL `WHERE x IS NOT NULL` if you need clean inputs. Output is
-// always non-null in v1.
+// NULL handling: by default, input ndarrays are raw buffers (NULL slots hold
+// garbage) and DuckDB auto-NULLs the output for rows where any input is NULL.
+// Pass `special_handling=true` to receive each input as a (values, mask) tuple
+// (mask: 1-D uint8 ndarray, 1=valid, 0=NULL) and to take responsibility for
+// emitting NULLs yourself.
+//
+// `init` is an optional zero-arg Python callable invoked once per worker thread
+// when the UDF starts executing; its return value is passed as the first
+// positional argument to `fn` on every chunk (per-thread state for RNGs,
+// running counters, etc.). `is_volatile=true` marks the function as
+// non-deterministic so the optimizer won't constant-fold or cache it.
 void create_scalar_function(Connection& con, const std::string& name, nb::callable fn,
-                            nb::object parameters, nb::object return_type, nb::object varargs);
+                            nb::object parameters, nb::object return_type, nb::object varargs,
+                            nb::object init, bool is_volatile, bool special_handling);
 
 // Registers a Python callable as a DuckDB scalar function, with input passed as
 // a `pyarrow.RecordBatch` and output expected as a `pyarrow.Array`. Built on

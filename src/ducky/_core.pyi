@@ -434,9 +434,13 @@ class Connection:
         parameters: list[str] | dict[str, str] | None = None,
         return_type: str | None = None,
         varargs: str | None = None,
+        init: Callable[[], Any] | None = None,
+        *,
+        volatile: bool = False,
+        special_handling: bool = False,
     ) -> None:
         """
-        Register a Python callable as a DuckDB scalar function. `parameters` is a list of type strings (positional call) or a dict of {name: type_string} (dict-style call). Inputs arrive as zero-copy 1-D ndarrays; `fn` must return one ndarray of length chunk_size and matching dtype. If `parameters` or `return_type` is omitted, they are inferred from `fn`'s annotations (bool/int/float → BOOLEAN/BIGINT/DOUBLE). Pass `varargs="TYPE"` (mutually exclusive with `parameters`) to register a variable-arity function; `fn` is then called as `fn(*args)` with one ndarray per SQL argument.
+        Register a Python callable as a DuckDB scalar function. `parameters` is a list of type strings (positional call) or a dict of {name: type_string} (dict-style call). Inputs arrive as zero-copy 1-D ndarrays; `fn` must return one ndarray of length chunk_size and matching dtype. If `parameters` or `return_type` is omitted, they are inferred from `fn`'s annotations (bool/int/float → BOOLEAN/BIGINT/DOUBLE). Pass `varargs="TYPE"` (mutually exclusive with `parameters`) to register a variable-arity function; `fn` is then called as `fn(*args)` with one ndarray per SQL argument. Pass `init=factory` (a zero-arg callable) to attach per-worker-thread state: it is called once per worker thread and its return value is threaded as the first positional argument of `fn` on every chunk (`fn(state, *args)` or `fn(state, kwargs)` in dict mode). `volatile=True` marks the function as non-deterministic so the optimizer won't fold or cache it (e.g. RNG / clock UDFs). `special_handling=True` switches to NULL-aware input: each argument is delivered as a `(values, mask)` tuple where `mask` is a 1-D uint8 ndarray with 1=valid, 0=NULL; the UDF is responsible for emitting NULL outputs via the same `(values, mask)` return form.
         """
 
     def create_arrow_function(
