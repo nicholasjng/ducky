@@ -486,6 +486,11 @@ class Connection:
         Snapshot of the current query's progress: (percentage, rows_processed, total_rows_to_process). `percentage` is -1.0 until DuckDB has an estimate.
         """
 
+    def get_profiling_info(self) -> dict[str, Any] | None:
+        """
+        Programmatic EXPLAIN ANALYZE: walk the post-execution profiling tree of the most recently run query and return a nested {'metrics': {str: str}, 'children': [...]} dict. Returns None if profiling isn't enabled — first run `con.execute("SET enable_profiling='no_output'")` (and optionally `SET profiling_mode='detailed'`). Metric values are currently strings (per the DuckDB C API); coerce numerics on the caller side.
+        """
+
     def register_arrow(self, name: str, obj: Any) -> None:
         """
         Register a Python object exposing `__arrow_c_stream__` (pyarrow Table, polars DataFrame, pandas-3 DataFrame, ...) as a table named `name`. Lazy and zero-copy: the source is kept and re-streamed on each query via a replacement scan (so it must support being streamed more than once), not materialized at registration.

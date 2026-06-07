@@ -394,6 +394,52 @@ nb::tuple Connection::progress() const {
     return nb::make_tuple(p.percentage, p.rows_processed, p.total_rows_to_process);
 }
 
+namespace {
+
+// Recursively materialize a duckdb_profiling_info node into a Python dict.
+// The info nodes themselves are borrowed (owned by the connection's profiler
+// state); only the duckdb_value handles for metric keys/values need destroying.
+nb::dict walk_profiling_node(duckdb_profiling_info info) {
+    nb::dict node;
+    nb::dict metrics;
+    duckdb_value map = duckdb_profiling_info_get_metrics(info);
+    if (map) {
+        idx_t n = duckdb_get_map_size(map);
+        for (idx_t i = 0; i < n; ++i) {
+            duckdb_value k = duckdb_get_map_key(map, i);
+            duckdb_value v = duckdb_get_map_value(map, i);
+            char* ks = duckdb_get_varchar(k);
+            char* vs = duckdb_get_varchar(v);
+            metrics[nb::str(ks ? ks : "")] = nb::str(vs ? vs : "");
+            duckdb_free(ks);
+            duckdb_free(vs);
+            duckdb_destroy_value(&k);
+            duckdb_destroy_value(&v);
+        }
+        duckdb_destroy_value(&map);
+    }
+    node["metrics"] = std::move(metrics);
+
+    nb::list children;
+    idx_t cc = duckdb_profiling_info_get_child_count(info);
+    for (idx_t i = 0; i < cc; ++i) {
+        children.append(walk_profiling_node(duckdb_profiling_info_get_child(info, i)));
+    }
+    node["children"] = std::move(children);
+    return node;
+}
+
+}  // namespace
+
+nb::object Connection::get_profiling_info() const {
+    if (!handle_ || !handle_->connection) {
+        throw DuckyError("ducky: connection is closed");
+    }
+    duckdb_profiling_info info = duckdb_get_profiling_info(handle_->connection);
+    if (!info) return nb::none();
+    return walk_profiling_node(info);
+}
+
 void Connection::register_arrow(const std::string& name, nb::object obj) {
     ensure_open();
     // Keep a strict identifier shape so `SELECT * FROM name` resolves unquoted:

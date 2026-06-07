@@ -131,6 +131,12 @@ class Connection {
     // DuckDB hasn't computed an estimate yet. Thread-safe.
     nb::tuple progress() const;
 
+    // Post-execution profiling tree of the most recently run query, as a
+    // nested {"metrics": {str: str}, "children": [...]} dict. Returns None if
+    // profiling isn't enabled (`SET enable_profiling=...`). Metric values are
+    // currently always strings (per the DuckDB C API); callers coerce.
+    nb::object get_profiling_info() const;
+
     // Register a Python object exposing the Arrow PyCapsule interface
     // (`__arrow_c_stream__`) as a table named `name`. The data is materialized
     // into a real DuckDB table at registration so subsequent queries against

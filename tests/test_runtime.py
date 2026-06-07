@@ -206,3 +206,70 @@ def test_progress_during_long_query():
         assert pct == -1.0 or 0.0 <= pct <= 100.0
         assert rows >= 0
         assert total >= 0
+
+
+def test_profiling_info_none_when_disabled():
+    # Without `SET enable_profiling=...`, DuckDB returns no profiling tree.
+    con = ducky.connect()
+    con.execute("SELECT 1 + 2").fetchall()
+    assert con.get_profiling_info() is None
+
+
+def test_profiling_info_walks_tree():
+    con = ducky.connect()
+    con.execute("SET enable_profiling='no_output'")
+    con.execute("SELECT i, i * 2 FROM range(1000) t(i) WHERE i % 3 = 0").fetchall()
+
+    root = con.get_profiling_info()
+    assert isinstance(root, dict)
+    assert set(root.keys()) == {"metrics", "children"}
+    assert isinstance(root["metrics"], dict)
+    assert isinstance(root["children"], list)
+    # The root is the QUERY_ROOT node with summary metrics; the operator tree
+    # hangs off the first child.
+    assert root["children"], "expected an operator subtree under the root"
+
+    # Walk the tree and confirm we see at least one operator with a timing metric.
+    def all_nodes(node):
+        yield node
+        for c in node["children"]:
+            yield from all_nodes(c)
+
+    timing_seen = False
+    for node in all_nodes(root):
+        for k, v in node["metrics"].items():
+            assert isinstance(k, str)
+            assert isinstance(v, str)
+        if "operator_timing" in node["metrics"] or "timing" in node["metrics"]:
+            timing_seen = True
+    assert timing_seen, "expected at least one node to expose a timing metric"
+
+
+def test_profiling_info_detailed_mode_extra_metrics():
+    # detailed mode unlocks additional per-operator counters (cardinality,
+    # cpu_time, etc.); verify the dict grows accordingly.
+    con = ducky.connect()
+    con.execute("SET enable_profiling='no_output'")
+    con.execute("SET profiling_mode='detailed'")
+    con.execute("SELECT count(*) FROM range(10_000) t(i)").fetchall()
+
+    root = con.get_profiling_info()
+    assert root is not None
+
+    def metric_keys(node):
+        keys = set(node["metrics"].keys())
+        for c in node["children"]:
+            keys |= metric_keys(c)
+        return keys
+
+    keys = metric_keys(root)
+    # Detailed mode reliably surfaces these across the operator tree.
+    assert "cpu_time" in keys
+    assert "intermediate_rows" in keys
+
+
+def test_profiling_info_after_close_raises():
+    con = ducky.connect()
+    con.close()
+    with pytest.raises(ducky.Error, match="closed"):
+        con.get_profiling_info()

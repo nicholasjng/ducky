@@ -285,12 +285,28 @@ ducky's data-science / ML audience, roughly highest-value first.
   (`duckdb_prepared_statement_type`). Context-manager aware. Per-index
   `param_type` was left out for now — easy to add on top if a use case wants it.
 
-- ⬜ **Query profiling access** (`duckdb_get_profiling_info` +
-  `duckdb_profiling_info_get_metrics` / `_get_value` / `_get_child(_count)`).
-  Programmatic `EXPLAIN ANALYZE`: walk the operator tree and pull timing /
-  cardinality metrics into a Python dict (gated by the `enable_profiling`
-  setting), instead of scraping `EXPLAIN` text. A natural fit for perf tuning
-  in notebooks and inside training loops.
+- ✅ **Query profiling access** (`duckdb_get_profiling_info` +
+  `duckdb_profiling_info_get_metrics` / `_get_child(_count)`). Programmatic
+  `EXPLAIN ANALYZE`: `Connection.get_profiling_info()` walks the post-execution
+  tree and returns a nested `{"metrics": {str: str}, "children": [...]}` dict,
+  rooted at DuckDB's QUERY_ROOT node — no scraping of `EXPLAIN` text. Returns
+  `None` until the user opts in (`SET enable_profiling='no_output'`, optionally
+  `SET profiling_mode='detailed'`). Metric values arrive as strings (per the C
+  API's current contract — the underlying `duckdb_value` always holds a
+  varchar); numeric coercion is left to the caller. Implemented via
+  `duckdb_profiling_info_get_metrics` → MAP-`duckdb_value` walk; node handles
+  are borrowed (owned by the connection's profiler state), so only the metric
+  key/value `duckdb_value`s are destroyed.
+  - ✅ **Ergonomic wrappers** in `ducky._profile`. `with ducky.profile(con) as p:`
+    toggles `enable_profiling='no_output'` (and `profiling_mode='detailed'` on
+    `mode='detailed'`) for the block, snapshots `con.get_profiling_info()` just
+    before the settings are restored — so the most recent query's tree survives
+    the context — and drops its connection reference on exit so the
+    `ProfileResult` doesn't pin an ephemeral connection. `str(p)` (and
+    `ducky.format_profiling_info(info)`) render the operator subtree as an
+    aligned tree with `time=` (human-readable durations) / `rows=` columns and
+    a one-line `extra_info` continuation; the query summary at the top shows
+    SQL, total/cpu time and total intermediate rows.
 
 - ⬜ **Table introspection + appender DEFAULTs** (`duckdb_table_description_*`,
   `duckdb_append_default` / `duckdb_append_default_to_chunk`). The
