@@ -35,6 +35,7 @@ from ._dataset import (
     target,
     vector,
 )
+from ._profile import format_profiling_info, profile
 from ._progress import progress_bar
 from ._typing import DuckDBConfig
 
@@ -93,7 +94,9 @@ __all__ = [
     "connect",
     "dataset",
     "feature",
+    "format_profiling_info",
     "matrix",
+    "profile",
     "progress_bar",
     "split",
     "target",
