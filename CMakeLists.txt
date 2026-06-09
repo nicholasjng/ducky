@@ -136,7 +136,11 @@ nanobind_add_module(
   src/cpp/result.cpp)
 
 target_include_directories(_core PRIVATE ${DUCKDB_DIR}/src/include)
-target_link_libraries(_core PRIVATE duckdb_static)
+# tsl::robin_map is vendored by nanobind under ext/robin_map/include and exposed
+# as an IMPORTED target by nanobind-config.cmake; link it so the headers are
+# visible to our sources (nanobind itself only links it PRIVATE to its own
+# static lib).
+target_link_libraries(_core PRIVATE duckdb_static tsl::robin_map)
 
 # duckdb_static's DuckDB constructor calls ExtensionHelper::LoadAllExtensions,
 # which is defined in the generated loader rather than in duckdb_static itself.

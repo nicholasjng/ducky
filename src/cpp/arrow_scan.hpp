@@ -1,11 +1,11 @@
 #pragma once
 
 #include <nanobind/nanobind.h>
+#include <tsl/robin_map.h>
 
 #include <memory>
 #include <mutex>
 #include <string>
-#include <unordered_map>
 
 #include "duckdb.h"
 
@@ -25,7 +25,7 @@ class Connection;
 // GIL, which the register and bind paths already do.
 struct ArrowRegistry {
     std::mutex mu;
-    std::unordered_map<std::string, nb::object> sources;
+    tsl::robin_map<std::string, nb::object> sources;
     duckdb_connection con = nullptr;  // borrowed; for duckdb_data_chunk_from_arrow
 };
 

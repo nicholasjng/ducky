@@ -3,8 +3,8 @@
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
 #include <nanobind/stl/string.h>
+#include <tsl/robin_map.h>
 
-#include <unordered_map>
 #include <vector>
 
 #include "connection.hpp"
@@ -81,7 +81,7 @@ void agg_update(duckdb_function_info info, duckdb_data_chunk input,
             }
 
             // Slow path: group row indices by state address.
-            std::unordered_map<duckdb_aggregate_state, std::vector<idx_t>> groups;
+            tsl::robin_map<duckdb_aggregate_state, std::vector<idx_t>> groups;
             groups.reserve(n);
             for (idx_t i = 0; i < n; ++i) {
                 groups[states[i]].push_back(i);
