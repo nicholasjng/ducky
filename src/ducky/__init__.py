@@ -1,7 +1,5 @@
 """ducky: tiny, fast nanobind bindings for DuckDB's C API."""
 
-from __future__ import annotations
-
 import sys
 
 if sys.version_info >= (3, 12):
@@ -49,14 +47,18 @@ def connect(
     database: str = ":memory:",
     **config: Unpack[DuckDBConfig],
 ) -> Connection:
-    """Open `database` (default in-memory) and return a Connection.
+    """Open ``database`` and return a :class:`Connection`.
 
-    DuckDB settings are passed as keyword arguments using the keys declared in
-    :class:`DuckDBConfig` (autocomplete-friendly), as their natural Python type
-    — `ducky.connect(memory_limit="2GB", threads=4, enable_object_cache=True)`.
-    Values are coerced to strings for DuckDB; any key or value DuckDB rejects
-    raises :class:`Error` at open time. See :func:`config_options` for the full
-    runtime list.
+    DuckDB settings are passed as natural-typed keyword arguments using the keys declared in :class:`DuckDBConfig`.
+    Values are coerced to strings for DuckDB; an invalid key or value raises :class:`Error` at open time.
+
+    Parameters
+    ----------
+    database : str, default ':memory:'
+        File path, ``':memory:'``, or any DuckDB connection string.
+    **config : DuckDBConfig
+        DuckDB settings applied at open.
+        See :func:`config_options` for the full list.
 
     Examples
     --------
@@ -78,9 +80,8 @@ def connect(
     coerced = {key: coerce(value) for key, value in config.items()}
     con = _connect(database, coerced or None)
 
-    # XLA-style opt-in: if DUCKY_PROFILE_DIR is set, attach a JSONL sink so
-    # every execute()/sql() on this connection lands in {dir}/profile-{pid}.jsonl
-    # with no further code change.
+    # if DUCKY_PROFILE_DIR is set, attach a JSONL sink so every execute()/sql()
+    # on this connection lands in {dir}/profile-{pid}.jsonl with no code change.
     if cfg := ProfileConfig.from_env():
         con.set_profile_sink(cfg.sink, sample=cfg.sample, mode=cfg.mode)
 

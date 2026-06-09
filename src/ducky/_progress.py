@@ -1,17 +1,7 @@
-"""Built-in progress-bar helper for long-running queries.
+"""Live progress bar for long-running queries.
 
-`Connection.progress()` exposes DuckDB's raw progress numbers, but wiring them
-into a live bar means enabling progress tracking, spawning a poller thread, and
-restoring connection settings afterwards. :func:`progress_bar` bakes that in:
-
-    >>> import ducky
-    >>> con = ducky.connect(threads=4)
-    >>> with ducky.progress_bar(con):
-    ...     con.execute("SELECT count(*) FROM range(1_000_000_000) WHERE i % 7 = 0")
-
-The bar renders through `tqdm` when it is installed and degrades to a minimal
-stderr `desc [####    ]  42.0%` printer otherwise — importing the helper never
-hard-fails on a missing tqdm.
+See :func:`progress_bar`.
+Renders via ``tqdm`` when installed; falls back to a minimal stderr bar otherwise (the import never hard-fails on missing tqdm).
 """
 
 from __future__ import annotations
@@ -108,29 +98,33 @@ def progress_bar(
     out: IO[str] | None = None,
     use_tqdm: bool = True,
 ) -> Iterator[Connection]:
-    """Render a live progress bar for queries run on `con` inside the block.
+    """Render a live progress bar for queries inside the block.
 
-    Enables DuckDB progress tracking, suppresses DuckDB's own printed bar, and
-    polls :meth:`Connection.progress` from a background thread to drive the bar.
-    The connection's progress settings are restored on exit.
+    Enables DuckDB progress tracking, polls :meth:`Connection.progress` from a background thread, and restores the connection's progress settings on exit.
 
     Parameters
     ----------
-    con:
+    con : Connection
         The connection whose queries should be tracked.
-    desc:
+    desc : str, default 'query'
         Label shown to the left of the bar.
-    interval:
+    interval : float, default 0.1
         Seconds between progress polls.
-    out:
-        Text stream to draw on (defaults to ``sys.stderr``).
-    use_tqdm:
-        Render through tqdm when available (default). Set ``False`` to force
-        the built-in stderr bar.
+    out : file-like, optional
+        Text stream to draw on.
+        Defaults to ``sys.stderr``.
+    use_tqdm : bool, default True
+        Render through ``tqdm`` when installed; set ``False`` to force the stderr fallback.
 
     Yields
     ------
-    The same connection, so ``with ducky.progress_bar(con) as c:`` works.
+    Connection
+        The same connection, so ``with progress_bar(con) as c:`` works.
+
+    Examples
+    --------
+    >>> with ducky.progress_bar(con):
+    ...     con.execute("SELECT count(*) FROM range(1_000_000_000) WHERE i % 7 = 0")
     """
     # Imported lazily so importing ducky doesn't pull in threading machinery.
     import threading

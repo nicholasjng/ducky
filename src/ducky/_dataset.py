@@ -1,36 +1,8 @@
 """Higher-level dataset / feature API for ML pipelines on top of DuckDB.
 
-The output is a dict of named **fields**, each either a :class:`Matrix` (several
-columns stacked into ``(n, d)``) or a :class:`Vector` (one column → ``(n,)``):
-
-    ds = ducky.dataset(
-        "https://…/titanic.csv",
-        fields={
-            "X": ducky.matrix({
-                "pclass":   ducky.feature("Pclass"),
-                "age":      ducky.feature("Age", standardize=True, dtype="f32"),
-                "fare":     ducky.feature("Fare", standardize=True, dtype="f32"),
-            }),
-            "y": ducky.vector("Survived", dtype="f32"),
-            "w": ducky.vector("sample_weight"),          # sample weights
-        },
-        drop_nulls=["Age"],
-        split=ducky.split(0.8, seed=0),
-        backend="jax",          # materialise folds straight into JAX (numpy default)
-    )
-    Xtr, ytr = ds.train.tensors()       # sugar for ds.train["X"], ds.train["y"]
-    Xval, wval = ds.val["X"], ds.val["w"]
-
-For the classic single-features / single-target case, pass ``columns=`` and
-``target=`` instead of ``fields=`` — they desugar to a ``{"X": matrix(columns),
-"y": vector(target)}`` field spec.
-
-The ``backend`` chooses the array library each fold is materialised into
-("numpy", "jax", "torch", "mlx"). The source is scanned once, streamed into the
-backend via DLPack (zero host copy for the native backends), then each fold is
-split out with an on-device integer gather and stacked into ``(n, d)`` on the
-device. A load targets a single backend; for an unsupported framework, use
-``backend="numpy"`` and convert from numpy at the cost of one copy.
+A dataset is described by named **fields**, each either a :class:`Matrix` (several columns stacked into ``(n, d)``) or a :class:`Vector` (one column, ``(n,)``).
+The source is scanned once, streamed into the chosen backend via DLPack (zero host copy for jax / torch / mlx), then each fold is split out with an on-device integer gather.
+See :func:`dataset` for the entry point.
 """
 
 from __future__ import annotations
@@ -52,13 +24,14 @@ if TYPE_CHECKING:
 class Feature:
     """One column in a :class:`Matrix` field.
 
-    ``expr`` is a SQL expression (not a Python expression) — typically just a
-    column name, optionally quoted: ``"Pclass"``, ``'"Siblings/Spouses Aboard"'``,
-    or a small expression like ``"Sex = 'male'"`` or
-    ``"coalesce(Age, 30.0)"``.
-
-    When ``standardize=True``, the column is z-scored using stats computed
-    against the *train* fold only — never the full dataset.
+    Parameters
+    ----------
+    expr : str
+        A SQL expression — typically just a column name, optionally quoted, or a small expression like ``"coalesce(Age, 30.0)"``.
+    dtype : str, default 'f32'
+        Target dtype (``'f32'``, ``'f64'``, ``'i32'``, …; see ``_DUCKDB_DTYPES``).
+    standardize : bool, default False
+        Z-score the column using statistics computed against the ``'train'`` fold only.
     """
 
     expr: str
@@ -70,8 +43,8 @@ class Feature:
 class Target:
     """Legacy shorthand for a single-column label field.
 
-    Equivalent to :class:`Vector` without ``standardize=``; preserved so the
-    pre-``fields=`` API (``dataset(columns=..., target=...)``) keeps working.
+    Equivalent to :class:`Vector` without ``standardize=``.
+    Kept so the pre-``fields=`` API (``dataset(columns=..., target=...)``) keeps working.
     """
 
     expr: str
@@ -80,7 +53,7 @@ class Target:
 
 @dataclass(frozen=True)
 class Vector:
-    """A one-column field. Materialised as a 1-D array of shape ``(n,)``."""
+    """A one-column field, materialised as a 1-D ``(n,)`` array."""
 
     expr: str
     dtype: str = "f32"
@@ -89,10 +62,13 @@ class Vector:
 
 @dataclass(frozen=True)
 class Matrix:
-    """A multi-column field. Materialised as a 2-D array of shape ``(n, d)``.
+    """A multi-column field, materialised as a 2-D ``(n, d)`` array.
 
-    ``columns`` maps a short name (used as part of the SQL alias) to a
-    :class:`Feature` spec. The order of columns is preserved in the stack.
+    Parameters
+    ----------
+    columns : dict[str, Feature]
+        Map from short column name (used in the SQL alias) to :class:`Feature`.
+        Insertion order is preserved in the stacked output.
     """
 
     columns: dict[str, Feature] = field(default_factory=dict)
@@ -103,19 +79,16 @@ Field = Vector | Matrix
 
 @dataclass(frozen=True)
 class Split:
-    """Random named-fold split based on a hash bucket over row position.
+    """Reproducible named-fold split based on a hash bucket over row position.
 
-    ``fractions`` maps fold name → share, and must sum to 1.0. The most common
-    case (single ``"train"``/``"val"`` split) has a shorthand: pass a plain
-    float to :func:`split` and we expand it to
-    ``{"train": x, "val": 1 - x}``.
+    Standardisation statistics (when ``Feature(standardize=True)``) are computed against the fold named ``'train'`` if present, otherwise across the whole dataset.
 
-    Reproducible across runs given a fixed ``seed``. Stratified splits and
-    user-supplied fold columns are not supported in this v0 sketch.
-
-    Standardisation statistics (see :class:`Feature` ``standardize=True``) are
-    always computed against the fold named ``"train"`` if present; otherwise
-    they're computed across the whole dataset.
+    Parameters
+    ----------
+    fractions : dict[str, float]
+        Fold name → share; must sum to 1.0.
+    seed : int, default 0
+        Fixes the hash so splits are reproducible across runs.
     """
 
     fractions: dict[str, float] = field(default_factory=lambda: {"train": 0.8, "val": 0.2})
@@ -123,22 +96,22 @@ class Split:
 
 
 def feature(expr: str, *, dtype: str = "f32", standardize: bool = False) -> Feature:
-    """Shorthand for ``Feature(expr=..., dtype=..., standardize=...)``."""
+    """Shorthand for :class:`Feature`."""
     return Feature(expr=expr, dtype=dtype, standardize=standardize)
 
 
 def target(expr: str, *, dtype: str = "f32") -> Target:
-    """Shorthand for ``Target(expr=..., dtype=...)``."""
+    """Shorthand for :class:`Target`."""
     return Target(expr=expr, dtype=dtype)
 
 
 def vector(expr: str, *, dtype: str = "f32", standardize: bool = False) -> Vector:
-    """Shorthand for ``Vector(expr=..., dtype=..., standardize=...)``."""
+    """Shorthand for :class:`Vector`."""
     return Vector(expr=expr, dtype=dtype, standardize=standardize)
 
 
 def matrix(columns: dict[str, Feature]) -> Matrix:
-    """Shorthand for ``Matrix(columns=...)``."""
+    """Shorthand for :class:`Matrix`."""
     if not columns:
         raise ValueError("matrix() requires at least one column")
     return Matrix(columns=dict(columns))
@@ -149,11 +122,14 @@ def split(
     *,
     seed: int = 0,
 ) -> Split:
-    """Shorthand for ``Split(fractions=..., seed=...)``.
+    """Build a :class:`Split`.
 
-    ``fractions`` is either a single float in ``(0, 1)`` (expanded to
-    ``{"train": x, "val": 1 - x}``) or a dict of fold name → share that sums
-    to 1.0.
+    Parameters
+    ----------
+    fractions : float or dict[str, float], default 0.8
+        A float ``x`` in ``(0, 1)`` expands to ``{"train": x, "val": 1 - x}``;
+        a dict maps fold name → share and must sum to 1.0.
+    seed : int, default 0
     """
     if isinstance(fractions, int | float):
         f = float(fractions)
@@ -167,8 +143,6 @@ def split(
         raise ValueError("each fold fraction must be > 0")
     return Split(fractions=dict(fractions), seed=seed)
 
-
-# ── Dtype mapping ──────────────────────────────────────────────────────────
 
 _DUCKDB_DTYPES: dict[str, str] = {
     "f32": "FLOAT",
@@ -192,28 +166,15 @@ def _to_duckdb_dtype(name: str) -> str:
         raise ValueError(f"unknown dtype {name!r}; pick one of {sorted(_DUCKDB_DTYPES)}") from exc
 
 
-# ── Backend dispatch ───────────────────────────────────────────────────────
-# A dataset is materialised into one array library. The heavy lifting (chunk →
-# column) is the streaming DLPack converter in _conversions; the helpers below
-# add the few backend-specific ops the split needs: pulling the bucket column
-# to the host for index maths, an integer row-gather, and an axis-1 stack.
-# Imports are lazy so none of jax/torch/mlx is a hard dependency.
-
 Backend = Literal["numpy", "jax", "torch", "mlx"]
 _BACKENDS: tuple[Backend, ...] = ("numpy", "jax", "torch", "mlx")
 _NO_DEVICE: tuple[Backend, ...] = ("numpy", "mlx")
 
-# Element type of a dataset's arrays — np.ndarray / jax.Array / torch.Tensor /
-# mlx.core.array, depending on the chosen backend. The dataset() overloads map
-# each backend literal to the concrete type so tensors() is precisely typed.
-
 
 class AbstractArray(Protocol):
-    """The minimal array surface ducky relies on across all backends.
+    """Minimal array protocol — just ``.shape`` — that bounds :data:`ArrayT`.
 
-    numpy / jax / torch / mlx arrays all satisfy this structurally (it's just
-    ``shape``); it bounds :data:`ArrayT` so generic code can read ``.shape``
-    without knowing the concrete backend type.
+    Satisfied structurally by numpy / jax / torch / mlx arrays.
     """
 
     @property
@@ -281,20 +242,12 @@ def _stack(cols: list[Any], backend: Backend) -> Any:
     return np.stack(cols, axis=1)
 
 
-# ── Output: Fold + Dataset ─────────────────────────────────────────────────
-
-
 @dataclass
 class Fold(Generic[ArrayT]):
     """One side of a split — a dict of named field arrays.
 
-    Each field is an array in the dataset's ``backend`` (numpy/jax/torch/mlx);
-    ``ArrayT`` is that array type. A :class:`Matrix` field is materialised as a
-    2-D ``(n, d)`` array, a :class:`Vector` field as a 1-D ``(n,)`` array.
-
-    Access fields by name with ``fold["X"]`` or as attributes (``fold.X``).
-    Several single-character field names can be requested at once via a
-    "swizzle" attribute — ``fold.Xy`` returns ``(fold["X"], fold["y"])``.
+    Each field is a backend array (numpy / jax / torch / mlx).
+    Access fields by name (``fold["X"]``) or attribute (``fold.X``); a multi-character attribute whose letters are all single-char field names "swizzles" into a tuple — ``fold.Xy`` is ``(fold["X"], fold["y"])``.
     """
 
     backend: Backend
@@ -312,10 +265,8 @@ class Fold(Generic[ArrayT]):
         return self._fields[name]
 
     def __getattr__(self, name: str) -> Any:
-        # __getattr__ only fires when normal lookup misses, so dataclass
-        # attributes like ``backend`` and ``_fields`` aren't routed here.
-        # Skip dunder/private lookups so things like ``__deepcopy__`` raise
-        # cleanly instead of trying to swizzle the leading underscore.
+        # Skip dunder/private lookups so things like __deepcopy__ raise cleanly
+        # instead of trying to swizzle the leading underscore.
         if name.startswith("_"):
             raise AttributeError(name)
         fields = self.__dict__.get("_fields")
@@ -323,14 +274,14 @@ class Fold(Generic[ArrayT]):
             raise AttributeError(name)
         if name in fields:
             return fields[name]
-        # Vector-style swizzle: every char of ``name`` must be a single-char
-        # field name. Returns a tuple in the order written.
+        # Swizzle: a multi-char attribute whose chars are all single-char field
+        # names returns a tuple in the order written.
         if len(name) > 1 and all(ch in fields for ch in name):
             return tuple(fields[ch] for ch in name)
         raise AttributeError(name)
 
     def tensors(self) -> tuple[ArrayT, ArrayT]:
-        """Sugar returning ``(self["X"], self["y"])`` for the classic case."""
+        """Return ``(self["X"], self["y"])``. Raises if either field is missing."""
         try:
             return self._fields["X"], self._fields["y"]
         except KeyError as exc:
@@ -350,15 +301,20 @@ class Fold(Generic[ArrayT]):
     ) -> Iterator[tuple[ArrayT, ArrayT]]:
         """Yield ``(X_batch, y_batch)`` slices of ``self.tensors()``.
 
-        Materialises the fold's ``X``/``y`` fields once up front (cheap — same
-        memory as ``tensors()``); each batch is then a gather along axis 0 in
-        the dataset's backend. The shuffle permutation is always computed on
-        the host (cheap, deterministic) and applied as a backend gather.
+        Each batch is an on-device gather along axis 0.
+        The shuffle permutation is computed on the host and applied as a backend gather.
 
-        ``shuffle=True`` permutes row order once per call (i.e. once per
-        epoch if you wrap this in a ``for epoch in range(...)``). Pass a
-        fresh ``seed`` per epoch for a deterministic but varying shuffle, or
-        ``seed=None`` for non-deterministic.
+        Parameters
+        ----------
+        batch_size : int
+            Rows per batch (must be > 0).
+        shuffle : bool, default False
+            Permute row order once per call.
+        seed : int or None, default None
+            Reproducible shuffle when set; non-deterministic when ``None``.
+            Pass a fresh seed per epoch for deterministic-but-varying order.
+        drop_last : bool, default False
+            Skip the final partial batch when ``n_rows % batch_size != 0``.
         """
         import numpy as np
 
@@ -383,16 +339,8 @@ class Fold(Generic[ArrayT]):
 class Dataset(Generic[ArrayT]):
     """A loaded dataset, split into one or more named folds.
 
-    ``ArrayT`` is the array type of the folds (set by the load ``backend``).
-
-    The most common access patterns:
-
-    - ``ds.train`` / ``ds.val`` / ``ds.test`` — convenience aliases for the
-      standard fold names (return ``None`` if that fold doesn't exist).
-    - ``ds.folds["custom"]`` or ``ds["custom"]`` — arbitrary fold names.
-    - Iterating ``ds.folds`` gives all available folds in declaration order.
-
-    When the spec includes no split, all rows land in a single ``"train"`` fold.
+    Access folds with ``ds.train`` / ``ds.val`` / ``ds.test`` (return ``None`` if absent), ``ds["custom"]``, or ``ds.folds``.
+    Without a split, all rows land in a single ``'train'`` fold.
     """
 
     folds: dict[str, Fold[ArrayT]]
@@ -416,7 +364,7 @@ class Dataset(Generic[ArrayT]):
 
     @property
     def feature_names(self) -> list[str]:
-        """Column names of the ``"X"`` matrix field (legacy shorthand path)."""
+        """Column names of the ``'X'`` matrix field. Legacy shorthand path."""
         spec = self.field_specs.get("X")
         if isinstance(spec, Matrix):
             return list(spec.columns)
@@ -424,7 +372,7 @@ class Dataset(Generic[ArrayT]):
 
     @property
     def target_name(self) -> str:
-        """The expression of the ``"y"`` vector field (legacy shorthand path)."""
+        """SQL expression of the ``'y'`` vector field. Legacy shorthand path."""
         spec = self.field_specs.get("y")
         if isinstance(spec, Vector):
             return spec.expr
@@ -438,11 +386,7 @@ class Dataset(Generic[ArrayT]):
         return f"Dataset({parts} rows, fields={list(self.field_specs)!r})"
 
 
-# ── SQL compiler ───────────────────────────────────────────────────────────
-
-
-# 1000 buckets gives 0.1% resolution on fold fractions — enough for anything
-# users want to express in v0.
+# 0.1% resolution on fold fractions.
 _N_BUCKETS = 1000
 
 
@@ -491,8 +435,6 @@ def _compile_sql(
     references a ``stats`` CTE computed against the ``"train"`` fold only —
     never the full dataset.
     """
-    if not isinstance(source, str):
-        raise NotImplementedError("source must be a string URL/path in this sketch")
     if not fields:
         raise ValueError("at least one field is required")
 
@@ -502,9 +444,6 @@ def _compile_sql(
 
     aliases = [a for a, _, _ in columns]
     if len(set(aliases)) != len(aliases):
-        # Aliases are derived from field + sub-column names; collisions only
-        # occur if the user picks a sub-column name with a "__" separator that
-        # mirrors another field's name. Surface it explicitly.
         dupes = sorted({a for a in aliases if aliases.count(a) > 1})
         raise ValueError(f"duplicate field/column aliases: {dupes}")
 
@@ -563,9 +502,6 @@ def _assemble_field(name: str, spec: Field, columns_data: dict[str, Any], backen
         return columns_data[name]
     cols = [columns_data[f"{name}__{c}"] for c in spec.columns]
     return _stack(cols, backend)
-
-
-# ── Public API ─────────────────────────────────────────────────────────────
 
 
 def _normalize_fields(
@@ -667,25 +603,53 @@ def dataset(
 ) -> Dataset[Any]:
     """Load a remote / local table as a feature-engineered dataset.
 
-    ``source`` is a string passed straight into ``FROM '…'`` — URL, local path,
-    or anything DuckDB's auto-detection can read (CSV, Parquet, JSON, …).
+    Scans the source once, streams it into the chosen ``backend`` via DLPack (zero host copy for jax / torch / mlx), then splits each fold out with an on-device integer gather.
 
-    The dataset shape is described by ``fields`` — a dict mapping each output
-    field name to either a :class:`Matrix` (several stacked feature columns) or
-    a :class:`Vector` (one column). For the classic single-features /
-    single-target case, ``columns=`` and ``target=`` are kept as shorthand that
-    desugar to ``fields={"X": matrix(columns), "y": vector(target)}``.
+    Parameters
+    ----------
+    source : str
+        Passed straight into ``FROM '…'`` — URL, local path, or anything DuckDB's auto-detection reads (CSV, Parquet, JSON, …).
+    fields : dict[str, Field], optional
+        Output field spec.
+        Each value is a :class:`Matrix` (stacked feature columns) or :class:`Vector` (one column).
+        Mutually exclusive with ``columns=`` / ``target=``.
+    columns : dict[str, Feature], optional
+        Legacy shorthand; combined with ``target`` it desugars to ``fields={"X": matrix(columns), "y": vector(target)}``.
+    target : Target, optional
+        Legacy shorthand; see ``columns``.
+    drop_nulls : list[str], optional
+        Source columns that must be non-NULL; rows with any NULL are dropped before splitting and statistics.
+    split : Split, optional
+        Named-fold split.
+        Without it, all rows land in a single ``'train'`` fold.
+    con : Connection, optional
+        Connection to run the scan on.
+        A throwaway one is opened and closed if omitted.
+    backend : {'numpy', 'jax', 'torch', 'mlx'}, default 'numpy'
+        Target array library; fixes ``Dataset``'s element type.
+    device : optional
+        Forwarded to the jax / torch converter.
+        Not accepted by ``'numpy'`` or ``'mlx'``.
 
-    ``backend`` selects the array library each fold is materialised into —
-    ``"numpy"`` (default), ``"jax"``, ``"torch"`` or ``"mlx"`` — and fixes the
-    returned ``Dataset``'s element type. The source is scanned once and streamed
-    into the backend via DLPack (zero host copy for the native backends); each
-    fold is then split out with an on-device integer gather. ``device`` is
-    forwarded to the jax/torch converters (DuckDB feeds them from the host, so
-    the chunks land there); ``"numpy"`` and ``"mlx"`` do not take a device.
+    Examples
+    --------
+    >>> ds = ducky.dataset(
+    ...     "https://.../titanic.csv",
+    ...     fields={
+    ...         "X": ducky.matrix({
+    ...             "pclass": ducky.feature("Pclass"),
+    ...             "age":    ducky.feature("Age", standardize=True),
+    ...         }),
+    ...         "y": ducky.vector("Survived"),
+    ...     },
+    ...     drop_nulls=["Age"],
+    ...     split=ducky.split(0.8, seed=0),
+    ...     backend="jax",
+    ... )
+    >>> Xtr, ytr = ds.train.tensors()
     """
     if backend not in _BACKENDS:
-        raise ValueError(f"unknown backend {backend!r}; pick one of {list(_BACKENDS)}")
+        raise ValueError(f"unknown backend {backend!r}; supported backends: {list(_BACKENDS)}")
     backend = cast(Backend, backend)  # validated above
     if device is not None and backend in _NO_DEVICE:
         raise ValueError(f"backend {backend!r} does not take a device argument")

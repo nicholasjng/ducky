@@ -16,9 +16,9 @@ namespace {
 
 using namespace nb::literals;
 
-// Cached Python stdlib type objects we dispatch against during binding. Same
-// pattern as result.cpp's py_types() — imported once, intentionally leaked so
-// the destructors never run at interpreter shutdown.
+// Cached Python stdlib types we dispatch against during binding. Imported
+// once, intentionally leaked so the destructors never run at interpreter
+// shutdown.
 struct BindTypes {
     nb::type_object date;             // datetime.date
     nb::type_object time;             // datetime.time
@@ -200,28 +200,23 @@ void bind_one(duckdb_prepared_statement stmt, idx_t idx, nb::handle value) {
         return;
     }
     if (nb::isinstance(value, T.decimal) || nb::isinstance(value, T.uuid)) {
-        // Pragmatic v1: bind as VARCHAR; DuckDB implicitly casts to the
-        // target column type (DECIMAL / UUID) on execute.
+        // Bind as VARCHAR; DuckDB implicitly casts to DECIMAL / UUID on execute.
         nb::str s = nb::str(value);
         bind_check(duckdb_bind_varchar(stmt, idx, s.c_str()), idx);
         return;
     }
-    // numpy scalars (and any object exposing .item() -> native Python): re-
-    // dispatch on the unboxed value. We probe with hasattr to avoid pulling
-    // numpy in as a runtime dependency.
+    // numpy scalars (anything exposing .item() -> native Python): re-dispatch
+    // on the unboxed value. hasattr probe avoids a numpy runtime dependency.
     if (nb::hasattr(value, "item")) {
         nb::object item;
         try {
             item = value.attr("item")();
         } catch (...) {
-            // .item() exists but failed (e.g. it's a method on a non-scalar
-            // ndarray); fall through to the unsupported-type error.
             item = nb::object();
         }
         if (item) {
-            // Guard against infinite recursion: the unboxed value must be a
-            // *different* type than the original. Native Python scalars never
-            // expose .item(), so this terminates immediately.
+            // Guard against infinite recursion: native Python scalars never
+            // expose .item(), so the type-change check terminates immediately.
             if (item.type().ptr() != value.type().ptr()) {
                 bind_one(stmt, idx, item);
                 return;
@@ -265,21 +260,12 @@ void bind_parameters(duckdb_prepared_statement stmt, nb::handle parameters) {
     }
 }
 
-// Drive duckdb_pending_execute_task in a GIL-releasing loop until the executor is
-// READY (or errors), then materialize the duckdb_result via duckdb_execute_pending.
-// `streaming` switches between the buffered result (duckdb_pending_prepared) and
-// the lazy chunk-pull result (duckdb_pending_prepared_streaming) — the latter
-// keeps peak memory bounded to one chunk for iter_batches_* consumers.
-//
-// Ticking one task at a time (instead of blocking inside duckdb_execute_prepared)
-// gives two things the v1 gil_scoped_release path could not:
-//   - KeyboardInterrupt lands mid-query: PyErr_CheckSignals runs between ticks,
-//     so Ctrl-C triggers duckdb_interrupt + a drained teardown instead of
-//     parking until the query finishes.
-//   - Streaming results are reachable: the materialized fast path through
-//     duckdb_execute_prepared has no streaming counterpart.
-//
-// The prepared statement is not destroyed here — the caller still owns it.
+// Drive duckdb_pending_execute_task in a GIL-releasing loop until READY (or
+// error), then materialize via duckdb_execute_pending. Ticking one task at a
+// time (rather than blocking inside duckdb_execute_prepared) lets us run
+// PyErr_CheckSignals between ticks (Ctrl-C interrupts mid-query) and reach the
+// streaming result path. `streaming` selects duckdb_pending_prepared_streaming
+// for the lazy chunk-pull result. The caller still owns `stmt`.
 duckdb_result run_pending(duckdb_connection con, duckdb_prepared_statement stmt, bool streaming) {
     duckdb_pending_result pending = nullptr;
     duckdb_state init = streaming ? duckdb_pending_prepared_streaming(stmt, &pending)
@@ -295,8 +281,7 @@ duckdb_result run_pending(duckdb_connection con, duckdb_prepared_statement stmt,
         {
             nb::gil_scoped_release release;
             state = duckdb_pending_execute_task(pending);
-            // Workers own the remaining tasks; yield briefly so we don't spin
-            // re-querying state. 1ms keeps Ctrl-C latency imperceptible.
+            // Workers own the remaining tasks; yield briefly instead of spinning.
             if (state == DUCKDB_PENDING_NO_TASKS_AVAILABLE) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
             }
@@ -307,10 +292,8 @@ duckdb_result run_pending(duckdb_connection con, duckdb_prepared_statement stmt,
             throw DuckyError(message);
         }
         if (PyErr_CheckSignals() != 0) {
-            // A Python signal handler raised (typically KeyboardInterrupt).
-            // Interrupt the executor, drain to a terminal state so background
-            // workers detach cleanly, then re-raise. The drained result is
-            // discarded — we never expose a partial result to the caller.
+            // Signal raised (typically KeyboardInterrupt). Interrupt, drain so
+            // background workers detach cleanly, discard the result, re-raise.
             duckdb_interrupt(con);
             duckdb_result drain;
             if (duckdb_execute_pending(pending, &drain) == DuckDBSuccess) {
@@ -341,11 +324,8 @@ duckdb_result run_pending(duckdb_connection con, duckdb_prepared_statement stmt,
 Connection::Connection(const std::string& database, nb::object config) {
     auto handle = std::make_shared<DuckDBHandle>();
 
-    // Build a duckdb_config from the user-supplied Mapping[str, str], if any.
-    // We iterate via .items() rather than requiring an nb::dict so the C
-    // surface honestly accepts any read-only Mapping (TypedDict, MappingProxy,
-    // user mappings) — we only read, never mutate or take ownership. The
-    // config is always destroyed; DuckDB copies the settings on open.
+    // Iterate via .items() so we accept any read-only Mapping (TypedDict,
+    // MappingProxy, user mappings), not just nb::dict.
     duckdb_config cfg = nullptr;
     if (!config.is_none()) {
         if (duckdb_create_config(&cfg) == DuckDBError) {
@@ -443,9 +423,8 @@ nb::object Connection::get_profiling_info() const {
 
 namespace {
 
-// Run a no-result statement directly via the C API, bypassing run()/run_pending
-// (so the SET doesn't end up in the profile sink). DuckDB returns an empty
-// result for SET; we destroy it immediately.
+// Run a SET (or other no-result) statement, bypassing run() so it doesn't
+// reach the profile sink.
 void exec_no_result(duckdb_connection con, const char* sql) {
     duckdb_result r;
     if (duckdb_query(con, sql, &r) == DuckDBError) {
@@ -550,12 +529,8 @@ duckdb_result Connection::run(const std::string& query, nb::object parameters, b
     ensure_open();
     duckdb_connection con = handle_->connection;
 
-    // Unified prepare + pending-execute path. Going through prepare even when
-    // there are no parameters costs one extra parse per call (negligible vs the
-    // executor work) but buys us pending semantics — see run_pending() for the
-    // GIL / signal-handling / streaming rationale. Multi-statement strings are
-    // a deliberate non-feature here; the unbound `duckdb_extract_statements`
-    // API is the roadmap path if we ever want them back.
+    // Always go through prepare + pending-execute so the run_pending semantics
+    // (signal handling, streaming) apply. Single statement only.
     duckdb_prepared_statement stmt = nullptr;
     if (duckdb_prepare(con, query.c_str(), &stmt) == DuckDBError) {
         std::string message = duckdb_prepare_error(stmt);
@@ -578,10 +553,8 @@ duckdb_result Connection::run(const std::string& query, nb::object parameters, b
         throw;
     }
     duckdb_destroy_prepare(&stmt);
-    // Emit a profile record after a materialized run. Streaming results are
-    // skipped: the chunks haven't been pulled yet when run_pending returns, so
-    // duckdb_get_profiling_info would reflect the *previous* query, not this
-    // one.
+    // Skip streaming: chunks haven't been pulled when run_pending returns,
+    // so the profile would reflect the previous query.
     if (!streaming) {
         maybe_emit_profile(query);
     }
@@ -601,8 +574,6 @@ std::shared_ptr<Result> Connection::sql(const std::string& query, bool streaming
     return make_result(run(query, nb::none(), streaming));
 }
 
-// ── Async substrate: PendingResult + Connection::make_pending ───────────────
-
 PendingResult::PendingResult(duckdb_pending_result pending, duckdb_prepared_statement stmt,
                              bool owns_stmt, duckdb_connection con,
                              std::shared_ptr<DuckDBHandle> handle)
@@ -620,10 +591,9 @@ void PendingResult::cleanup_locked() {
 }
 
 PendingResult::~PendingResult() {
-    // Backstop for an abandoned coroutine (never materialized or drained). A
-    // live worker would hold a reference to this object via the bound
-    // execute_task method, so no tick can be in flight here — no lock needed.
-    // Interrupt first so a partially-started query stops promptly.
+    // Backstop for an abandoned coroutine. A live worker would hold a ref to
+    // this object via execute_task, so no tick can be in flight — no lock
+    // needed. Interrupt first so a partial query stops promptly.
     if (pending_) {
         if (con_) duckdb_interrupt(con_);
         duckdb_result drained;
@@ -664,10 +634,9 @@ std::shared_ptr<Result> PendingResult::materialize() {
 }
 
 void PendingResult::drain() {
-    // Interrupt is safe to call from this thread while a worker is mid-tick on
-    // another; it makes that tick return promptly so the lock frees up. Only
-    // then do we take the lock (with the GIL dropped, so the worker can finish
-    // and reacquire the GIL to return) and run the executor to a terminal state.
+    // Interrupt before taking the lock so a mid-tick worker on another thread
+    // returns promptly and lets the lock free up. GIL is dropped so the worker
+    // can reacquire it to finish.
     if (con_) duckdb_interrupt(con_);
     nb::gil_scoped_release release;
     std::lock_guard<std::mutex> lock(mu_);
@@ -721,18 +690,12 @@ PreparedStatement* Connection::prepare(const std::string& query) {
 }
 
 std::shared_ptr<Result> Connection::current_result() {
-    // Returning by value hands back a co-owning shared_ptr, so the Result stays
-    // alive for the caller even if a concurrent execute() replaces last_result_
-    // the instant after. The execute()/fetch*/current_result bindings carry
-    // nb::lock_self() (see ducky.cpp), serializing those last_result_ accesses on
-    // free-threaded builds.
+    // Co-owning shared_ptr keeps the Result alive for the caller even if a
+    // concurrent execute() replaces last_result_.
     if (!last_result_) throw DuckyError("ducky: no result set; call execute() first");
     return last_result_;
 }
 
-// The fetch delegators go through current_result() (a co-owning shared_ptr)
-// rather than a bare Result& — the temporary keeps the result alive across the
-// call, and Result's own lock_self serializes the cursor mutation.
 nb::object Connection::fetchone() { return current_result()->fetchone(); }
 nb::list Connection::fetchmany(int64_t size) { return current_result()->fetchmany(size); }
 nb::list Connection::fetchall() { return current_result()->fetchall(); }
@@ -748,9 +711,7 @@ nb::object Connection::columns() const {
     return nb::cast(last_result_->column_names());
 }
 
-// ── PreparedStatement ────────────────────────────────────────────────────────
-// Implemented here (rather than a separate prepared.cpp) to reuse the
-// bind_parameters() machinery in this file's anonymous namespace.
+// Implemented here (rather than prepared.cpp) to reuse bind_parameters().
 
 PreparedStatement::PreparedStatement(duckdb_prepared_statement stmt,
                                      std::shared_ptr<DuckDBHandle> handle)

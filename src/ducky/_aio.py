@@ -1,17 +1,12 @@
-"""Async drivers behind ``Connection.aexecute`` / ``Connection.asql``.
+"""Async drivers behind :meth:`Connection.aexecute` / :meth:`Connection.asql`.
 
-The C++ ``aexecute`` / ``asql`` methods forward here, handing us a steppable
-``PendingResult`` (see ``connection.hpp``). We own the executor loop from
-Python: each tick is offloaded to a worker thread — the DuckDB task releases the
-GIL, so the event loop thread stays free — and we yield to the loop between
-ticks instead of blocking on it. Cancellation (a cancelled task, or Ctrl-C)
-maps onto DuckDB's interrupt + drain teardown, mirroring the synchronous
-``run_pending`` path.
+The C++ ``aexecute`` / ``asql`` methods forward here, handing us a steppable :class:`PendingResult` (see ``connection.hpp``).
+We own the executor loop from Python: each tick is offloaded to a worker thread.
+The DuckDB task releases the GIL, so the event loop thread stays free — and we yield to the loop between ticks instead of blocking on it.
+Cancellation (a cancelled task, or Ctrl-C) maps onto DuckDB's interrupt + drain teardown, mirroring the synchronous ``run_pending`` path.
 
-Unlike the synchronous ``execute`` (which returns the connection and stashes
-``current_result``), the async drivers resolve to the ``Result`` directly — no
-connection state is mutated from inside the coroutine, so concurrent awaits on
-one connection can't trample each other's "current result".
+Unlike the synchronous :meth:`Connection.execute` (which stashes ``current_result``), the async drivers resolve to the :class:`Result` directly —
+no connection state is mutated from inside the coroutine, so concurrent awaits on one connection can't trample each other's "current result".
 """
 
 from __future__ import annotations
@@ -26,6 +21,7 @@ if TYPE_CHECKING:
 
 
 async def _drive(pending: PendingResult) -> Result:
+    """Step ``pending`` to completion on the event loop, returning its result."""
     try:
         while True:
             state = await asyncio.to_thread(pending.execute_task)
@@ -50,8 +46,10 @@ async def aexecute(
     parameters: list | tuple | dict[str, Any] | None,
     streaming: bool,
 ) -> Result:
+    """Async driver behind :meth:`Connection.aexecute`."""
     return await _drive(con.make_pending(query, parameters, streaming))
 
 
 async def asql(con: Connection, query: str, streaming: bool) -> Result:
+    """Async driver behind :meth:`Connection.asql`."""
     return await _drive(con.make_pending(query, None, streaming))
