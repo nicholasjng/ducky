@@ -35,7 +35,12 @@ from ._dataset import (
     target,
     vector,
 )
-from ._profile import format_profiling_info, profile
+from ._profile import (
+    ProfileConfig,
+    format_profiling_info,
+    jsonl_profile_sink,
+    profile,
+)
 from ._progress import progress_bar
 from ._typing import DuckDBConfig
 
@@ -71,7 +76,15 @@ def connect(
         return str(value)
 
     coerced = {key: coerce(value) for key, value in config.items()}
-    return _connect(database, coerced or None)
+    con = _connect(database, coerced or None)
+
+    # XLA-style opt-in: if DUCKY_PROFILE_DIR is set, attach a JSONL sink so
+    # every execute()/sql() on this connection lands in {dir}/profile-{pid}.jsonl
+    # with no further code change.
+    if cfg := ProfileConfig.from_env():
+        con.set_profile_sink(cfg.sink, sample=cfg.sample, mode=cfg.mode)
+
+    return con
 
 
 __all__ = [
@@ -85,6 +98,7 @@ __all__ = [
     "Fold",
     "Matrix",
     "PreparedStatement",
+    "ProfileConfig",
     "Result",
     "Split",
     "Target",
@@ -95,6 +109,7 @@ __all__ = [
     "dataset",
     "feature",
     "format_profiling_info",
+    "jsonl_profile_sink",
     "matrix",
     "profile",
     "progress_bar",

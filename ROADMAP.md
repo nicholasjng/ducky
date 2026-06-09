@@ -307,6 +307,22 @@ ducky's data-science / ML audience, roughly highest-value first.
     aligned tree with `time=` (human-readable durations) / `rows=` columns and
     a one-line `extra_info` continuation; the query summary at the top shows
     SQL, total/cpu time and total intermediate rows.
+  - ✅ **Always-on sink** for prod / training-loop / `ducky.dataset` queries
+    where the call site doesn't own the `execute()`. `Connection.set_profile_sink`
+    (C++) plumbs an `nb::object` sink + sample counter onto the connection;
+    `Connection::run` invokes the sink as `sink(query, info)` after every
+    materialized query (streaming results are skipped — their chunks haven't
+    been pulled yet when `run_pending` returns, so the C-API profile would
+    reflect the *previous* query). Sink exceptions are forwarded via
+    `PyErr_WriteUnraisable` so a buggy sink can't break a query. The Python
+    layer ships `ducky.jsonl_profile_sink(path, *, with_info=True|False)` —
+    one JSON line per query with `ts` / `sql` / (`info`|`summary`), opened
+    line-buffered and serialized across threads — and an XLA-style env path:
+    `ducky.connect()` checks `DUCKY_PROFILE_DIR` (plus `_MODE`, `_SAMPLE`,
+    `_NO_INFO`) and auto-attaches a process-wide JSONL sink to every new
+    connection. Prepared statements and async (`aexecute` / `asql`) aren't
+    hooked yet — the in-scope entrypoints are `execute()`/`sql()`, which is
+    what `ducky.dataset` and the typical training loop drive.
 
 - ⬜ **Table introspection + appender DEFAULTs** (`duckdb_table_description_*`,
   `duckdb_append_default` / `duckdb_append_default_to_chunk`). The

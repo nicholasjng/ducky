@@ -491,6 +491,17 @@ class Connection:
         Programmatic EXPLAIN ANALYZE: walk the post-execution profiling tree of the most recently run query and return a nested {'metrics': {str: str}, 'children': [...]} dict. Returns None if profiling isn't enabled — first run `con.execute("SET enable_profiling='no_output'")` (and optionally `SET profiling_mode='detailed'`). Metric values are currently strings (per the DuckDB C API); coerce numerics on the caller side.
         """
 
+    def set_profile_sink(
+        self,
+        sink: Callable[[str, dict[str, Any]], None] | None,
+        *,
+        sample: int = 1,
+        mode: str = "standard",
+    ) -> None:
+        """
+        Install an always-on profile sink. When set, every subsequent `execute()` / `sql()` automatically captures the post-execution profiling tree and invokes `sink(query, info)` — the same nested dict that `get_profiling_info()` returns. Enables profiling on the connection (SET enable_profiling='no_output', plus profiling_mode='detailed' when mode='detailed'). `sample=N>1` fires the sink only every Nth query, useful in tight training loops. Pass `sink=None` to detach. Streaming results (`streaming=True`) are not profiled — their chunks haven't been pulled by the time `execute` returns. Sink exceptions are printed via PyErr_WriteUnraisable and do not propagate.
+        """
+
     def register_arrow(self, name: str, obj: Any) -> None:
         """
         Register a Python object exposing `__arrow_c_stream__` (pyarrow Table, polars DataFrame, pandas-3 DataFrame, ...) as a table named `name`. Lazy and zero-copy: the source is kept and re-streamed on each query via a replacement scan (so it must support being streamed more than once), not materialized at registration.

@@ -137,6 +137,16 @@ class Connection {
     // currently always strings (per the DuckDB C API); callers coerce.
     nb::object get_profiling_info() const;
 
+    // Install a "always-on" profile sink: when set, every successful
+    // execute()/sql() automatically captures the profiling tree and forwards
+    // it as `sink(query: str, info: dict)`. Enables profiling on the
+    // connection (SET enable_profiling='no_output', and optionally
+    // profiling_mode='detailed'). `sample` fires the sink every Nth query
+    // (>=1; default 1). Pass `sink=None` to disable; existing profiling
+    // settings are *not* restored — call `con.execute("RESET enable_profiling")`
+    // if you want the settings back.
+    void set_profile_sink(nb::object sink, int64_t sample, const std::string& mode);
+
     // Register a Python object exposing the Arrow PyCapsule interface
     // (`__arrow_c_stream__`) as a table named `name`. The data is materialized
     // into a real DuckDB table at registration so subsequent queries against
@@ -153,6 +163,11 @@ class Connection {
     // result (and any Arrow stream from it) stays usable after this Connection
     // is closed or dropped.
     std::shared_ptr<Result> make_result(duckdb_result result);
+    // If a sink is installed and the sample counter fires, fetch the post-
+    // execution profiling tree and invoke sink(query, info). Called from run()
+    // for materialized queries; streaming results are skipped because their
+    // profiling info isn't yet complete when run() returns.
+    void maybe_emit_profile(const std::string& query);
 
     std::shared_ptr<DuckDBHandle> handle_;
     std::shared_ptr<Result> last_result_;
@@ -161,4 +176,12 @@ class Connection {
     // before the database handle closes). ~Connection is defined out-of-line in
     // connection.cpp, where ArrowRegistry is a complete type.
     std::unique_ptr<ArrowRegistry> arrow_registry_;
+    // Programmatic always-on profiling. profile_sink_ is `nb::none()` when no
+    // sink is installed; otherwise the (Python-callable) sink. Held under the
+    // Connection's PyCriticalSection (via lock_self on set_profile_sink /
+    // execute) so the read in maybe_emit_profile and the write in
+    // set_profile_sink don't race on free-threaded builds.
+    nb::object profile_sink_;
+    int64_t profile_sample_ = 1;
+    int64_t profile_counter_ = 0;
 };

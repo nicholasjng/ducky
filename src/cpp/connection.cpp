@@ -380,6 +380,7 @@ Connection::Connection(const std::string& database, nb::object config) {
         throw DuckyError("ducky: failed to connect to '" + database + "'");
     }
     handle_ = std::move(handle);
+    profile_sink_ = nb::none();
 }
 
 void Connection::interrupt() {
@@ -438,6 +439,65 @@ nb::object Connection::get_profiling_info() const {
     duckdb_profiling_info info = duckdb_get_profiling_info(handle_->connection);
     if (!info) return nb::none();
     return walk_profiling_node(info);
+}
+
+namespace {
+
+// Run a no-result statement directly via the C API, bypassing run()/run_pending
+// (so the SET doesn't end up in the profile sink). DuckDB returns an empty
+// result for SET; we destroy it immediately.
+void exec_no_result(duckdb_connection con, const char* sql) {
+    duckdb_result r;
+    if (duckdb_query(con, sql, &r) == DuckDBError) {
+        std::string message = duckdb_result_error(&r);
+        duckdb_destroy_result(&r);
+        throw DuckyError("ducky: " + std::string(sql) + " failed: " + message);
+    }
+    duckdb_destroy_result(&r);
+}
+
+}  // namespace
+
+void Connection::set_profile_sink(nb::object sink, int64_t sample, const std::string& mode) {
+    ensure_open();
+    if (sample < 1) sample = 1;
+    if (mode != "standard" && mode != "detailed") {
+        throw DuckyError("ducky: profile mode must be 'standard' or 'detailed', got '" + mode +
+                         "'");
+    }
+    if (sink.is_none()) {
+        profile_sink_ = nb::none();
+        profile_sample_ = 1;
+        profile_counter_ = 0;
+        return;
+    }
+    if (!PyCallable_Check(sink.ptr())) {
+        throw DuckyError("ducky: profile sink must be callable or None");
+    }
+    duckdb_connection con = handle_->connection;
+    exec_no_result(con, "SET enable_profiling='no_output'");
+    if (mode == "detailed") {
+        exec_no_result(con, "SET profiling_mode='detailed'");
+    }
+    profile_sink_ = sink;
+    profile_sample_ = sample;
+    profile_counter_ = 0;
+}
+
+void Connection::maybe_emit_profile(const std::string& query) {
+    // Fast path: no sink installed.
+    if (profile_sink_.is_none()) return;
+    int64_t n = profile_counter_++;
+    if (n % profile_sample_ != 0) return;
+    duckdb_profiling_info info = duckdb_get_profiling_info(handle_->connection);
+    if (!info) return;
+    nb::object tree = walk_profiling_node(info);
+    // Sink errors must not break the query — print to stderr and continue.
+    try {
+        profile_sink_(query, tree);
+    } catch (nb::python_error& e) {
+        PyErr_WriteUnraisable(profile_sink_.ptr());
+    }
 }
 
 void Connection::register_arrow(const std::string& name, nb::object obj) {
@@ -518,6 +578,13 @@ duckdb_result Connection::run(const std::string& query, nb::object parameters, b
         throw;
     }
     duckdb_destroy_prepare(&stmt);
+    // Emit a profile record after a materialized run. Streaming results are
+    // skipped: the chunks haven't been pulled yet when run_pending returns, so
+    // duckdb_get_profiling_info would reflect the *previous* query, not this
+    // one.
+    if (!streaming) {
+        maybe_emit_profile(query);
+    }
     return result;
 }
 

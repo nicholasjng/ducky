@@ -1,6 +1,8 @@
 """Query-profiling helpers: a context manager that toggles DuckDB's profiling
-settings, and a pretty-printer for the nested dict returned by
-:meth:`Connection.get_profiling_info`.
+settings, a pretty-printer for the nested dict returned by
+:meth:`Connection.get_profiling_info`, and an XLA-style "always-on" sink that
+can be wired up to a connection programmatically or via the ``DUCKY_PROFILE_*``
+environment variables.
 
 `Connection.get_profiling_info` is the raw, programmatic access — but it only
 returns anything once `enable_profiling` is set, and the dict is dense
@@ -12,18 +14,38 @@ parser/binder/planner phases, query summary). This module wraps both halves:
     >>> with ducky.profile(con) as p:
     ...     con.execute("SELECT count(*) FROM range(1_000_000)").fetchall()
     >>> print(p)  # or format_profiling_info(p.info) for the same string
+
+For inner-loop / dataset queries that the call site doesn't own, install a
+sink once and forget — every subsequent ``execute()``/``sql()`` writes a
+record:
+
+    >>> con = ducky.connect()
+    >>> con.set_profile_sink(ducky.jsonl_profile_sink("/tmp/p.jsonl"))
+    >>> ds = ducky.dataset(con, ...)  # queries are profiled transparently
+
+The same wiring can be triggered from outside the source by setting
+``DUCKY_PROFILE_DIR`` (and optionally ``DUCKY_PROFILE_MODE``,
+``DUCKY_PROFILE_SAMPLE``) before importing ducky.
 """
 
 from __future__ import annotations
 
 import contextlib
-from collections.abc import Iterator
-from typing import TYPE_CHECKING, Any, Literal
+import json
+import os
+import threading
+from collections.abc import Callable, Iterator
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import IO, TYPE_CHECKING, Any, Literal, NamedTuple
 
 if TYPE_CHECKING:
     from ._core import Connection
 
 ProfilingMode = Literal["standard", "detailed"]
+
+# A profile sink is `sink(query: str, info: dict) -> None`.
+ProfileSink = Callable[[str, dict[str, Any]], None]
 
 
 class ProfileResult:
@@ -252,3 +274,117 @@ def format_profiling_info(
             lines.append(" " * (name_width + 4) + collapsed)
 
     return "\n".join(lines)
+
+
+# ── Always-on sinks ──────────────────────────────────────────────────────────
+
+
+def jsonl_profile_sink(
+    path: str | os.PathLike[str],
+    *,
+    append: bool = True,
+    with_info: bool = True,
+) -> ProfileSink:
+    """Return a sink that appends each profile as one JSON line to ``path``.
+
+    Each record is::
+
+        {"ts": "<UTC ISO-8601>", "sql": "...", "info": {...nested tree...}}
+
+    The file is opened line-buffered so a crash mid-record won't lose the
+    previous lines. Set ``with_info=False`` to omit the raw tree and keep only
+    the SQL + a summary block (``total_time``, ``cpu_time``,
+    ``total_intermediate_rows``) extracted from the query-summary node — handy
+    when you only need top-line numbers and the full tree would bloat the log.
+
+    Writes are serialized by a lock so multiple connections in the same process
+    can safely share one sink.
+    """
+    # Long-lived handle, owned by the sink closure — closed on process exit.
+    # `with open(...) as f:` would require reopening on every write.
+    f: IO[str] = Path(path).open("a" if append else "w", buffering=1)  # noqa: SIM115
+    lock = threading.Lock()
+
+    def _summary(info: dict[str, Any]) -> dict[str, Any]:
+        for child in info.get("children", []):
+            if "sql" in child["metrics"]:
+                m = child["metrics"]
+                return {
+                    k: m[k] for k in ("total_time", "cpu_time", "total_intermediate_rows") if k in m
+                }
+        return {}
+
+    def sink(sql: str, info: dict[str, Any]) -> None:
+        record: dict[str, Any] = {
+            "ts": datetime.now(UTC).isoformat(timespec="microseconds"),
+            "sql": sql,
+        }
+        if with_info:
+            record["info"] = info
+        else:
+            record["summary"] = _summary(info)
+        line = json.dumps(record, default=str)
+        with lock:
+            f.write(line + "\n")
+
+    return sink
+
+
+class ProfileConfig(NamedTuple):
+    """Configuration bundle for an always-on profile sink.
+
+    Holds the sink callable plus the ``sample`` and ``mode`` arguments that
+    :meth:`Connection.set_profile_sink` accepts. The class itself is pure data
+    — construct it directly when you want a programmatic config, or build one
+    from the ``DUCKY_PROFILE_*`` environment via :meth:`from_env`::
+
+        cfg = ducky.ProfileConfig(my_sink, sample=10, mode="detailed")
+        # or
+        if cfg := ducky.ProfileConfig.from_env():
+            con.set_profile_sink(cfg.sink, sample=cfg.sample, mode=cfg.mode)
+    """
+
+    sink: ProfileSink
+    sample: int = 1
+    mode: str = "standard"
+
+    @classmethod
+    def from_env(cls) -> ProfileConfig | None:
+        """Read ``DUCKY_PROFILE_*`` and return a config, or ``None``.
+
+        Honored env vars:
+
+        * ``DUCKY_PROFILE_DIR``: directory to write to (created if missing).
+          Returns ``None`` when unset, so callers can use a walrus check.
+        * ``DUCKY_PROFILE_MODE``: ``'standard'`` (default) or ``'detailed'``.
+        * ``DUCKY_PROFILE_SAMPLE``: integer; sink fires every Nth query.
+        * ``DUCKY_PROFILE_NO_INFO``: any non-empty value → omit the raw tree
+          (writes only ``ts``/``sql``/``summary``), keeping the JSONL compact.
+
+        All connections in the same process share one file
+        ``{dir}/profile-{pid}.jsonl`` (the sink locks across threads).
+        """
+        directory_env = os.environ.get("DUCKY_PROFILE_DIR")
+        if not directory_env:
+            return None
+        directory = Path(directory_env)
+        with_info = not os.environ.get("DUCKY_PROFILE_NO_INFO")
+        key = (directory, with_info)
+        with _env_sink_lock:
+            sink = _env_sink_cache.get(key)
+            if sink is None:
+                directory.mkdir(parents=True, exist_ok=True)
+                path = directory / f"profile-{os.getpid()}.jsonl"
+                sink = jsonl_profile_sink(path, with_info=with_info)
+                _env_sink_cache[key] = sink
+        return cls(
+            sink=sink,
+            sample=int(os.environ.get("DUCKY_PROFILE_SAMPLE", "1")),
+            mode=os.environ.get("DUCKY_PROFILE_MODE", "standard"),
+        )
+
+
+# Process-wide cache so every connection appends to the same file. Opening a
+# second handle to the same path would be wasteful and harder to tail.
+_env_sink_lock = threading.Lock()
+_env_sink_cache: dict[tuple[Path, bool], ProfileSink] = {}

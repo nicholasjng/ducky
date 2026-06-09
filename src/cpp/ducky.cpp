@@ -570,6 +570,23 @@ NB_MODULE(_core, m) {
              "`con.execute(\"SET enable_profiling='no_output'\")` (and optionally "
              "`SET profiling_mode='detailed'`). Metric values are currently "
              "strings (per the DuckDB C API); coerce numerics on the caller side.")
+        .def("set_profile_sink", &Connection::set_profile_sink, "sink"_a.none(), nb::kw_only(),
+             "sample"_a = 1, "mode"_a = "standard",
+             nb::sig("def set_profile_sink(self, sink: collections.abc.Callable[[str, "
+                     "dict[str, typing.Any]], None] | None, *, sample: int = 1, "
+                     "mode: str = 'standard') -> None"),
+             "Install an always-on profile sink. When set, every subsequent "
+             "`execute()` / `sql()` automatically captures the post-execution "
+             "profiling tree and invokes `sink(query, info)` — the same nested "
+             "dict that `get_profiling_info()` returns. Enables profiling on "
+             "the connection (SET enable_profiling='no_output', plus "
+             "profiling_mode='detailed' when mode='detailed'). `sample=N>1` "
+             "fires the sink only every Nth query, useful in tight training "
+             "loops. Pass `sink=None` to detach. Streaming results "
+             "(`streaming=True`) are not profiled — their chunks haven't been "
+             "pulled by the time `execute` returns. Sink exceptions are "
+             "printed via PyErr_WriteUnraisable and do not propagate.",
+             nb::lock_self())
         .def("register_arrow", &Connection::register_arrow, "name"_a, "obj"_a,
              nb::sig("def register_arrow(self, name: str, obj: typing.Any) -> None"),
              "Register a Python object exposing `__arrow_c_stream__` (pyarrow "
