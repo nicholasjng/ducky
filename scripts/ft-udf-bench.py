@@ -36,9 +36,8 @@ import ducky
 
 
 def busy(x: np.ndarray) -> np.ndarray:
-    # The inner loop is pure Python, so it holds the GIL and only parallelizes
-    # once the GIL is gone. (numpy vectorization releases the GIL and would
-    # muddy the comparison, so we deliberately avoid it here.)
+    # Deliberately pure Python — numpy vectorization would release the GIL
+    # and muddy the with/without-GIL comparison.
     xl = x.tolist()
     out = [0.0] * len(xl)
     for i in range(len(xl)):
@@ -53,9 +52,8 @@ def busy(x: np.ndarray) -> np.ndarray:
 def run(threads: int, rows: int) -> float:
     con = ducky.connect(threads=threads)
     con.create_function("busy", busy, parameters=["DOUBLE"], return_type="DOUBLE")
-    # A materialized table scan parallelizes across row groups (~122,880 rows
-    # each), so DuckDB calls the UDF from multiple workers. (A bare range() scan
-    # stays single-threaded and would show no speedup regardless of the GIL.)
+    # Materialize so the scan parallelizes across row groups; a bare range()
+    # scan stays single-threaded and would show no speedup either way.
     con.execute(f"CREATE TABLE t AS SELECT (i % 1000)::DOUBLE AS x FROM range({rows}) t(i)")
     start = time.perf_counter()
     con.sql("SELECT sum(busy(x)) FROM t").fetchitem()

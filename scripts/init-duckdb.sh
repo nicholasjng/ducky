@@ -8,16 +8,14 @@
 # unused paths are never written to disk — and, by fetching with
 # `--filter=blob:none`, their blobs are never downloaded either.
 #
-# `git submodule update` has no `--no-checkout`, so there is no one-liner that
-# sets sparsity before materializing the tree. Instead we build the submodule's
-# git dir ourselves (`git init --separate-git-dir` into the standard
-# `.git/modules/<path>` location, exactly where `git submodule` expects it),
-# configure sparsity, then check out the pinned revision — fetching it shallow
-# and blobless first if the git dir doesn't already have it.
+# `git submodule update` has no `--no-checkout`, so we build the submodule's
+# git dir ourselves (`git init --separate-git-dir` into `.git/modules/<path>`
+# where `git submodule` expects it), configure sparsity, then check out the
+# pinned revision — fetching it shallow and blobless first if needed.
 #
-# Every step is idempotent and the flow converges to the same end state (pinned
-# revision, sparse working tree) from a fresh clone, a half-finished run, or an
-# existing full checkout. Keep the path list below in sync with DEVELOPMENT.md.
+# Every step is idempotent: fresh clone, half-finished run, or existing full
+# checkout all converge to the same state. Keep the path list below in sync
+# with DEVELOPMENT.md.
 #
 # Usage:
 #   scripts/init-duckdb.sh
@@ -27,13 +25,11 @@ repo_root="$(git rev-parse --show-toplevel)"
 cd "$repo_root"
 
 submodule="ext/duckdb"
-# `git submodule` keeps each submodule's git dir under the superproject's
-# modules/ directory; place ours there so submodule commands keep working.
+# Place the git dir where `git submodule` expects it.
 gitdir="$repo_root/$(git rev-parse --git-path "modules/$submodule")"
 
-# Paths we keep inside the DuckDB working tree, one gitignore-style pattern per
-# line (non-cone mode; a leading '/' anchors each pattern at the submodule
-# root). Anything not listed here stays unwritten.
+# Sparse-checkout patterns (non-cone; leading '/' anchors at the submodule
+# root). Anything not listed stays unwritten.
 sparse_patterns='/CMakeLists.txt
 /DuckDBConfig.cmake.in
 /DuckDBConfigVersion.cmake.in
@@ -56,12 +52,10 @@ sparse_patterns='/CMakeLists.txt
 echo ">> Registering submodule..."
 git submodule init "$submodule"
 url="$(git config "submodule.$submodule.url")"
-# The recorded gitlink revision the superproject pins this submodule to.
+# Gitlink revision the superproject pins this submodule to.
 sha="$(git ls-files -s "$submodule" | awk '{print $2}')"
 
-# Create the git dir + worktree link if they aren't already there. `git init`
-# is safe to repeat (it reinitializes), but we only need it when the worktree
-# isn't linked yet — avoid touching an already-working checkout.
+# Create the git dir + worktree link only if it isn't linked yet.
 if [ ! -e "$submodule/.git" ]; then
     echo ">> Creating git dir..."
     mkdir -p "$(dirname "$gitdir")" "$submodule"
@@ -69,7 +63,6 @@ if [ ! -e "$submodule/.git" ]; then
 fi
 
 echo ">> Configuring remote and sparse checkout..."
-# Idempotent remote setup: the git dir may already carry an 'origin'.
 if git -C "$submodule" remote get-url origin >/dev/null 2>&1; then
     git -C "$submodule" remote set-url origin "$url"
 else
@@ -82,18 +75,16 @@ git -C "$submodule" config core.sparseCheckout true
 git -C "$submodule" config core.sparseCheckoutCone false
 printf '%s\n' "$sparse_patterns" >"$gitdir/info/sparse-checkout"
 
-# Fetch the pinned revision only if the git dir doesn't already have it.
 if ! git -C "$submodule" cat-file -e "$sha^{commit}" 2>/dev/null; then
     echo ">> Fetching pinned revision $sha (shallow, blobless)..."
     git -C "$submodule" fetch -q --filter=blob:none --depth 1 origin "$sha"
 fi
 
 echo ">> Checking out $sha..."
-# -f resets the working tree to the pinned revision (like `git submodule
-# update --force`) and repopulates it even when the index already points at
-# this commit but the files are missing (e.g. a wiped or half-built tree).
+# -f repopulates the tree even when the index is already at this commit but
+# files are missing (e.g. a wiped or half-built tree).
 git -C "$submodule" checkout -q -f --detach "$sha"
-# Trim any paths a pre-existing full checkout left outside the sparse set.
+# Trim paths a pre-existing full checkout may have left outside the sparse set.
 git -C "$submodule" sparse-checkout reapply
 
 echo ">> Done. DuckDB working tree: $(du -sh "$submodule" | cut -f1)"
