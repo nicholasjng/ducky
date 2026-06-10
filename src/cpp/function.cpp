@@ -148,18 +148,18 @@ struct UDFState {
 void udf_extra_info_destroy(void* ptr) {
     if (!ptr) return;
     nb::gil_scoped_acquire gil;
-    delete static_cast<UDFContext*>(ptr);
+    delete (UDFContext*)ptr;
 }
 
 void udf_state_destroy(void* ptr) {
     if (!ptr) return;
     nb::gil_scoped_acquire gil;
-    delete static_cast<UDFState*>(ptr);
+    delete (UDFState*)ptr;
 }
 
 // Called once per worker thread; builds per-thread state via init=callable.
 void udf_init_trampoline(duckdb_init_info info) {
-    auto* ctx = static_cast<UDFContext*>(duckdb_scalar_function_init_get_extra_info(info));
+    auto* ctx = (UDFContext*)duckdb_scalar_function_init_get_extra_info(info);
     nb::gil_scoped_acquire gil;
     try {
         nb::object state = ctx->init_callable();
@@ -198,7 +198,7 @@ void set_udf_error(duckdb_function_info info, const char* what) {
 }
 
 void udf_trampoline(duckdb_function_info info, duckdb_data_chunk input, duckdb_vector output) {
-    auto* ctx = static_cast<UDFContext*>(duckdb_scalar_function_get_extra_info(info));
+    auto* ctx = (UDFContext*)duckdb_scalar_function_get_extra_info(info);
     nb::gil_scoped_acquire gil;
 
     idx_t n = duckdb_data_chunk_get_size(input);
@@ -225,7 +225,7 @@ void udf_trampoline(duckdb_function_info info, duckdb_data_chunk input, duckdb_v
             };
 
             // Borrowed; the holder owns it until thread teardown.
-            auto* state_holder = static_cast<UDFState*>(duckdb_scalar_function_get_state(info));
+            auto* state_holder = (UDFState*)duckdb_scalar_function_get_state(info);
             nb::handle state = state_holder ? nb::handle(state_holder->obj) : nb::handle();
 
             nb::object result;
@@ -313,7 +313,7 @@ struct ArrowUDFContext {
 
 void arrow_udf_extra_info_destroy(void* ptr) {
     if (!ptr) return;
-    auto* ctx = static_cast<ArrowUDFContext*>(ptr);
+    auto* ctx = (ArrowUDFContext*)ptr;
     for (duckdb_logical_type& t : ctx->param_types) duckdb_destroy_logical_type(&t);
     if (ctx->return_type) duckdb_destroy_logical_type(&ctx->return_type);
     if (ctx->options) duckdb_destroy_arrow_options(&ctx->options);
@@ -362,7 +362,7 @@ struct ConvertedSchemaGuard {
 
 void arrow_udf_trampoline(duckdb_function_info info, duckdb_data_chunk input,
                           duckdb_vector output) {
-    auto* ctx = static_cast<ArrowUDFContext*>(duckdb_scalar_function_get_extra_info(info));
+    auto* ctx = (ArrowUDFContext*)duckdb_scalar_function_get_extra_info(info);
     nb::gil_scoped_acquire gil;
     idx_t n_cols = duckdb_data_chunk_get_column_count(input);
 

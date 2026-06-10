@@ -122,7 +122,7 @@ void bind_one(duckdb_prepared_statement stmt, idx_t idx, nb::handle value) {
         uint64_t lo = 0, hi = 0;
         if (negative) {
             py_long_to_int128(value, /*is_signed=*/true, lo, hi);
-            duckdb_hugeint h{lo, static_cast<int64_t>(hi)};
+            duckdb_hugeint h{lo, (int64_t)(hi)};
             bind_check(duckdb_bind_hugeint(stmt, idx, h), idx);
         } else {
             py_long_to_int128(value, /*is_signed=*/false, lo, hi);

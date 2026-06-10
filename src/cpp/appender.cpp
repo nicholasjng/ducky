@@ -315,7 +315,7 @@ void Appender::append_columns(nb::dict columns, nb::object masks) {
             throw DuckyError("ducky: column '" + name + "' dtype mismatch (target is " +
                              duckdb_type_name(type_ids_[idx]) + ")");
         }
-        int64_t len = static_cast<int64_t>(arr.shape(0));
+        int64_t len = (int64_t)arr.shape(0);
         if (n_rows < 0)
             n_rows = len;
         else if (len != n_rows) {
@@ -335,7 +335,7 @@ void Appender::append_columns(nb::dict columns, nb::object masks) {
                                   m.dtype().code != nb::dtype<uint8_t>().code)) {
                 throw DuckyError("ducky: mask for '" + name + "' must be 1-D bool/uint8");
             }
-            if (static_cast<int64_t>(m.shape(0)) != n_rows) {
+            if ((int64_t)m.shape(0) != n_rows) {
                 throw DuckyError("ducky: mask for '" + name + "' has wrong length");
             }
             mask_arrays[idx] = std::move(m);
@@ -348,8 +348,8 @@ void Appender::append_columns(nb::dict columns, nb::object masks) {
     idx_t vec_size = duckdb_vector_size();
 
     // Stream chunks of up to vec_size rows.
-    for (int64_t offset = 0; offset < n_rows; offset += static_cast<int64_t>(vec_size)) {
-        idx_t this_n = static_cast<idx_t>(std::min<int64_t>(vec_size, n_rows - offset));
+    for (int64_t offset = 0; offset < n_rows; offset += (int64_t)vec_size) {
+        idx_t this_n = (idx_t)std::min<int64_t>(vec_size, n_rows - offset);
 
         duckdb_data_chunk chunk = duckdb_create_data_chunk(types_.data(), n_cols);
         duckdb_data_chunk_set_size(chunk, this_n);
@@ -361,7 +361,7 @@ void Appender::append_columns(nb::dict columns, nb::object masks) {
             if (col_present[i]) {
                 FlatDType d;
                 flat_dtype_for(type_ids_[i], d);
-                const uint8_t* src = static_cast<const uint8_t*>(col_arrays[i].data());
+                const uint8_t* src = (const uint8_t*)col_arrays[i].data();
                 std::memcpy(dst, src + offset * d.elem_size, this_n * d.elem_size);
             } else {
                 // Missing column → all NULL via a single memset on the bitmap.
@@ -374,12 +374,12 @@ void Appender::append_columns(nb::dict columns, nb::object masks) {
                 duckdb_vector_ensure_validity_writable(vec);
                 uint64_t* validity = duckdb_vector_get_validity(vec);
                 if (mask_arrays[i].dtype().code == nb::dtype<bool>().code) {
-                    const bool* m = static_cast<const bool*>(mask_arrays[i].data());
+                    const bool* m = (const bool*)mask_arrays[i].data();
                     for (idx_t r = 0; r < this_n; ++r) {
                         duckdb_validity_set_row_validity(validity, r, m[offset + r]);
                     }
                 } else {
-                    const uint8_t* m = static_cast<const uint8_t*>(mask_arrays[i].data());
+                    const uint8_t* m = (const uint8_t*)mask_arrays[i].data();
                     for (idx_t r = 0; r < this_n; ++r) {
                         duckdb_validity_set_row_validity(validity, r, m[offset + r] != 0);
                     }
