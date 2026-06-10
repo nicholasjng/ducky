@@ -36,9 +36,8 @@ struct ArrayRelease {
     }
 };
 
-// State carried from bind through the scan. We pull batches lazily from the
-// Arrow stream and emit them in vector-size slices. Single-threaded (the scan
-// sets max_threads = 1), so this is mutated by one thread only.
+// State carried from bind through the scan; mutated by one thread only since
+// the scan sets max_threads = 1 (which also lets us pool the selection vector).
 struct ArrowScanBind {
     nb::object capsule;                                 // keeps the Arrow stream alive
     ArrowArrayStream* stream = nullptr;                 // borrowed from `capsule`
@@ -47,6 +46,8 @@ struct ArrowScanBind {
     idx_t cursor = 0;                                   // row offset within `pending`
     bool done = false;                                  // stream exhausted
     duckdb_connection con = nullptr;                    // borrowed
+    // Sized to vec_size; reused on every emit to avoid per-chunk alloc/free.
+    duckdb_selection_vector sel = nullptr;
 };
 
 void arrow_scan_bind_destroy(void* ptr) {
@@ -54,13 +55,13 @@ void arrow_scan_bind_destroy(void* ptr) {
     auto* b = (ArrowScanBind*)ptr;
     if (b->pending) duckdb_destroy_data_chunk(&b->pending);
     if (b->converted) duckdb_destroy_arrow_converted_schema(&b->converted);
+    if (b->sel) duckdb_destroy_selection_vector(b->sel);
     nb::gil_scoped_acquire gil;  // decref the capsule (its destructor releases the stream)
     delete b;
 }
 
-// Pull the next batch from the stream into `b->pending` (converted to a chunk),
-// advancing past end-of-stream. Returns false when the stream is exhausted.
-// Must run with the GIL held (get_next may call back into Python).
+// Pull the next batch into `b->pending` as a converted chunk. Returns false
+// at end of stream. Must run with the GIL held — get_next may call into Python.
 bool pull_next_batch(ArrowScanBind* b) {
     if (b->pending) {
         duckdb_destroy_data_chunk(&b->pending);
@@ -136,6 +137,7 @@ void arrow_scan_bind(duckdb_bind_info info) {
             b->capsule = capsule;
             b->stream = stream;
             b->con = reg->con;
+            b->sel = duckdb_create_selection_vector(duckdb_vector_size());
             duckdb_bind_set_bind_data(info, b, &arrow_scan_bind_destroy);
 
             std::string err;
@@ -184,18 +186,16 @@ void arrow_scan_function(duckdb_function_info info, duckdb_data_chunk output) {
             idx_t avail = duckdb_data_chunk_get_size(b->pending) - b->cursor;
             idx_t n = avail < duckdb_vector_size() ? avail : duckdb_vector_size();
 
-            // Emit rows [cursor, cursor + n) of the pending batch. duckdb's
-            // copy-with-selection handles every column type for us.
-            duckdb_selection_vector sel = duckdb_create_selection_vector(n);
-            sel_t* sd = duckdb_selection_vector_get_data_ptr(sel);
+            // Emit rows [cursor, cursor + n) via the pooled selection vector;
+            // copy-with-selection handles every column type.
+            sel_t* sd = duckdb_selection_vector_get_data_ptr(b->sel);
             for (idx_t i = 0; i < n; ++i) sd[i] = (sel_t)(b->cursor + i);
 
             idx_t n_cols = duckdb_data_chunk_get_column_count(b->pending);
             for (idx_t c = 0; c < n_cols; ++c) {
                 duckdb_vector_copy_sel(duckdb_data_chunk_get_vector(b->pending, c),
-                                       duckdb_data_chunk_get_vector(output, c), sel, n, 0, 0);
+                                       duckdb_data_chunk_get_vector(output, c), b->sel, n, 0, 0);
             }
-            duckdb_destroy_selection_vector(sel);
 
             duckdb_data_chunk_set_size(output, n);
             b->cursor += n;

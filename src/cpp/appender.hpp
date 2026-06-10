@@ -1,6 +1,7 @@
 #pragma once
 
 #include <nanobind/nanobind.h>
+#include <tsl/robin_map.h>
 
 #include <memory>
 #include <optional>
@@ -87,6 +88,9 @@ class Appender {
 
     duckdb_appender handle_ = nullptr;
     std::vector<std::string> names_;
+    // name → index in names_/types_/type_ids_. Lets append_columns resolve
+    // column keys without an O(n_columns) scan each call.
+    tsl::robin_map<std::string, idx_t> name_to_idx_;
     std::vector<duckdb_logical_type> types_;  // owned; destroyed in dtor
     std::vector<duckdb_type> type_ids_;
     std::shared_ptr<DuckDBHandle> connection_;

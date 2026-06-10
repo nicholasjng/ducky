@@ -16,10 +16,8 @@
 
 namespace {
 
-// Returns the flat dtype + element size for numeric / temporal DuckDB types,
-// or false for non-flat types (VARCHAR / nested / DECIMAL / HUGEINT / INTERVAL).
-// Delegates to the shared TypeSpec table in function.cpp, the same source the
-// chunk exporter (chunk.cpp) draws its dtype mapping from.
+// Flat dtype + element size for numeric / temporal DuckDB types, or false for
+// non-flat types (VARCHAR, nested, DECIMAL, HUGEINT, INTERVAL).
 struct FlatDType {
     nb::dlpack::dtype dtype;
     size_t elem_size;
@@ -47,9 +45,8 @@ std::string quote_ident(const std::string& s) {
     return out;
 }
 
-// Discover column names by running `SELECT * FROM <qualified> LIMIT 0` and
-// reading them off the result. We do this once at construction so callers
-// can write `append_columns({"name": ndarray})` without an extra DESCRIBE.
+// Discover column names via `SELECT * FROM <qualified> LIMIT 0`. Called once
+// at construction so callers can use append_columns({name: ndarray}).
 std::vector<std::string> discover_column_names(duckdb_connection con,
                                                const std::optional<std::string>& catalog,
                                                const std::optional<std::string>& schema,
@@ -76,9 +73,8 @@ std::vector<std::string> discover_column_names(duckdb_connection con,
     return names;
 }
 
-// 1-D, C-contiguous ndarray view of unknown dtype. We do the dtype check
-// manually so we can give better error messages than nanobind's templated
-// type-mismatch reject.
+// 1-D, C-contiguous ndarray view of unknown dtype; we dtype-check manually
+// for better error messages than nanobind's templated reject.
 using AnyArray = nb::ndarray<nb::ro, nb::c_contig>;
 
 bool dtype_eq(nb::dlpack::dtype a, nb::dlpack::dtype b) {
@@ -113,8 +109,7 @@ Appender::Appender(Connection& connection, std::string table, std::optional<std:
         throw DuckyError(message);
     }
 
-    // Cache column types up front. Logical types are owned and destroyed in
-    // the destructor.
+    // Cache column types; logical types are owned and destroyed in the dtor.
     idx_t n_cols = duckdb_appender_column_count(handle_);
     types_.reserve(n_cols);
     type_ids_.reserve(n_cols);
@@ -132,6 +127,11 @@ Appender::Appender(Connection& connection, std::string table, std::optional<std:
         types_.clear();
         duckdb_appender_destroy(&handle_);
         throw;
+    }
+
+    name_to_idx_.reserve(names_.size());
+    for (idx_t i = 0; i < (idx_t)names_.size(); ++i) {
+        name_to_idx_.emplace(names_[i], i);
     }
 
     connection_ = connection.handle();
@@ -173,10 +173,11 @@ std::vector<std::string> Appender::column_types() const {
 }
 
 idx_t Appender::resolve(const std::string& name) const {
-    for (idx_t i = 0; i < names_.size(); ++i) {
-        if (names_[i] == name) return i;
+    auto it = name_to_idx_.find(name);
+    if (it == name_to_idx_.end()) {
+        throw DuckyError("ducky: unknown column '" + name + "' in appender");
     }
-    throw DuckyError("ducky: unknown column '" + name + "' in appender");
+    return it->second;
 }
 
 void Appender::flush() {
@@ -203,10 +204,6 @@ void Appender::close() {
                          (error_message.empty() ? std::string("(no message)") : error_message));
     }
 }
-
-// ────────────────────────────────────────────────────────────────────────────
-// Row API
-// ────────────────────────────────────────────────────────────────────────────
 
 namespace {
 
@@ -288,16 +285,11 @@ void Appender::append_row(nb::args values) {
     check_state(duckdb_appender_end_row(handle_), "end_row failed");
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// Columnar fast path
-// ────────────────────────────────────────────────────────────────────────────
-
 void Appender::append_columns(nb::dict columns, nb::object masks) {
     ensure_open();
     idx_t n_cols = type_ids_.size();
     if (columns.size() == 0) return;
 
-    // Build (col_idx -> ndarray) and (col_idx -> mask ndarray).
     std::vector<AnyArray> col_arrays(n_cols);
     std::vector<bool> col_present(n_cols, false);
     std::vector<AnyArray> mask_arrays(n_cols);
@@ -372,12 +364,10 @@ void Appender::append_columns(nb::dict columns, nb::object masks) {
                 const uint8_t* src = static_cast<const uint8_t*>(col_arrays[i].data());
                 std::memcpy(dst, src + offset * d.elem_size, this_n * d.elem_size);
             } else {
-                // Missing column: mark all rows as NULL.
+                // Missing column → all NULL via a single memset on the bitmap.
                 duckdb_vector_ensure_validity_writable(vec);
                 uint64_t* validity = duckdb_vector_get_validity(vec);
-                for (idx_t r = 0; r < this_n; ++r) {
-                    duckdb_validity_set_row_invalid(validity, r);
-                }
+                std::memset(validity, 0, (this_n + 7) / 8);
             }
 
             if (mask_present[i]) {
@@ -415,10 +405,8 @@ bool drain_arrow_error(duckdb_error_data err, std::string& out) {
     return has;
 }
 
-// Release-on-scope-exit for an Arrow C struct we *own* (the stream path fills
-// our own stack ArrowSchema/ArrowArray and transfers ownership to us). For the
-// __arrow_c_array__ path the PyCapsules own their structs instead, so we don't
-// wrap those — see append_arrow.
+// Release-on-scope-exit for owned Arrow C structs (stream path only; the
+// __arrow_c_array__ path has the capsules own their structs).
 struct SchemaRelease {
     ArrowSchema* s;
     ~SchemaRelease() {
