@@ -3,6 +3,7 @@
 #include <nanobind/ndarray.h>
 #include <nanobind/stl/string.h>
 
+#include <atomic>
 #include <cstring>
 #include <utility>
 #include <vector>
@@ -18,8 +19,24 @@ nb::dlpack::dtype dt() {
     return nb::dtype<T>();
 }
 
-// The set of primitive types we support for UDF parameters and return values.
-// Mirrors the set Chunk.column() exposes — see src/cpp/chunk.cpp.
+// Cached pyarrow callables hit on every Arrow-UDF chunk.
+struct PyArrowAPI {
+    nb::object import_from_c;  // pa.RecordBatch._import_from_c
+    nb::object from_arrays;    // pa.RecordBatch.from_arrays
+};
+
+const PyArrowAPI& pyarrow_api() {
+    static std::atomic<PyArrowAPI*> cached{nullptr};
+    static nb::ft_mutex mu;
+    return cached_singleton(cached, mu, [] {
+        nb::module_ pa = nb::module_::import_("pyarrow");
+        nb::object rb_cls = pa.attr("RecordBatch");
+        return PyArrowAPI{rb_cls.attr("_import_from_c"), rb_cls.attr("from_arrays")};
+    });
+}
+
+// Primitive types accepted as UDF parameters / return values; mirrors the set
+// Chunk.column() exposes.
 const TypeSpec kTypes[] = {
     {"BOOLEAN", DUCKDB_TYPE_BOOLEAN, sizeof(bool), &dt<bool>},
     {"TINYINT", DUCKDB_TYPE_TINYINT, sizeof(int8_t), &dt<int8_t>},
@@ -50,9 +67,8 @@ const TypeSpec& lookup(const std::string& name) {
                      "DATE, TIME, TIMESTAMP[_S/MS/NS/TZ])");
 }
 
-// Map a Python annotation object to a DuckDB type string. Only the natural
-// numeric/boolean Python types are recognized — anything else is a user
-// error that should be made explicit by passing `parameters=` / `return_type=`.
+// Python annotation → DuckDB type string. Only bool/int/float; anything else
+// must be made explicit by passing `parameters=` / `return_type=`.
 std::string annotation_to_type(nb::handle hint, const std::string& where) {
     nb::module_ builtins = nb::module_::import_("builtins");
     if (hint.is(builtins.attr("bool"))) return "BOOLEAN";
@@ -105,8 +121,7 @@ std::string infer_return_type(nb::callable fn) {
     return annotation_to_type(hints["return"], "return value");
 }
 
-// Lives in DuckDB's extra_info slot; carries everything the trampoline needs to
-// dispatch one chunk of input to the user's callable.
+// Lives in DuckDB's extra_info slot; carries everything the trampoline needs.
 struct UDFContext {
     nb::callable callable;       // owns the Python ref
     nb::callable init_callable;  // optional per-worker-thread state factory
@@ -142,8 +157,7 @@ void udf_state_destroy(void* ptr) {
     delete static_cast<UDFState*>(ptr);
 }
 
-// Called once per worker thread when the UDF starts executing. Builds the
-// per-thread state by invoking the user's init=callable.
+// Called once per worker thread; builds per-thread state via init=callable.
 void udf_init_trampoline(duckdb_init_info info) {
     auto* ctx = static_cast<UDFContext*>(duckdb_scalar_function_init_get_extra_info(info));
     nb::gil_scoped_acquire gil;
@@ -161,8 +175,7 @@ void udf_init_trampoline(duckdb_init_info info) {
 }
 
 // Build a uint8 ndarray view (1=valid, 0=NULL) over `mask_buf` for vector `v`.
-// `mask_buf` must outlive the returned ndarray (the trampoline owns it for the
-// duration of the user's callable).
+// `mask_buf` must outlive the returned ndarray.
 nb::object build_input_mask(duckdb_vector v, idx_t n, std::vector<uint8_t>& mask_buf) {
     mask_buf.resize(n);
     uint64_t* validity = duckdb_vector_get_validity(v);
@@ -192,16 +205,14 @@ void udf_trampoline(duckdb_function_info info, duckdb_data_chunk input, duckdb_v
     idx_t n_params =
         ctx->varargs_type ? duckdb_data_chunk_get_column_count(input) : ctx->param_types.size();
     size_t shape[1] = {(size_t)n};
-    // Per-arg mask scratch buffers; sized only when special_handling is set.
-    // The (values, mask) ndarrays handed to the callable view this storage, so
-    // it must live until the callable returns.
+    // Per-arg mask scratch (only with special_handling). The (values, mask)
+    // ndarrays view this storage; it must live until the callable returns.
     std::vector<std::vector<uint8_t>> mask_bufs(ctx->special_handling ? n_params : 0);
 
     guard(
         [&] {
-            // Build input ndarray views over the chunk's vectors. Owner is empty:
-            // the arrays are valid only for the duration of this call. Capturing
-            // them past the call is undefined — same hazard as Chunk.column views.
+            // Input ndarray views over the chunk's vectors. Owner is empty;
+            // arrays are valid only for this call, like Chunk.column views.
             auto build_values = [&](idx_t i) {
                 duckdb_vector v = duckdb_data_chunk_get_vector(input, i);
                 void* data = duckdb_vector_get_data(v);
@@ -213,8 +224,7 @@ void udf_trampoline(duckdb_function_info info, duckdb_data_chunk input, duckdb_v
                 return (nb::object)nb::make_tuple(values, mask);
             };
 
-            // Per-worker-thread state set by init=callable; borrowed reference
-            // (the holder owns it until thread teardown).
+            // Borrowed; the holder owns it until thread teardown.
             auto* state_holder = static_cast<UDFState*>(duckdb_scalar_function_get_state(info));
             nb::handle state = state_holder ? nb::handle(state_holder->obj) : nb::handle();
 
@@ -232,8 +242,8 @@ void udf_trampoline(duckdb_function_info info, duckdb_data_chunk input, duckdb_v
                 result = state ? ctx->callable(state, kwargs) : ctx->callable(kwargs);
             }
 
-            // The UDF may return either an ndarray of values, or a (values, mask)
-            // tuple where `mask` is a 1D uint8/bool array (1=valid, 0=null).
+            // Returned value: an ndarray, or a (values, mask) tuple where
+            // mask is a 1-D uint8/bool array (1=valid, 0=null).
             nb::object values_obj = result;
             nb::object mask_obj;
             if (nb::isinstance<nb::tuple>(result)) {
@@ -266,7 +276,7 @@ void udf_trampoline(duckdb_function_info info, duckdb_data_chunk input, duckdb_v
                     throw DuckyError("ducky: UDF mask shape != (" + std::to_string(n) + ",)");
                 }
                 nb::dlpack::dtype mdt = mask.dtype();
-                // Accept uint8 or bool (both 8-bit unsigned in DLPack: code=1, bits=8).
+                // uint8 or bool — both 8-bit unsigned in DLPack (code=1, bits=8).
                 if (mdt.bits != 8 || (mdt.code != (uint8_t)nb::dlpack::dtype_code::UInt &&
                                       mdt.code != (uint8_t)nb::dlpack::dtype_code::Bool)) {
                     throw DuckyError("ducky: UDF mask must be uint8 or bool");
@@ -373,10 +383,8 @@ void arrow_udf_trampoline(duckdb_function_info info, duckdb_data_chunk input,
 
             // Hand the (array, schema) pair off to pyarrow via _import_from_c.
             // pyarrow takes ownership and clears the release callbacks on success.
-            nb::module_ pa = nb::module_::import_("pyarrow");
-            nb::object rb =
-                pa.attr("RecordBatch")
-                    .attr("_import_from_c")((uintptr_t)(&in.array), (uintptr_t)(&in.schema));
+            const PyArrowAPI& pa = pyarrow_api();
+            nb::object rb = pa.import_from_c((uintptr_t)(&in.array), (uintptr_t)(&in.schema));
 
             // Dispatch to the user's callable according to the registered convention.
             nb::object result;
@@ -400,7 +408,7 @@ void arrow_udf_trampoline(duckdb_function_info info, duckdb_data_chunk input,
             nb::list out_arrays, out_names;
             out_arrays.append(result);
             out_names.append(nb::str("x"));
-            nb::object out_rb = pa.attr("RecordBatch").attr("from_arrays")(out_arrays, out_names);
+            nb::object out_rb = pa.from_arrays(out_arrays, out_names);
 
             ArrowPair out;
             out_rb.attr("_export_to_c")((uintptr_t)(&out.array), (uintptr_t)(&out.schema));

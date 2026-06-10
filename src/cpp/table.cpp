@@ -15,8 +15,7 @@ namespace {
 
 // Convert a duckdb_value (bound SQL parameter) to a Python object.
 nb::object duckdb_value_to_python(duckdb_value val) {
-    // duckdb_get_value_type returns a BORROWED reference (pointer to val's own field).
-    // Do NOT call duckdb_destroy_logical_type on it.
+    // duckdb_get_value_type returns a borrowed pointer — do not destroy.
     duckdb_type tid = duckdb_get_type_id(duckdb_get_value_type(val));
 
     switch (tid) {
@@ -187,18 +186,18 @@ void table_main(duckdb_function_info info, duckdb_data_chunk output) {
 
     bool ok = guard(
         [&] {
+            PyObject* gen = id->generator.ptr();
             while (rows < 2048) {
-                nb::object row_obj;
-                try {
-                    row_obj =
-                        nb::object(nb::module_::import_("builtins").attr("next")(id->generator));
-                } catch (nb::python_error& e) {
-                    if (e.matches(PyExc_StopIteration)) {
-                        id->exhausted = true;
-                        break;
-                    }
-                    throw;
+                // PyIter_Next: returns NULL at exhaustion (no error) or NULL +
+                // error set on failure. Avoids a `builtins.next` attr lookup
+                // and a StopIteration throw per row.
+                PyObject* raw = PyIter_Next(gen);
+                if (!raw) {
+                    if (PyErr_Occurred()) throw nb::python_error();
+                    id->exhausted = true;
+                    break;
                 }
+                nb::object row_obj = nb::steal(raw);
 
                 // Accept single-value non-tuple rows as a 1-element tuple.
                 nb::tuple row;
