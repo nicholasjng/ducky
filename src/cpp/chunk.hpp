@@ -2,6 +2,7 @@
 
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
+#include <tsl/robin_map.h>
 
 #include <cstdint>
 #include <memory>
@@ -12,6 +13,14 @@
 #include "duckdb.h"
 
 namespace nb = nanobind;
+
+// Shared schema (column names + name → index) for all the chunks of one
+// Result. Built once by Result and held by every Chunk it spawns, so
+// fetch_chunk doesn't deep-copy the name vector per chunk.
+struct ChunkSchema {
+    std::vector<std::string> names;
+    tsl::robin_map<std::string, idx_t> name_to_idx;
+};
 
 // Owns a single `duckdb_data_chunk` and exposes each numeric/temporal column as
 // a zero-copy nb::ndarray (numpy framework, DLPack-compatible).
@@ -35,7 +44,7 @@ namespace nb = nanobind;
 // alive for as long as any column view is held.
 class Chunk {
    public:
-    Chunk(duckdb_data_chunk chunk, std::vector<std::string> names,
+    Chunk(duckdb_data_chunk chunk, std::shared_ptr<const ChunkSchema> schema,
           std::shared_ptr<DuckDBHandle> handle);
     ~Chunk();
 
@@ -43,7 +52,7 @@ class Chunk {
     Chunk& operator=(const Chunk&) = delete;
 
     idx_t size() const { return size_; }
-    const std::vector<std::string>& column_names() const { return names_; }
+    const std::vector<std::string>& column_names() const { return schema_->names; }
     std::vector<std::string> column_types() const;
 
     // Returns the column at `key` (int index or str name) as a 1-D ndarray
@@ -69,7 +78,9 @@ class Chunk {
     idx_t resolve(nb::object key) const;
 
     duckdb_data_chunk chunk_;
-    std::vector<std::string> names_;
+    // Shared with the Result that produced this chunk; immutable across all
+    // chunks of that result.
+    std::shared_ptr<const ChunkSchema> schema_;
     std::vector<duckdb_logical_type> types_;
     std::vector<duckdb_type> type_ids_;
     std::vector<duckdb_vector> vectors_;

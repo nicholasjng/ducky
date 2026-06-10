@@ -10,11 +10,9 @@
 
 namespace {
 
-// Maps a DuckDB primitive type to a DLPack/numpy dtype matching the chunk's
-// in-memory layout (temporal types come back as their raw integer storage:
-// DATE -> int32 days, TIMESTAMP -> int64 micros). Delegates to the shared
-// TypeSpec table in function.cpp. Non-flat types (VARCHAR, BLOB, LIST, STRUCT,
-// MAP, ARRAY, DECIMAL, HUGEINT, UUID, INTERVAL) return false; callers raise.
+// DuckDB primitive type → DLPack/numpy dtype matching the in-memory layout.
+// Temporal types come back as their raw integer storage (DATE int32 days,
+// TIMESTAMP int64 micros). Non-flat types return false.
 bool dtype_for(duckdb_type t, nb::dlpack::dtype& out) {
     if (const TypeSpec* spec = typespec_for(t)) {
         out = spec->dtype();
@@ -23,10 +21,8 @@ bool dtype_for(duckdb_type t, nb::dlpack::dtype& out) {
     return false;
 }
 
-// Lazily-constructed numpy structured dtypes for HUGEINT, UHUGEINT, and
-// INTERVAL. Each is built from Python on first use and intentionally leaked so
-// its destructor never runs at interpreter shutdown (same pattern as
-// bind_types() in connection.cpp).
+// Lazy numpy structured dtypes for HUGEINT, UHUGEINT, INTERVAL. Built once,
+// intentionally leaked at interpreter shutdown.
 struct StructDtypes {
     nb::object hugeint;   // dtype([('lower','<u8'),('upper','<i8')])
     nb::object uhugeint;  // dtype([('lower','<u8'),('upper','<u8')])
@@ -51,9 +47,8 @@ const StructDtypes& struct_dtypes() {
     });
 }
 
-// Wrap `data` (n * itemsize bytes) as a zero-copy uint8 ndarray, then call
-// numpy .view(dtype) to reinterpret it as a structured array of n elements.
-// `owner` keeps the underlying buffer alive via nanobind's owner mechanism.
+// Wrap n * itemsize bytes as a zero-copy uint8 ndarray, then .view(dtype) it
+// into a structured array of n elements. `owner` pins the underlying buffer.
 nb::object make_struct_view(void* data, size_t n, size_t itemsize, nb::object dtype,
                             nb::handle owner) {
     size_t byte_count = n * itemsize;
@@ -64,11 +59,11 @@ nb::object make_struct_view(void* data, size_t n, size_t itemsize, nb::object dt
 
 }  // namespace
 
-Chunk::Chunk(duckdb_data_chunk chunk, std::vector<std::string> names,
+Chunk::Chunk(duckdb_data_chunk chunk, std::shared_ptr<const ChunkSchema> schema,
              std::shared_ptr<DuckDBHandle> handle)
-    : chunk_(chunk), names_(std::move(names)), handle_(std::move(handle)) {
+    : chunk_(chunk), schema_(std::move(schema)), handle_(std::move(handle)) {
     size_ = duckdb_data_chunk_get_size(chunk_);
-    idx_t n = names_.size();
+    idx_t n = schema_->names.size();
     types_.reserve(n);
     type_ids_.reserve(n);
     vectors_.reserve(n);
@@ -98,15 +93,20 @@ std::vector<std::string> Chunk::column_types() const {
 
 idx_t Chunk::resolve(nb::object key) const {
     if (nb::isinstance<nb::str>(key)) {
-        std::string name = nb::cast<std::string>(key);
-        for (idx_t i = 0; i < names_.size(); ++i) {
-            if (names_[i] == name) return i;
+        // Borrow PyUnicode's cached UTF-8; the std::string ctor only allocates
+        // for the probe key (and once more on miss for the error message).
+        Py_ssize_t size = 0;
+        const char* data = PyUnicode_AsUTF8AndSize(key.ptr(), &size);
+        if (!data) throw nb::python_error();
+        auto it = schema_->name_to_idx.find(std::string(data, (size_t)size));
+        if (it == schema_->name_to_idx.end()) {
+            throw DuckyError("ducky: no such column: " + std::string(data, (size_t)size));
         }
-        throw DuckyError("ducky: no such column: " + name);
+        return it->second;
     }
     if (nb::isinstance<nb::int_>(key)) {
         int64_t i = nb::cast<int64_t>(key);
-        int64_t n = (int64_t)names_.size();
+        int64_t n = (int64_t)schema_->names.size();
         if (i < 0) i += n;
         if (i < 0 || i >= n) throw DuckyError("ducky: column index out of range");
         return (idx_t)i;
@@ -172,7 +172,7 @@ int Chunk::decimal_scale(nb::object key) {
     idx_t i = resolve(key);
     if (type_ids_[i] != DUCKDB_TYPE_DECIMAL) {
         throw DuckyError(std::string("ducky: decimal_scale() called on non-DECIMAL column '") +
-                         names_[i] + "' (" + duckdb_type_name(type_ids_[i]) + ")");
+                         schema_->names[i] + "' (" + duckdb_type_name(type_ids_[i]) + ")");
     }
     return (int)duckdb_decimal_scale(types_[i]);
 }
