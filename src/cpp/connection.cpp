@@ -5,7 +5,6 @@
 #include <nanobind/stl/vector.h>
 
 #include <atomic>
-#include <chrono>
 #include <cstring>
 #include <thread>
 
@@ -277,9 +276,10 @@ duckdb_result run_pending(duckdb_connection con, duckdb_prepared_statement stmt,
         {
             nb::gil_scoped_release release;
             state = duckdb_pending_execute_task(pending);
-            // Workers own the remaining tasks; yield briefly instead of spinning.
+            // Workers own the remaining tasks. yield() (not sleep) — a 1 ms
+            // sleep here was ~100s overhead across 100k single-row INSERTs.
             if (state == DUCKDB_PENDING_NO_TASKS_AVAILABLE) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                std::this_thread::yield();
             }
         }
         if (state == DUCKDB_PENDING_ERROR) {
