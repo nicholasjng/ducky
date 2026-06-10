@@ -35,6 +35,16 @@ dev = [
 typing = [
     "ty>=0.0.35",
 ]
+bench = [
+    "duckdb>=1.5",
+    "mew",
+    "memray>=1.18",
+    "numpy>=2.4.6",
+    "pyarrow>=24.0.0",
+]
+
+[tool.uv.sources]
+mew = { path = "../mew", editable = true }
 
 [tool.uv]
 # Build ducky against the project .venv so includes from Python packages
@@ -57,6 +67,14 @@ if.env.DUCKY_ASAN = "1"
 build-dir = "build/asan"
 cmake.build-type = "Debug"
 cmake.args = ["-DDUCKY_ASAN=ON"]
+
+# RelWithDebInfo: Release optimizations + debug symbols. Lets atos/perf/dtrace
+# symbolize ducky frames in profiles. On macOS, dwarf stays in the .o files
+# and atos finds it as long as the build tree is intact (no need for a dSYM).
+[[tool.scikit-build.overrides]]
+if.env.DUCKY_RELDBG = "1"
+build-dir = "build/reldbg"
+cmake.build-type = "RelWithDebInfo"
 
 [tool.ruff]
 line-length = 100
