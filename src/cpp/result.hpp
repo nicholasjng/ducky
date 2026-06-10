@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 
+#include "chunk.hpp"
 #include "database.hpp"
 #include "duckdb.h"
 
@@ -29,7 +30,7 @@ class Result {
     Result(const Result&) = delete;
     Result& operator=(const Result&) = delete;
 
-    const std::vector<std::string>& column_names() const { return names_; }
+    const std::vector<std::string>& column_names() const { return schema_->names; }
     std::vector<std::string> column_types() const;
     // PEP 249 Cursor.description: one 7-tuple per column, or None when the
     // statement produced no result set.
@@ -64,7 +65,9 @@ class Result {
     duckdb_result result_;
     std::shared_ptr<DuckDBHandle> handle_;
     idx_t column_count_;
-    std::vector<std::string> names_;
+    // Shared with every Chunk this Result spawns; never mutated after the
+    // Result constructor finishes.
+    std::shared_ptr<const ChunkSchema> schema_;
     std::vector<duckdb_type> types_;
     // Per-column logical types, owned for the Result's lifetime so the row
     // decoder doesn't allocate one per cell (a column's type is constant).

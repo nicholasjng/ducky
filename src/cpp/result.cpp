@@ -1,5 +1,6 @@
 #include "result.hpp"
 
+#include <datetime.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/vector.h>
 
@@ -14,29 +15,25 @@ using namespace nb::literals;
 
 namespace {
 
-// Python constructors we convert into, imported once and intentionally leaked so
-// their destructors never run after interpreter shutdown.
+// Python types and instances used by convert_value. Imported once,
+// intentionally leaked so destructors don't run at interpreter shutdown.
+// date / time / timedelta values are built via the PyDateTime_* CAPI macros.
 struct PyTypes {
-    nb::type_object date;       // datetime.date
-    nb::type_object time;       // datetime.time
-    nb::type_object datetime;   // datetime.datetime
-    nb::type_object timedelta;  // datetime.timedelta
-    nb::object timezone_utc;    // datetime.timezone.utc — an instance, not a type
-    nb::type_object decimal;    // decimal.Decimal
-    nb::object decimal_ctx;     // decimal.Context(prec=40) — an instance
-    nb::type_object uuid;       // uuid.UUID
+    nb::type_object datetime;  // datetime.datetime (tz-aware branch only)
+    nb::object timezone_utc;   // datetime.timezone.utc
+    nb::type_object decimal;   // decimal.Decimal
+    nb::object decimal_ctx;    // decimal.Context(prec=40)
+    nb::type_object uuid;      // uuid.UUID
 };
 
 const PyTypes& py_types() {
     static std::atomic<PyTypes*> cached{nullptr};
     static nb::ft_mutex mu;
     return cached_singleton(cached, mu, [] {
+        if (!PyDateTimeAPI) PyDateTime_IMPORT;
         PyTypes t;
         nb::module_ datetime = nb::module_::import_("datetime");
-        t.date = datetime.attr("date");
-        t.time = datetime.attr("time");
         t.datetime = datetime.attr("datetime");
-        t.timedelta = datetime.attr("timedelta");
         t.timezone_utc = datetime.attr("timezone").attr("utc");
         nb::module_ decimal = nb::module_::import_("decimal");
         t.decimal = decimal.attr("Decimal");
@@ -51,8 +48,8 @@ nb::object steal_checked(PyObject* obj) {
     return nb::steal(obj);
 }
 
-// Builds an arbitrary-precision Python int from a 128-bit value given as a
-// 64-bit unsigned low half and an already-boxed (signed or unsigned) high half.
+// Build a Python int from a 128-bit value: unsigned low half + already-boxed
+// (signed or unsigned) high half.
 nb::object combine_128(nb::object high, uint64_t low) {
     nb::object shift = steal_checked(PyLong_FromLong(64));
     nb::object hi = steal_checked(PyNumber_Lshift(high.ptr(), shift.ptr()));
@@ -69,30 +66,28 @@ nb::object uhugeint_to_py(duckdb_uhugeint value) {
 }
 
 nb::object date_to_py(int32_t days) {
-    duckdb_date date{days};
-    duckdb_date_struct s = duckdb_from_date(date);
-    return py_types().date(s.year, s.month, s.day);
+    duckdb_date_struct s = duckdb_from_date(duckdb_date{days});
+    return nb::steal(PyDate_FromDate(s.year, s.month, s.day));
 }
 
 nb::object time_to_py(int64_t micros) {
-    duckdb_time time{micros};
-    duckdb_time_struct s = duckdb_from_time(time);
-    return py_types().time(s.hour, s.min, s.sec, s.micros);
+    duckdb_time_struct s = duckdb_from_time(duckdb_time{micros});
+    return nb::steal(PyTime_FromTime(s.hour, s.min, s.sec, s.micros));
 }
 
 nb::object timestamp_to_py(int64_t micros, bool utc) {
-    duckdb_timestamp ts{micros};
-    duckdb_timestamp_struct s = duckdb_from_timestamp(ts);
+    duckdb_timestamp_struct s = duckdb_from_timestamp(duckdb_timestamp{micros});
     if (utc) {
+        // No CAPI overload takes tzinfo; route through the Python constructor.
         return py_types().datetime(s.date.year, s.date.month, s.date.day, s.time.hour, s.time.min,
                                    s.time.sec, s.time.micros, py_types().timezone_utc);
     }
-    return py_types().datetime(s.date.year, s.date.month, s.date.day, s.time.hour, s.time.min,
-                               s.time.sec, s.time.micros);
+    return nb::steal(PyDateTime_FromDateAndTime(s.date.year, s.date.month, s.date.day, s.time.hour,
+                                                s.time.min, s.time.sec, s.time.micros));
 }
 
-// DuckDB stores UUIDs as an int128 with the high bit flipped so signed ordering
-// matches UUID ordering; flip it back to recover the unsigned 128-bit value.
+// DuckDB stores UUIDs as int128 with the high bit flipped (so signed ordering
+// matches UUID ordering); flip it back for the unsigned 128-bit value.
 nb::object uuid_to_py(duckdb_hugeint value) {
     uint64_t high = (uint64_t)value.upper ^ (uint64_t(1) << 63);
     nb::object as_int = combine_128(steal_checked(PyLong_FromUnsignedLongLong(high)), value.lower);
@@ -117,16 +112,15 @@ nb::object decimal_to_py(void* data, idx_t row, duckdb_type internal, uint8_t sc
         default:
             throw DuckyError("ducky: unexpected DECIMAL storage type");
     }
-    // Decimal(unscaled).scaleb(-scale) shifts the decimal point exactly (the
-    // wide context avoids any rounding).
+    // scaleb shifts the decimal point exactly; the wide context avoids rounding.
     return py_types().decimal(unscaled).attr("scaleb")(-(int)scale, py_types().decimal_ctx);
 }
 
 nb::object interval_to_py(duckdb_interval value) {
-    // datetime.timedelta has no notion of months; approximate 1 month as 30
-    // days. (Use the Arrow path for an exact month/day/micros interval.)
-    long days = (long)value.days + (long)value.months * 30;
-    return py_types().timedelta(days, 0, value.micros);  // (days, seconds, microseconds)
+    // timedelta has no months; approximate 1 month as 30 days. Use the Arrow
+    // path for an exact month / day / micros interval.
+    int days = value.days + value.months * 30;
+    return nb::steal(PyDelta_FromDSU(days, 0, value.micros));
 }
 
 idx_t enum_index(void* data, idx_t row, duckdb_type internal) {
@@ -142,11 +136,10 @@ idx_t enum_index(void* data, idx_t row, duckdb_type internal) {
     }
 }
 
-// Recursively converts the value at `row` of `vector` to a Python object,
-// descending into LIST/STRUCT/ARRAY/MAP children as needed. `logical` is the
-// vector's logical type, *borrowed* (the caller owns it): top-level columns pass
-// the Result's cached types, so the hot path never allocates a logical type per
-// cell. Nested children fetch their own type once per cell and free it.
+// Recursively convert the value at `row` of `vector` to a Python object,
+// descending into LIST/STRUCT/ARRAY/MAP children. `logical` is borrowed: top-
+// level columns pass the Result's cached types so the hot path never allocates
+// per cell; nested children fetch and free their own per cell.
 nb::object convert_value(duckdb_vector vector, duckdb_logical_type logical, idx_t row) {
     uint64_t* validity = duckdb_vector_get_validity(vector);
     if (validity && !duckdb_validity_row_is_valid(validity, row)) return nb::none();
@@ -273,10 +266,9 @@ nb::object convert_value(duckdb_vector vector, duckdb_logical_type logical, idx_
     }
 }
 
-// ── Arrow C stream interface ────────────────────────────────────────────────
-// Backs an ArrowArrayStream by pulling chunks from a duckdb_result on demand
-// and exporting each via the DuckDB Arrow C API. `owner` keeps the Python
-// Result alive for as long as the stream exists.
+// ArrowArrayStream backing for a duckdb_result: pulls chunks on demand and
+// exports each via the DuckDB Arrow C API. `owner` keeps the Result alive
+// for the stream's lifetime.
 struct ArrowStreamState {
     nb::object owner;              // keeps the Result (and its DuckDBHandle) alive
     duckdb_result* result;         // borrowed from owner
@@ -284,8 +276,7 @@ struct ArrowStreamState {
     std::string last_error;
 };
 
-// Records an error from a duckdb_error_data (if any) and destroys it. Returns
-// true when an error was present.
+// Record + destroy a duckdb_error_data; returns true when an error was present.
 bool consume_error(ArrowStreamState* state, duckdb_error_data error) {
     if (!error) return false;
     bool has_error = duckdb_error_data_has_error(error);
@@ -349,8 +340,8 @@ nb::object Result::arrow_c_stream(nb::object self) {
     if (!handle_ || !handle_->connection) {
         throw DuckyError("ducky: Arrow export is unavailable; the connection is closed");
     }
-    // Options carry a live client context from the still-open connection (the
-    // handle keeps it alive). The stream owns them and frees them on release.
+    // Options carry a live client context from the connection; the stream
+    // owns them and frees them on release.
     duckdb_arrow_options options = nullptr;
     duckdb_connection_get_arrow_options(handle_->connection, &options);
 
@@ -374,16 +365,23 @@ nb::object Result::arrow_c_stream(nb::object self) {
 
 Result::Result(duckdb_result result, std::shared_ptr<DuckDBHandle> handle)
     : result_(result), handle_(std::move(handle)) {
+    // PyDateTimeAPI is static per-TU; prime ours so the *_to_py helpers can
+    // use PyDate_FromDate / PyTime_FromTime / etc. unconditionally.
+    if (!PyDateTimeAPI) PyDateTime_IMPORT;
     column_count_ = duckdb_column_count(&result_);
-    names_.reserve(column_count_);
+    auto schema = std::make_shared<ChunkSchema>();
+    schema->names.reserve(column_count_);
+    schema->name_to_idx.reserve(column_count_);
     types_.reserve(column_count_);
     column_types_.reserve(column_count_);
     for (idx_t i = 0; i < column_count_; ++i) {
-        names_.emplace_back(duckdb_column_name(&result_, i));
+        schema->names.emplace_back(duckdb_column_name(&result_, i));
+        schema->name_to_idx.emplace(schema->names.back(), i);
         duckdb_logical_type logical = duckdb_column_logical_type(&result_, i);
         column_types_.push_back(logical);
         types_.push_back(duckdb_get_type_id(logical));
     }
+    schema_ = std::move(schema);
 }
 
 Result::~Result() {
@@ -415,8 +413,8 @@ nb::object Result::description() const {
     nb::list out;
     for (idx_t i = 0; i < column_count_; ++i) {
         // (name, type_code, display_size, internal_size, precision, scale, null_ok)
-        out.append(nb::make_tuple(names_[i], duckdb_type_name(types_[i]), nb::none(), nb::none(),
-                                  nb::none(), nb::none(), nb::none()));
+        out.append(nb::make_tuple(schema_->names[i], duckdb_type_name(types_[i]), nb::none(),
+                                  nb::none(), nb::none(), nb::none(), nb::none()));
     }
     return out;
 }
@@ -453,10 +451,8 @@ nb::object Result::build_row() {
     return nb::steal(tuple);
 }
 
-// The cursor methods below mutate chunk_ / cursor_ / vectors_. They're registered
-// with nb::lock_self() in ducky.cpp, which wraps each call in a PyCriticalSection
-// on the Result on free-threaded builds (no-op under the GIL) — so concurrent
-// calls on the same Result are serialized rather than corrupting cursor state.
+// The cursor methods below mutate chunk_/cursor_/vectors_; nb::lock_self() in
+// ducky.cpp serializes concurrent calls on free-threaded builds.
 nb::object Result::fetchone() {
     if (!ensure_row()) return nb::none();
     return build_row();
@@ -482,9 +478,8 @@ nb::object Result::fetchitem() {
     if (!ensure_row()) {
         throw DuckyError("ducky: fetchitem() requires exactly 1 row; the result is empty");
     }
-    // Decode the lone cell, then confirm no second row remains. The value is a
-    // fully materialized Python object, so it survives releasing the chunk that
-    // the follow-up ensure_row() may trigger.
+    // Decode then confirm no second row remains. value is materialized, so it
+    // survives the chunk release that the follow-up ensure_row() may trigger.
     idx_t row = cursor_++;
     nb::object value = convert_value(vectors_[0], column_types_[0], row);
     if (ensure_row()) {
@@ -496,5 +491,5 @@ nb::object Result::fetchitem() {
 nb::object Result::fetch_chunk() {
     duckdb_data_chunk chunk = duckdb_fetch_chunk(result_);
     if (!chunk) return nb::none();
-    return nb::cast(new Chunk(chunk, names_, handle_));
+    return nb::cast(new Chunk(chunk, schema_, handle_));
 }
