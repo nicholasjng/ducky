@@ -1,5 +1,6 @@
 #include "connection.hpp"
 
+#include <datetime.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/vector.h>
 
@@ -16,14 +17,9 @@ namespace {
 
 using namespace nb::literals;
 
-// Cached Python stdlib types we dispatch against during binding. Imported
-// once, intentionally leaked so the destructors never run at interpreter
-// shutdown.
+// Cached Python types and 128-bit constants used by bind_one. Imported once,
+// intentionally leaked so the destructors don't run at interpreter shutdown.
 struct BindTypes {
-    nb::type_object date;             // datetime.date
-    nb::type_object time;             // datetime.time
-    nb::type_object datetime;         // datetime.datetime
-    nb::type_object timedelta;        // datetime.timedelta
     nb::type_object decimal;          // decimal.Decimal
     nb::type_object uuid;             // uuid.UUID
     nb::object epoch_utc;             // datetime(1970, 1, 1, tzinfo=timezone.utc)
@@ -37,23 +33,19 @@ const BindTypes& bind_types() {
     static std::atomic<BindTypes*> cached{nullptr};
     static nb::ft_mutex mu;
     return cached_singleton(cached, mu, [] {
+        // PyDateTime_IMPORT primes PyDateTimeAPI for this TU.
+        if (!PyDateTimeAPI) PyDateTime_IMPORT;
         nb::module_ dt = nb::module_::import_("datetime");
-        nb::type_object datetime_ty = dt.attr("datetime");
         nb::object utc = dt.attr("timezone").attr("utc");
-        nb::object epoch_utc = datetime_ty(1970, 1, 1, 0, 0, 0, 0, utc);
+        nb::object epoch_utc = dt.attr("datetime")(1970, 1, 1, 0, 0, 0, 0, utc);
         nb::object two_pow_127 = nb::int_(1).attr("__lshift__")(127);
-        nb::object int128_min = two_pow_127.attr("__neg__")();
         nb::object two_pow_128 = nb::int_(1).attr("__lshift__")(128);
         nb::object mask64 = nb::int_(1).attr("__lshift__")(64).attr("__sub__")(nb::int_(1));
         return BindTypes{
-            dt.attr("date"),
-            dt.attr("time"),
-            datetime_ty,
-            dt.attr("timedelta"),
             nb::module_::import_("decimal").attr("Decimal"),
             nb::module_::import_("uuid").attr("UUID"),
             std::move(epoch_utc),
-            std::move(int128_min),
+            two_pow_127.attr("__neg__")(),
             std::move(two_pow_127),
             std::move(two_pow_128),
             std::move(mask64),
@@ -62,9 +54,8 @@ const BindTypes& bind_types() {
 }
 
 // Split a Python int into a 128-bit (lo, hi) pair.
-//
-// `is_signed=true`  accepts values in [-2^127,   2^127 - 1].
-// `is_signed=false` accepts values in [0,        2^128 - 1].
+//   is_signed=true  → [-2^127, 2^127 - 1]
+//   is_signed=false → [0,      2^128 - 1]
 // Anything outside raises DuckyError.
 void py_long_to_int128(nb::handle value, bool is_signed, uint64_t& lo, uint64_t& hi) {
     const BindTypes& T = bind_types();
@@ -81,7 +72,7 @@ void py_long_to_int128(nb::handle value, bool is_signed, uint64_t& lo, uint64_t&
         }
     }
 
-    // Two's-complement of N bits is (value mod 2^N); Python's % on negatives
+    // Two's-complement of N bits is value mod 2^N; Python's % on negatives
     // already returns the positive residue.
     nb::object wrapped = nb::borrow(value).attr("__mod__")(T.uint128_max_plus_one);
     lo = nb::cast<uint64_t>(wrapped.attr("__and__")(T.mask64));
@@ -91,9 +82,10 @@ void py_long_to_int128(nb::handle value, bool is_signed, uint64_t& lo, uint64_t&
 // Convert a tz-aware datetime to UTC microseconds since the unix epoch.
 int64_t aware_datetime_to_utc_micros(nb::handle value) {
     nb::object delta = nb::borrow(value) - bind_types().epoch_utc;  // datetime.timedelta
-    int64_t days = nb::cast<int64_t>(delta.attr("days"));
-    int64_t seconds = nb::cast<int64_t>(delta.attr("seconds"));
-    int64_t micros = nb::cast<int64_t>(delta.attr("microseconds"));
+    PyObject* d = delta.ptr();
+    int64_t days = PyDateTime_DELTA_GET_DAYS(d);
+    int64_t seconds = PyDateTime_DELTA_GET_SECONDS(d);
+    int64_t micros = PyDateTime_DELTA_GET_MICROSECONDS(d);
     return ((days * 86400) + seconds) * 1000000 + micros;
 }
 
@@ -118,14 +110,14 @@ void bind_one(duckdb_prepared_statement stmt, idx_t idx, nb::handle value) {
         return;
     }
     if (nb::isinstance<nb::int_>(value)) {
-        // Try int64 first; on overflow, fall back to (u)hugeint.
-        try {
-            int64_t v = nb::cast<int64_t>(value);
+        // PyLong_AsLongLong reports overflow via PyErr_Occurred — no
+        // nb::cast_error throw on the common path.
+        int64_t v = PyLong_AsLongLong(value.ptr());
+        if (v != -1 || !PyErr_Occurred()) {
             bind_check(duckdb_bind_int64(stmt, idx, v), idx);
             return;
-        } catch (const nb::cast_error&) {
-            // fallthrough
         }
+        PyErr_Clear();
         bool negative = PyObject_RichCompareBool(value.ptr(), nb::int_(0).ptr(), Py_LT) == 1;
         uint64_t lo = 0, hi = 0;
         if (negative) {
@@ -144,57 +136,64 @@ void bind_one(duckdb_prepared_statement stmt, idx_t idx, nb::handle value) {
         return;
     }
     if (nb::isinstance<nb::str>(value)) {
-        std::string s = nb::cast<std::string>(value);
-        bind_check(duckdb_bind_varchar_length(stmt, idx, s.data(), s.size()), idx);
+        // Borrow PyUnicode's cached UTF-8 buffer; no std::string copy.
+        Py_ssize_t size = 0;
+        const char* data = PyUnicode_AsUTF8AndSize(value.ptr(), &size);
+        if (!data) throw nb::python_error();
+        bind_check(duckdb_bind_varchar_length(stmt, idx, data, (idx_t)size), idx);
         return;
     }
     if (nb::isinstance<nb::bytes>(value)) {
-        nb::bytes b = nb::borrow<nb::bytes>(value);
-        bind_check(duckdb_bind_blob(stmt, idx, b.c_str(), b.size()), idx);
+        char* data = nullptr;
+        Py_ssize_t size = 0;
+        if (PyBytes_AsStringAndSize(value.ptr(), &data, &size) != 0) throw nb::python_error();
+        bind_check(duckdb_bind_blob(stmt, idx, data, (idx_t)size), idx);
         return;
     }
     // datetime.datetime is a subclass of datetime.date, so check it first.
-    if (nb::isinstance(value, T.datetime)) {
+    // PyDateTime_* macros read directly from the struct — no attr lookups.
+    PyObject* raw = value.ptr();
+    if (PyDateTime_Check(raw)) {
         bool aware = !value.attr("tzinfo").is_none();
         if (aware) {
             duckdb_timestamp ts{aware_datetime_to_utc_micros(value)};
             bind_check(duckdb_bind_timestamp_tz(stmt, idx, ts), idx);
         } else {
             duckdb_timestamp_struct s{};
-            s.date.year = nb::cast<int32_t>(value.attr("year"));
-            s.date.month = nb::cast<int8_t>(value.attr("month"));
-            s.date.day = nb::cast<int8_t>(value.attr("day"));
-            s.time.hour = nb::cast<int8_t>(value.attr("hour"));
-            s.time.min = nb::cast<int8_t>(value.attr("minute"));
-            s.time.sec = nb::cast<int8_t>(value.attr("second"));
-            s.time.micros = nb::cast<int32_t>(value.attr("microsecond"));
+            s.date.year = PyDateTime_GET_YEAR(raw);
+            s.date.month = (int8_t)PyDateTime_GET_MONTH(raw);
+            s.date.day = (int8_t)PyDateTime_GET_DAY(raw);
+            s.time.hour = (int8_t)PyDateTime_DATE_GET_HOUR(raw);
+            s.time.min = (int8_t)PyDateTime_DATE_GET_MINUTE(raw);
+            s.time.sec = (int8_t)PyDateTime_DATE_GET_SECOND(raw);
+            s.time.micros = PyDateTime_DATE_GET_MICROSECOND(raw);
             bind_check(duckdb_bind_timestamp(stmt, idx, duckdb_to_timestamp(s)), idx);
         }
         return;
     }
-    if (nb::isinstance(value, T.date)) {
+    if (PyDate_Check(raw)) {
         duckdb_date_struct s{};
-        s.year = nb::cast<int32_t>(value.attr("year"));
-        s.month = nb::cast<int8_t>(value.attr("month"));
-        s.day = nb::cast<int8_t>(value.attr("day"));
+        s.year = PyDateTime_GET_YEAR(raw);
+        s.month = (int8_t)PyDateTime_GET_MONTH(raw);
+        s.day = (int8_t)PyDateTime_GET_DAY(raw);
         bind_check(duckdb_bind_date(stmt, idx, duckdb_to_date(s)), idx);
         return;
     }
-    if (nb::isinstance(value, T.time)) {
+    if (PyTime_Check(raw)) {
         duckdb_time_struct s{};
-        s.hour = nb::cast<int8_t>(value.attr("hour"));
-        s.min = nb::cast<int8_t>(value.attr("minute"));
-        s.sec = nb::cast<int8_t>(value.attr("second"));
-        s.micros = nb::cast<int32_t>(value.attr("microsecond"));
+        s.hour = (int8_t)PyDateTime_TIME_GET_HOUR(raw);
+        s.min = (int8_t)PyDateTime_TIME_GET_MINUTE(raw);
+        s.sec = (int8_t)PyDateTime_TIME_GET_SECOND(raw);
+        s.micros = PyDateTime_TIME_GET_MICROSECOND(raw);
         bind_check(duckdb_bind_time(stmt, idx, duckdb_to_time(s)), idx);
         return;
     }
-    if (nb::isinstance(value, T.timedelta)) {
+    if (PyDelta_Check(raw)) {
         duckdb_interval iv{};
         iv.months = 0;
-        iv.days = nb::cast<int32_t>(value.attr("days"));
-        int64_t seconds = nb::cast<int64_t>(value.attr("seconds"));
-        int32_t micros = nb::cast<int32_t>(value.attr("microseconds"));
+        iv.days = PyDateTime_DELTA_GET_DAYS(raw);
+        int64_t seconds = PyDateTime_DELTA_GET_SECONDS(raw);
+        int32_t micros = PyDateTime_DELTA_GET_MICROSECONDS(raw);
         iv.micros = seconds * 1000000 + micros;
         bind_check(duckdb_bind_interval(stmt, idx, iv), idx);
         return;
@@ -205,8 +204,8 @@ void bind_one(duckdb_prepared_statement stmt, idx_t idx, nb::handle value) {
         bind_check(duckdb_bind_varchar(stmt, idx, s.c_str()), idx);
         return;
     }
-    // numpy scalars (anything exposing .item() -> native Python): re-dispatch
-    // on the unboxed value. hasattr probe avoids a numpy runtime dependency.
+    // numpy scalars (anything exposing .item() → native Python): re-dispatch
+    // on the unboxed value.
     if (nb::hasattr(value, "item")) {
         nb::object item;
         try {
@@ -215,8 +214,8 @@ void bind_one(duckdb_prepared_statement stmt, idx_t idx, nb::handle value) {
             item = nb::object();
         }
         if (item) {
-            // Guard against infinite recursion: native Python scalars never
-            // expose .item(), so the type-change check terminates immediately.
+            // Native Python scalars never expose .item(), so the type-change
+            // check terminates immediately — no infinite recursion.
             if (item.type().ptr() != value.type().ptr()) {
                 bind_one(stmt, idx, item);
                 return;
@@ -229,8 +228,6 @@ void bind_one(duckdb_prepared_statement stmt, idx_t idx, nb::handle value) {
                      ")");
 }
 
-// Bind a sequence of positional parameters (list/tuple) onto a prepared
-// statement.
 void bind_positional(duckdb_prepared_statement stmt, nb::handle parameters) {
     idx_t param = 0;
     for (nb::handle value : parameters) {
@@ -239,7 +236,6 @@ void bind_positional(duckdb_prepared_statement stmt, nb::handle parameters) {
     }
 }
 
-// Bind a dict of named parameters by looking up each name's index.
 void bind_named(duckdb_prepared_statement stmt, nb::handle parameters) {
     nb::dict d = nb::borrow<nb::dict>(parameters);
     for (auto [k, v] : d) {
@@ -292,15 +288,11 @@ duckdb_result run_pending(duckdb_connection con, duckdb_prepared_statement stmt,
             throw DuckyError(message);
         }
         if (PyErr_CheckSignals() != 0) {
-            // Signal raised (typically KeyboardInterrupt). Interrupt, drain so
-            // background workers detach cleanly, discard the result, re-raise.
+            // Typically KeyboardInterrupt. Interrupt, drain, discard, re-raise.
             duckdb_interrupt(con);
             duckdb_result drain;
-            if (duckdb_execute_pending(pending, &drain) == DuckDBSuccess) {
-                duckdb_destroy_result(&drain);
-            } else {
-                duckdb_destroy_result(&drain);
-            }
+            duckdb_execute_pending(pending, &drain);
+            duckdb_destroy_result(&drain);
             duckdb_destroy_pending(&pending);
             throw nb::python_error();
         }
