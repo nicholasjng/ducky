@@ -21,32 +21,6 @@ bool dtype_for(duckdb_type t, nb::dlpack::dtype& out) {
     return false;
 }
 
-// Lazy numpy structured dtypes for HUGEINT, UHUGEINT, INTERVAL. Built once,
-// intentionally leaked at interpreter shutdown.
-struct StructDtypes {
-    nb::object hugeint;   // dtype([('lower','<u8'),('upper','<i8')])
-    nb::object uhugeint;  // dtype([('lower','<u8'),('upper','<u8')])
-    nb::object interval;  // dtype([('months','<i4'),('days','<i4'),('micros','<i8')])
-};
-
-const StructDtypes& struct_dtypes() {
-    static std::atomic<StructDtypes*> cached{nullptr};
-    static nb::ft_mutex mu;
-    return cached_singleton(cached, mu, [] {
-        nb::module_ np = nb::module_::import_("numpy");
-        auto mk = [&](std::initializer_list<std::pair<const char*, const char*>> fields) {
-            nb::list spec;
-            for (auto& [name, code] : fields) spec.append(nb::make_tuple(name, code));
-            return np.attr("dtype")(spec);
-        };
-        return StructDtypes{
-            mk({{"lower", "<u8"}, {"upper", "<i8"}}),
-            mk({{"lower", "<u8"}, {"upper", "<u8"}}),
-            mk({{"months", "<i4"}, {"days", "<i4"}, {"micros", "<i8"}}),
-        };
-    });
-}
-
 // Wrap n * itemsize bytes as a zero-copy uint8 ndarray, then .view(dtype) it
 // into a structured array of n elements. `owner` pins the underlying buffer.
 nb::object make_struct_view(void* data, size_t n, size_t itemsize, nb::object dtype,

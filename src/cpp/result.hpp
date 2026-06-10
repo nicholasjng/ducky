@@ -49,6 +49,15 @@ class Result {
     // cursor as fetch*/arrow_c_stream — don't mix them on one result.
     nb::object fetch_chunk();
 
+    // Drain the result into a {name: numpy.ndarray} dict. Loops chunks in C++,
+    // pre-allocates one buffer per column, memcpy's each chunk's vector data
+    // into the right slice, and wraps the buffer as a numpy ndarray (HUGEINT /
+    // UHUGEINT / INTERVAL / DECIMAL-HUGEINT get reinterpreted via .view() into
+    // a structured dtype). `columns` is an Iterable[str] or None for all.
+    // Raises DuckyError on column types with no flat ndarray representation
+    // (VARCHAR, LIST, STRUCT, MAP) — callers should route to .arrow() instead.
+    nb::object to_numpy(nb::object columns);
+
     // Arrow PyCapsule interface: exports the remaining result as an Arrow C
     // stream. `self` is the owning Python object, kept alive for the stream's
     // lifetime. Consumes the result (mutually exclusive with the fetch* path).

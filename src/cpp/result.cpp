@@ -6,10 +6,12 @@
 
 #include <cerrno>
 #include <cstdlib>
+#include <cstring>
 
 #include "arrow_abi.h"
 #include "chunk.hpp"
 #include "ducky.hpp"
+#include "function.hpp"
 
 using namespace nb::literals;
 
@@ -492,4 +494,132 @@ nb::object Result::fetch_chunk() {
     duckdb_data_chunk chunk = duckdb_fetch_chunk(result_);
     if (!chunk) return nb::none();
     return nb::cast(new Chunk(chunk, schema_, handle_));
+}
+
+namespace {
+
+// Per-column plan resolved upfront by to_numpy_native. `elem_size` is the raw
+// byte width DuckDB lays out in memory; `dtype` describes how to surface it.
+// If `struct_view` is non-null we allocate a uint8 buffer of `total*elem_size`
+// bytes and finish with `arr.view(struct_view)` to reinterpret as a structured
+// array of `total` items (HUGEINT/UHUGEINT/INTERVAL + DECIMAL/HUGEINT-internal).
+struct NumpyColumnPlan {
+    size_t elem_size;
+    nb::dlpack::dtype dtype;
+    nb::object struct_view;  // non-null → reinterpret via .view()
+};
+
+NumpyColumnPlan plan_column(duckdb_type tid, duckdb_logical_type logical, const std::string& name) {
+    if (const TypeSpec* spec = typespec_for(tid)) {
+        return NumpyColumnPlan{spec->size, spec->dtype(), nb::object()};
+    }
+    const StructDtypes& sd = struct_dtypes();
+    switch (tid) {
+        case DUCKDB_TYPE_HUGEINT:
+            return NumpyColumnPlan{sizeof(duckdb_hugeint), nb::dtype<uint8_t>(), sd.hugeint};
+        case DUCKDB_TYPE_UHUGEINT:
+            return NumpyColumnPlan{sizeof(duckdb_uhugeint), nb::dtype<uint8_t>(), sd.uhugeint};
+        case DUCKDB_TYPE_INTERVAL:
+            return NumpyColumnPlan{sizeof(duckdb_interval), nb::dtype<uint8_t>(), sd.interval};
+        case DUCKDB_TYPE_DECIMAL: {
+            duckdb_type internal = duckdb_decimal_internal_type(logical);
+            if (internal == DUCKDB_TYPE_HUGEINT) {
+                return NumpyColumnPlan{sizeof(duckdb_hugeint), nb::dtype<uint8_t>(), sd.hugeint};
+            }
+            const TypeSpec* spec = typespec_for(internal);  // always primitive here
+            return NumpyColumnPlan{spec->size, spec->dtype(), nb::object()};
+        }
+        default:
+            throw DuckyError(std::string("ducky: to_numpy: column '") + name + "' has type " +
+                             duckdb_type_name(tid) +
+                             " (no flat ndarray representation; "
+                             "use .arrow() for VARCHAR, LIST, STRUCT, MAP, ...)");
+    }
+}
+
+}  // namespace
+
+nb::object Result::to_numpy(nb::object columns) {
+    // Resolve `columns` (None → all) into a selection mask, and resolve the
+    // per-column layout (typespec or struct view). Both run before the scan so
+    // we don't waste work on a recoverable type error.
+    std::vector<bool> selected(column_count_, true);
+    if (!columns.is_none()) {
+        std::fill(selected.begin(), selected.end(), false);
+        for (nb::handle item : columns) {
+            std::string name = nb::cast<std::string>(item);
+            auto it = schema_->name_to_idx.find(name);
+            if (it == schema_->name_to_idx.end()) {
+                throw DuckyError("ducky: to_numpy: unknown column '" + name + "'");
+            }
+            selected[it->second] = true;
+        }
+    }
+
+    std::vector<NumpyColumnPlan> plans(column_count_);
+    for (idx_t c = 0; c < column_count_; ++c) {
+        if (!selected[c]) continue;
+        plans[c] = plan_column(types_[c], column_types_[c], schema_->names[c]);
+    }
+
+    // Pass 1: pull every chunk, recording size; keep them alive for pass 2's
+    // memcpy. duckdb_destroy_data_chunk only happens after we've copied out.
+    std::vector<duckdb_data_chunk> chunks;
+    std::vector<idx_t> sizes;
+    idx_t total = 0;
+    while (true) {
+        duckdb_data_chunk ch = duckdb_fetch_chunk(result_);
+        if (!ch) break;
+        idx_t sz = duckdb_data_chunk_get_size(ch);
+        if (sz == 0) {
+            duckdb_destroy_data_chunk(&ch);
+            continue;
+        }
+        chunks.push_back(ch);
+        sizes.push_back(sz);
+        total += sz;
+    }
+
+    auto cleanup_chunks = [&] {
+        for (duckdb_data_chunk ch : chunks) duckdb_destroy_data_chunk(&ch);
+    };
+
+    nb::dict out;
+    try {
+        for (idx_t c = 0; c < column_count_; ++c) {
+            if (!selected[c]) continue;
+            const NumpyColumnPlan& p = plans[c];
+            size_t bytes = total * p.elem_size;
+            void* buf = bytes ? std::malloc(bytes) : nullptr;
+            if (bytes && !buf) throw std::bad_alloc();
+            // Capsule frees `buf` when the ndarray's owner ref hits zero.
+            nb::capsule owner(buf, [](void* p) noexcept { std::free(p); });
+
+            size_t offset = 0;
+            for (size_t i = 0; i < chunks.size(); ++i) {
+                duckdb_vector v = duckdb_data_chunk_get_vector(chunks[i], (idx_t)c);
+                const void* src = duckdb_vector_get_data(v);
+                std::memcpy((char*)buf + offset, src, sizes[i] * p.elem_size);
+                offset += sizes[i] * p.elem_size;
+            }
+
+            nb::object arr;
+            if (p.struct_view) {
+                // Wrap as a flat uint8 buffer (total * elem_size bytes) and let
+                // numpy reinterpret it as a structured array of `total` items.
+                size_t byte_shape[1] = {bytes};
+                nb::ndarray<nb::numpy> raw(buf, 1, byte_shape, owner, nullptr, p.dtype);
+                arr = nb::cast(raw).attr("view")(p.struct_view);
+            } else {
+                size_t shape[1] = {(size_t)total};
+                arr = nb::cast(nb::ndarray<nb::numpy>(buf, 1, shape, owner, nullptr, p.dtype));
+            }
+            out[schema_->names[c].c_str()] = arr;
+        }
+    } catch (...) {
+        cleanup_chunks();
+        throw;
+    }
+    cleanup_chunks();
+    return out;
 }

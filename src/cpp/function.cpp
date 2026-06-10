@@ -448,6 +448,24 @@ void arrow_udf_trampoline(duckdb_function_info info, duckdb_data_chunk input,
 
 const TypeSpec& lookup_typespec(const std::string& name) { return lookup(name); }
 
+const StructDtypes& struct_dtypes() {
+    static std::atomic<StructDtypes*> cached{nullptr};
+    static nb::ft_mutex mu;
+    return cached_singleton(cached, mu, [] {
+        nb::module_ np = nb::module_::import_("numpy");
+        auto mk = [&](std::initializer_list<std::pair<const char*, const char*>> fields) {
+            nb::list spec;
+            for (auto& [name, code] : fields) spec.append(nb::make_tuple(name, code));
+            return np.attr("dtype")(spec);
+        };
+        return StructDtypes{
+            mk({{"lower", "<u8"}, {"upper", "<i8"}}),
+            mk({{"lower", "<u8"}, {"upper", "<u8"}}),
+            mk({{"months", "<i4"}, {"days", "<i4"}, {"micros", "<i8"}}),
+        };
+    });
+}
+
 duckdb_logical_type parse_logical_type(duckdb_connection con, const std::string& type_str) {
     if (type_str.empty()) {
         throw DuckyError("ducky: empty type string");

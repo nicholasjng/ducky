@@ -105,15 +105,6 @@ void def_conversions(Cls& cls, Src src) {
                 "None) -> collections.abc.Iterator[dict[str, mlx.core.array]]"),
         "Yield one dict per chunk: {name: mlx.core.array}. Zero-copy on CPU via DLPack.");
     cls.def(
-        "to_numpy",
-        [src](nb::object self, nb::object columns) {
-            return conversions().attr("to_numpy")(src(self), columns);
-        },
-        "columns"_a = nb::none(),
-        nb::sig("def to_numpy(self, columns: collections.abc.Iterable[str] | None = None) "
-                "-> dict[str, numpy.ndarray]"),
-        "Eagerly concatenate all chunks into {name: numpy.ndarray}.");
-    cls.def(
         "to_torch",
         [src](nb::object self, nb::object columns, nb::object device) {
             return conversions().attr("to_torch")(src(self), columns, device);
@@ -214,6 +205,12 @@ NB_MODULE(_core, m) {
              nb::lock_self())
         .def("fetch_chunk", &Result::fetch_chunk, nb::sig("def fetch_chunk(self) -> Chunk | None"),
              "Pull the next :class:`Chunk`, or None at end of stream.", nb::lock_self())
+        .def("to_numpy", &Result::to_numpy, "columns"_a = nb::none(),
+             nb::sig("def to_numpy(self, columns: collections.abc.Iterable[str] "
+                     "| None = None) -> dict[str, numpy.ndarray]"),
+             "Drain the result into a {name: numpy.ndarray} dict. "
+             "Raises on VARCHAR/LIST/STRUCT/MAP — use .arrow() for those.",
+             nb::lock_self())
         .def(
             "__arrow_c_stream__",
             [](nb::object self, nb::object) {
@@ -467,6 +464,19 @@ NB_MODULE(_core, m) {
     def_conversions(conn_cls, [](nb::object self) {
         return nb::cast(nb::cast<Connection&>(self).current_result());
     });
+    // to_numpy is bound directly (not via def_conversions) so it doesn't
+    // detour through the Python conversions module — the C++ method runs the
+    // chunk loop without leaving the binding.
+    conn_cls.def(
+        "to_numpy",
+        [](nb::object self, nb::object columns) {
+            return nb::cast<Connection&>(self).current_result()->to_numpy(columns);
+        },
+        "columns"_a = nb::none(),
+        nb::sig("def to_numpy(self, columns: collections.abc.Iterable[str] | None = None) "
+                "-> dict[str, numpy.ndarray]"),
+        "Drain the latest result into a {name: numpy.ndarray} dict. "
+        "Raises on VARCHAR/LIST/STRUCT/MAP — use .arrow() for those.");
     conn_cls
         .def(
             "create_function",

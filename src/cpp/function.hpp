@@ -32,6 +32,15 @@ const TypeSpec& lookup_typespec(const std::string& name);
 // chunk exporter (chunk.cpp) and the columnar appender (appender.cpp).
 const TypeSpec* typespec_for(duckdb_type type);
 
+// Cached numpy structured dtypes used to re-view HUGEINT / UHUGEINT / INTERVAL
+// memory (which has no DLPack equivalent). Built lazily on first access.
+struct StructDtypes {
+    nb::object hugeint;   // dtype([('lower','<u8'),('upper','<i8')])
+    nb::object uhugeint;  // dtype([('lower','<u8'),('upper','<u8')])
+    nb::object interval;  // dtype([('months','<i4'),('days','<i4'),('micros','<i8')])
+};
+const StructDtypes& struct_dtypes();
+
 // Parse a DuckDB type expression via a SQL round-trip. Supports the full type
 // grammar: "VARCHAR", "DECIMAL(10,2)", "LIST(INTEGER)", etc.
 // Returns an owned logical type; caller must destroy with duckdb_destroy_logical_type.

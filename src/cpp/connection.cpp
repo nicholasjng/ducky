@@ -732,14 +732,29 @@ std::shared_ptr<Result> PreparedStatement::execute(nb::object parameters, bool s
 
 void PreparedStatement::executemany(nb::object seq) {
     ensure_valid();
+    // Skip run_pending's per-row GIL release + signal-check loop: each row's
+    // INSERT/UPDATE completes synchronously in microseconds, so the loop's
+    // overhead dominates per-row cost. duckdb_execute_prepared blocks until
+    // done; we check for signals every PERIOD rows so Ctrl-C is still snappy.
+    constexpr idx_t SIGNAL_CHECK_PERIOD = 1024;
+    idx_t since_check = 0;
     for (nb::handle params : seq) {
-        if (duckdb_clear_bindings(stmt_) == DuckDBError) {
-            throw DuckyError("ducky: failed to clear prepared-statement bindings");
-        }
+        // No duckdb_clear_bindings: bind_parameters writes all positional
+        // params 1..N, overwriting any prior values. Named-dict callers are
+        // expected to use the same key set per row (PEP-249's executemany
+        // contract is row-shape consistency).
         bind_parameters(stmt_, params);
-        // Materialized — we discard the result, so streaming buys nothing here.
-        duckdb_result result = run_pending(handle_->connection, stmt_, /*streaming=*/false);
+        duckdb_result result;
+        if (duckdb_execute_prepared(stmt_, &result) == DuckDBError) {
+            std::string message = duckdb_result_error(&result);
+            duckdb_destroy_result(&result);
+            throw DuckyError(message);
+        }
         duckdb_destroy_result(&result);
+        if (++since_check >= SIGNAL_CHECK_PERIOD) {
+            since_check = 0;
+            if (PyErr_CheckSignals() != 0) throw nb::python_error();
+        }
     }
 }
 

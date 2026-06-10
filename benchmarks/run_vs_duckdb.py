@@ -136,10 +136,10 @@ def _print_memory_table(ducky_runs: list[dict], duckdb_runs: list[dict]) -> None
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--no-memory", action="store_true",
-                        help="skip the memray memory pass")
-    parser.add_argument("-t", "--tag", default=None,
-                        help="filter to a single tag (select, insert, ml, ...)")
+    parser.add_argument("--no-memory", action="store_true", help="skip the memray memory pass")
+    parser.add_argument(
+        "-t", "--tag", default=None, help="filter to a single tag (select, insert, ml, ...)"
+    )
     args = parser.parse_args()
 
     with tempfile.TemporaryDirectory() as tmp:

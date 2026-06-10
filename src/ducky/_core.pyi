@@ -95,6 +95,11 @@ class Result:
     def fetch_chunk(self) -> Chunk | None:
         """Pull the next :class:`Chunk`, or None at end of stream."""
 
+    def to_numpy(self, columns: Iterable[str] | None = None) -> dict[str, numpy.ndarray]:
+        """
+        Drain the result into a {name: numpy.ndarray} dict. Raises on VARCHAR/LIST/STRUCT/MAP — use .arrow() for those.
+        """
+
     def __arrow_c_stream__(self, requested_schema: Any = None) -> Any:
         """Export the result via the Arrow PyCapsule stream interface."""
 
@@ -150,9 +155,6 @@ class Result:
         """
         Yield one dict per chunk: {name: mlx.core.array}. Zero-copy on CPU via DLPack.
         """
-
-    def to_numpy(self, columns: Iterable[str] | None = None) -> dict[str, numpy.ndarray]:
-        """Eagerly concatenate all chunks into {name: numpy.ndarray}."""
 
     def to_torch(
         self, columns: Iterable[str] | None = None, device: torch.device | str | int | None = None
@@ -495,9 +497,6 @@ class Connection:
         Yield one dict per chunk: {name: mlx.core.array}. Zero-copy on CPU via DLPack.
         """
 
-    def to_numpy(self, columns: Iterable[str] | None = None) -> dict[str, numpy.ndarray]:
-        """Eagerly concatenate all chunks into {name: numpy.ndarray}."""
-
     def to_torch(
         self, columns: Iterable[str] | None = None, device: torch.device | str | int | None = None
     ) -> dict[str, torch.Tensor]:
@@ -510,6 +509,11 @@ class Connection:
 
     def to_mlx(self, columns: Iterable[str] | None = None) -> dict[str, mlx.core.array]:
         """Eagerly concatenate all chunks into {name: mlx.core.array}."""
+
+    def to_numpy(self, columns: Iterable[str] | None = None) -> dict[str, numpy.ndarray]:
+        """
+        Drain the latest result into a {name: numpy.ndarray} dict. Raises on VARCHAR/LIST/STRUCT/MAP — use .arrow() for those.
+        """
 
     def create_function(
         self,

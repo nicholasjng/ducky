@@ -36,6 +36,8 @@ class ArrowSource(Protocol):
 class _ChunkSource(Protocol):
     """Anything that produces ducky :class:`Chunk` objects on demand."""
 
+    def to_numpy(self, columns: Iterable[str] | None = None) -> dict[str, np.ndarray]: ...
+
     def fetch_chunk(self) -> Chunk | None: ...
 
 
@@ -122,22 +124,12 @@ def iter_batches(
 
 
 def to_numpy(source: _ChunkSource, columns: Iterable[str] | None = None) -> dict[str, np.ndarray]:
-    """Eagerly concatenate all chunks into ``{name: numpy.ndarray}``.
+    """Thin alias for ``source.to_numpy(columns)``.
 
-    Numeric / temporal columns only — raises :class:`ducky.Error` on string, list, struct, decimal, etc.
-    Use ``.arrow()`` (or select only numeric columns) for those.
+    Kept so ``from ducky._conversions import to_numpy`` still resolves; the real
+    implementation lives on :meth:`Result.to_numpy` (C++).
     """
-    import numpy as np
-
-    # chunk.column(n) is a view; retain the chunks until after concatenate
-    # so the views stay valid.
-    live: list[Chunk] = []
-    parts: dict[str, list[np.ndarray]] = {}
-    for chunk in chunks(source):
-        live.append(chunk)
-        for name in _select(chunk.columns, columns):
-            parts.setdefault(name, []).append(chunk.column(name))
-    return {name: np.concatenate(arrs) for name, arrs in parts.items()}
+    return source.to_numpy(columns)
 
 
 def iter_batches_torch(
@@ -169,17 +161,17 @@ def to_torch(
     columns: Iterable[str] | None = None,
     device: torch.device | str | int | None = None,
 ) -> dict[str, torch.Tensor]:
-    """Eagerly concatenate all chunks into ``{name: torch.Tensor}``.
+    """Eagerly drain all chunks into ``{name: torch.Tensor}``.
 
-    Uses :func:`iter_batches_torch` internally, so no intermediate numpy materialization occurs; each chunk is converted via DLPack and released before the next is fetched.
+    Loops chunks in C++ via :func:`to_numpy`; each tensor wraps the resulting numpy buffer via :func:`torch.from_numpy` (zero-copy on CPU).
+    For memory-bounded streaming use :func:`iter_batches_torch`.
     """
     import torch
 
-    parts: dict[str, list[torch.Tensor]] = {}
-    for batch in iter_batches_torch(source, columns=columns, device=device):
-        for name, t in batch.items():
-            parts.setdefault(name, []).append(t)
-    return {name: torch.cat(ts) for name, ts in parts.items()}
+    arrays = source.to_numpy(columns)
+    if device is None:
+        return {name: torch.from_numpy(arr) for name, arr in arrays.items()}
+    return {name: torch.from_numpy(arr).to(device) for name, arr in arrays.items()}
 
 
 def iter_batches_jax(
@@ -205,17 +197,15 @@ def to_jax(
     columns: Iterable[str] | None = None,
     device: jax.Device | None = None,
 ) -> dict[str, jax.Array]:
-    """Eagerly concatenate all chunks into ``{name: jax.Array}``.
+    """Eagerly drain all chunks into ``{name: jax.Array}``.
 
-    Uses :func:`iter_batches_jax` internally, so no intermediate numpy materialization occurs.
+    Loops chunks in C++ via :func:`to_numpy`; each array wraps the resulting numpy buffer via :func:`jax.numpy.asarray` (zero-copy on CPU).
+    For memory-bounded streaming use :func:`iter_batches_jax`.
     """
     import jax.numpy as jnp
 
-    parts: dict[str, list[jax.Array]] = {}
-    for batch in iter_batches_jax(source, columns=columns, device=device):
-        for name, arr in batch.items():
-            parts.setdefault(name, []).append(arr)
-    return {name: jnp.concatenate(arrs) for name, arrs in parts.items()}
+    arrays = source.to_numpy(columns)
+    return {name: jnp.asarray(arr, device=device) for name, arr in arrays.items()}
 
 
 def iter_batches_mlx(
@@ -240,14 +230,13 @@ def to_mlx(
     source: _ChunkSource,
     columns: Iterable[str] | None = None,
 ) -> dict[str, mx.array]:
-    """Eagerly concatenate all chunks into ``{name: mlx.core.array}``.
+    """Eagerly drain all chunks into ``{name: mlx.core.array}``.
 
-    Uses :func:`iter_batches_mlx` internally, so no intermediate numpy materialization occurs; each chunk is converted via DLPack and released before the next is fetched.
+    Loops chunks in C++ via :func:`to_numpy`; each array wraps the resulting numpy buffer via :func:`mlx.core.array` (zero-copy on the CPU backend).
+    MLX has no float64, so ``DOUBLE`` columns arrive as float32.
+    For memory-bounded streaming use :func:`iter_batches_mlx`.
     """
     import mlx.core as mx
 
-    parts: dict[str, list[mx.array]] = {}
-    for batch in iter_batches_mlx(source, columns=columns):
-        for name, arr in batch.items():
-            parts.setdefault(name, []).append(arr)
-    return {name: mx.concatenate(arrs) for name, arrs in parts.items()}
+    arrays = source.to_numpy(columns)
+    return {name: mx.array(arr) for name, arr in arrays.items()}
