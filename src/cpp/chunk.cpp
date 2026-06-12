@@ -37,18 +37,6 @@ Chunk::Chunk(duckdb_data_chunk chunk, std::shared_ptr<const ChunkSchema> schema,
              std::shared_ptr<DuckDBHandle> handle)
     : chunk_(chunk), schema_(std::move(schema)), handle_(std::move(handle)) {
     size_ = duckdb_data_chunk_get_size(chunk_);
-    idx_t n = schema_->names.size();
-    types_.reserve(n);
-    type_ids_.reserve(n);
-    vectors_.reserve(n);
-    unpacked_validity_.resize(n);
-    for (idx_t i = 0; i < n; ++i) {
-        duckdb_vector v = duckdb_data_chunk_get_vector(chunk_, i);
-        vectors_.push_back(v);
-        duckdb_logical_type logical = duckdb_vector_get_column_type(v);
-        types_.push_back(logical);
-        type_ids_.push_back(duckdb_get_type_id(logical));
-    }
 }
 
 Chunk::~Chunk() {
@@ -58,10 +46,28 @@ Chunk::~Chunk() {
     if (chunk_) duckdb_destroy_data_chunk(&chunk_);
 }
 
-std::vector<std::string> Chunk::column_types() const {
+duckdb_logical_type Chunk::logical_type(idx_t i) {
+    if (types_.empty()) {
+        types_.resize(schema_->names.size(), nullptr);
+        type_ids_.resize(schema_->names.size(), DUCKDB_TYPE_INVALID);
+    }
+    if (!types_[i]) {
+        types_[i] = duckdb_vector_get_column_type(vector(i));  // owned, freed in dtor
+        type_ids_[i] = duckdb_get_type_id(types_[i]);
+    }
+    return types_[i];
+}
+
+duckdb_type Chunk::type_id(idx_t i) {
+    logical_type(i);
+    return type_ids_[i];
+}
+
+std::vector<std::string> Chunk::column_types() {
+    idx_t n = schema_->names.size();
     std::vector<std::string> out;
-    out.reserve(type_ids_.size());
-    for (duckdb_type t : type_ids_) out.emplace_back(duckdb_type_name(t));
+    out.reserve(n);
+    for (idx_t i = 0; i < n; ++i) out.emplace_back(duckdb_type_name(type_id(i)));
     return out;
 }
 
@@ -90,9 +96,9 @@ idx_t Chunk::resolve(nb::object key) const {
 
 nb::object Chunk::column(nb::object key, nb::handle owner) {
     idx_t i = resolve(key);
-    void* data = duckdb_vector_get_data(vectors_[i]);
+    void* data = duckdb_vector_get_data(vector(i));
     size_t n = (size_t)size_;
-    duckdb_type tid = type_ids_[i];
+    duckdb_type tid = type_id(i);
 
     // Primitive / temporal types — zero-copy ndarray.
     nb::dlpack::dtype dtype;
@@ -113,7 +119,7 @@ nb::object Chunk::column(nb::object key, nb::handle owner) {
         return make_struct_view(data, n, sizeof(duckdb_interval), sd.interval, owner);
     }
     if (tid == DUCKDB_TYPE_DECIMAL) {
-        duckdb_type internal = duckdb_decimal_internal_type(types_[i]);
+        duckdb_type internal = duckdb_decimal_internal_type(logical_type(i));
         if (internal == DUCKDB_TYPE_HUGEINT) {
             return make_struct_view(data, n, sizeof(duckdb_hugeint), sd.hugeint, owner);
         }
@@ -129,9 +135,9 @@ nb::object Chunk::column(nb::object key, nb::handle owner) {
 
 nb::object Chunk::dlpack(nb::object key, nb::handle owner) {
     idx_t i = resolve(key);
-    void* data = duckdb_vector_get_data(vectors_[i]);
+    void* data = duckdb_vector_get_data(vector(i));
     size_t n = (size_t)size_;
-    duckdb_type tid = type_ids_[i];
+    duckdb_type tid = type_id(i);
 
     nb::dlpack::dtype dtype;
     if (!dtype_for(tid, dtype)) {
@@ -144,17 +150,18 @@ nb::object Chunk::dlpack(nb::object key, nb::handle owner) {
 
 int Chunk::decimal_scale(nb::object key) {
     idx_t i = resolve(key);
-    if (type_ids_[i] != DUCKDB_TYPE_DECIMAL) {
+    if (type_id(i) != DUCKDB_TYPE_DECIMAL) {
         throw DuckyError(std::string("ducky: decimal_scale() called on non-DECIMAL column '") +
-                         schema_->names[i] + "' (" + duckdb_type_name(type_ids_[i]) + ")");
+                         schema_->names[i] + "' (" + duckdb_type_name(type_id(i)) + ")");
     }
-    return (int)duckdb_decimal_scale(types_[i]);
+    return (int)duckdb_decimal_scale(logical_type(i));
 }
 
 nb::object Chunk::validity(nb::object key, nb::handle owner) {
     idx_t i = resolve(key);
-    uint64_t* valid = duckdb_vector_get_validity(vectors_[i]);
+    uint64_t* valid = duckdb_vector_get_validity(vector(i));
     if (!valid) return nb::none();
+    if (unpacked_validity_.empty()) unpacked_validity_.resize(schema_->names.size());
     if (!unpacked_validity_[i]) {
         auto buf = std::make_unique<uint8_t[]>(size_ ? size_ : 1);
         for (idx_t r = 0; r < size_; ++r) {

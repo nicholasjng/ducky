@@ -115,8 +115,10 @@ def iter_batches(
         When True each value becomes a ``(values, mask)`` tuple.
         ``mask`` is a uint8 ndarray (1 = valid, 0 = NULL) or ``None`` if the chunk's column has no nulls.
     """
+    names: list[str] | None = None
     for chunk in chunks(source):
-        names = _select(chunk.columns, columns)
+        if names is None:  # column names are constant across a result's chunks
+            names = _select(chunk.columns, columns)
         if with_validity:
             yield {n: (chunk.column(n), chunk.validity(n)) for n in names}
         else:
@@ -145,8 +147,10 @@ def iter_batches_torch(
     """
     import torch
 
+    names: list[str] | None = None
     for chunk in chunks(source):
-        names = _select(chunk.columns, columns)
+        if names is None:
+            names = _select(chunk.columns, columns)
         batch = {}
         for n in names:
             t = torch.from_dlpack(chunk.dlpack(n))
@@ -187,8 +191,10 @@ def iter_batches_jax(
     """
     import jax.numpy as jnp
 
+    names: list[str] | None = None
     for chunk in chunks(source):
-        names = _select(chunk.columns, columns)
+        if names is None:
+            names = _select(chunk.columns, columns)
         yield {n: jnp.asarray(chunk.dlpack(n), device=device) for n in names}
 
 
@@ -221,8 +227,10 @@ def iter_batches_mlx(
     """
     import mlx.core as mx
 
+    names: list[str] | None = None
     for chunk in chunks(source):
-        names = _select(chunk.columns, columns)
+        if names is None:
+            names = _select(chunk.columns, columns)
         yield {n: mx.array(chunk.dlpack(n)) for n in names}
 
 

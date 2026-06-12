@@ -53,7 +53,8 @@ class Chunk {
 
     idx_t size() const { return size_; }
     const std::vector<std::string>& column_names() const { return schema_->names; }
-    std::vector<std::string> column_types() const;
+    // Non-const: fills the lazy per-column type cache.
+    std::vector<std::string> column_types();
 
     // Returns the column at `key` (int index or str name) as a 1-D ndarray
     // view over the chunk's buffer. See class comment for supported types.
@@ -76,14 +77,23 @@ class Chunk {
 
    private:
     idx_t resolve(nb::object key) const;
+    // Lazy per-column accessors. Chunk construction sits on the per-chunk hot
+    // path (fetch_chunk / iter_batches at ~489 chunks per 1M rows), so the
+    // constructor materializes no per-column state; logical types — which
+    // duckdb allocates per duckdb_vector_get_column_type call — are fetched
+    // and cached only for the columns actually touched.
+    duckdb_vector vector(idx_t i) const { return duckdb_data_chunk_get_vector(chunk_, i); }
+    duckdb_logical_type logical_type(idx_t i);
+    duckdb_type type_id(idx_t i);
 
     duckdb_data_chunk chunk_;
     // Shared with the Result that produced this chunk; immutable across all
     // chunks of that result.
     std::shared_ptr<const ChunkSchema> schema_;
+    // Lazily sized + filled by logical_type()/type_id(); empty until the
+    // first per-column access.
     std::vector<duckdb_logical_type> types_;
     std::vector<duckdb_type> type_ids_;
-    std::vector<duckdb_vector> vectors_;
     std::vector<std::unique_ptr<uint8_t[]>> unpacked_validity_;
     std::shared_ptr<DuckDBHandle> handle_;
     idx_t size_;
