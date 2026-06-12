@@ -498,8 +498,11 @@ void Connection::register_arrow(const std::string& name, nb::object obj) {
 
     // Lazy, zero-copy: stash the source and resolve `SELECT * FROM name` to the
     // ducky_arrow_scan table function via the replacement scan, re-streaming the
-    // source on each query (so it must support being streamed more than once).
+    // source on each execution (so it must support being streamed more than once).
     if (!arrow_registry_) arrow_registry_ = install_arrow_scan(*this);
+    // Cached plans bound the previous source's schema; force a re-plan so a
+    // re-registered source with a different shape doesn't hit a stale plan.
+    stmt_cache_clear();
     std::lock_guard<std::mutex> lock(arrow_registry_->mu);
     arrow_registry_->sources[name] = std::move(obj);  // insert / overwrite (GIL held)
 }
@@ -508,9 +511,78 @@ Connection::~Connection() { close(); }
 
 void Connection::close() {
     // Release this Connection's references. The database stays open until the
-    // last Result sharing the handle is also gone.
+    // last Result sharing the handle is also gone. Cached statements go first:
+    // they reference the connection they were prepared on.
+    stmt_cache_clear();
     last_result_.reset();
     handle_.reset();
+}
+
+namespace {
+
+// Capacity of the per-connection prepared-statement cache. Plans are small
+// relative to result data; 128 covers repeated-query workloads (the same
+// ballpark as sqlite3's per-connection statement cache).
+constexpr size_t kStmtCacheCapacity = 128;
+
+// Statement types that are safe to keep cached plans across. Anything else —
+// SET/RESET, PRAGMA, LOAD, ATTACH/DETACH, CALL, DDL, ... — flushes the cache:
+// the optimizer constant-folds settings-dependent expressions (e.g.
+// current_setting()) into the plan, and unlike catalog changes, a SET does not
+// trigger DuckDB's RebindPreparedStatement, so a cached plan would return
+// stale values. DDL is already rebind-safe but flushing on it costs nothing
+// in hot loops and drops plans referencing dead objects sooner.
+bool keeps_stmt_cache(duckdb_statement_type type) {
+    switch (type) {
+        case DUCKDB_STATEMENT_TYPE_SELECT:
+        case DUCKDB_STATEMENT_TYPE_INSERT:
+        case DUCKDB_STATEMENT_TYPE_UPDATE:
+        case DUCKDB_STATEMENT_TYPE_DELETE:
+        case DUCKDB_STATEMENT_TYPE_EXPLAIN:
+        case DUCKDB_STATEMENT_TYPE_COPY:
+        case DUCKDB_STATEMENT_TYPE_ANALYZE:
+        case DUCKDB_STATEMENT_TYPE_TRANSACTION:
+        case DUCKDB_STATEMENT_TYPE_RELATION:
+            return true;
+        default:
+            return false;
+    }
+}
+
+}  // namespace
+
+duckdb_prepared_statement Connection::stmt_cache_checkout(const std::string& query) {
+    auto it = stmt_cache_.find(query);
+    if (it == stmt_cache_.end()) return nullptr;
+    duckdb_prepared_statement stmt = it->second->stmt;
+    stmt_lru_.erase(it->second);
+    stmt_cache_.erase(it);
+    return stmt;
+}
+
+void Connection::stmt_cache_checkin(const std::string& query, duckdb_prepared_statement stmt) {
+    auto it = stmt_cache_.find(query);
+    if (it != stmt_cache_.end()) {
+        // A concurrent run() of the same query prepared its own copy and
+        // finished first; replace it — ours is the most recently used.
+        duckdb_destroy_prepare(&it->second->stmt);
+        stmt_lru_.erase(it->second);
+        stmt_cache_.erase(it);
+    }
+    stmt_lru_.push_front(CachedStmt{query, stmt});
+    stmt_cache_.emplace(query, stmt_lru_.begin());
+    if (stmt_lru_.size() > kStmtCacheCapacity) {
+        CachedStmt& victim = stmt_lru_.back();
+        duckdb_destroy_prepare(&victim.stmt);
+        stmt_cache_.erase(victim.query);
+        stmt_lru_.pop_back();
+    }
+}
+
+void Connection::stmt_cache_clear() {
+    for (CachedStmt& entry : stmt_lru_) duckdb_destroy_prepare(&entry.stmt);
+    stmt_lru_.clear();
+    stmt_cache_.clear();
 }
 
 void Connection::ensure_open() const {
@@ -522,12 +594,21 @@ duckdb_result Connection::run(const std::string& query, nb::object parameters, b
     duckdb_connection con = handle_->connection;
 
     // Always go through prepare + pending-execute so the run_pending semantics
-    // (signal handling, streaming) apply. Single statement only.
-    duckdb_prepared_statement stmt = nullptr;
-    if (duckdb_prepare(con, query.c_str(), &stmt) == DuckDBError) {
-        std::string message = duckdb_prepare_error(stmt);
+    // (signal handling, streaming) apply. Single statement only. Repeated query
+    // text reuses the cached prepared statement, skipping parse + plan; the
+    // bindings are cleared so a cached statement starts unbound exactly like a
+    // fresh prepare (no parameter leakage between calls).
+    duckdb_prepared_statement stmt = stmt_cache_checkout(query);
+    if (stmt && duckdb_clear_bindings(stmt) == DuckDBError) {
         duckdb_destroy_prepare(&stmt);
-        throw DuckyError(message);
+        stmt = nullptr;
+    }
+    if (!stmt) {
+        if (duckdb_prepare(con, query.c_str(), &stmt) == DuckDBError) {
+            std::string message = duckdb_prepare_error(stmt);
+            duckdb_destroy_prepare(&stmt);
+            throw DuckyError(message);
+        }
     }
     if (!parameters.is_none()) {
         try {
@@ -541,10 +622,17 @@ duckdb_result Connection::run(const std::string& query, nb::object parameters, b
     try {
         result = run_pending(con, stmt, streaming);
     } catch (...) {
+        // Conservative: don't cache a statement whose execution failed — the
+        // next run re-prepares from scratch, matching pre-cache error paths.
         duckdb_destroy_prepare(&stmt);
         throw;
     }
-    duckdb_destroy_prepare(&stmt);
+    if (keeps_stmt_cache(duckdb_prepared_statement_type(stmt))) {
+        stmt_cache_checkin(query, stmt);
+    } else {
+        stmt_cache_clear();
+        duckdb_destroy_prepare(&stmt);
+    }
     // Skip streaming: chunks haven't been pulled when run_pending returns,
     // so the profile would reflect the previous query.
     if (!streaming) {

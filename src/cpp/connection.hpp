@@ -1,8 +1,10 @@
 #pragma once
 
 #include <nanobind/nanobind.h>
+#include <tsl/robin_map.h>
 
 #include <cstdint>
+#include <list>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -128,6 +130,29 @@ class Connection {
    private:
     void ensure_open() const;
     duckdb_result run(const std::string& query, nb::object parameters, bool streaming);
+
+    // Prepared-statement cache for run(): an LRU keyed by exact query text so
+    // repeated execute()/sql() calls skip parse + plan (parsing alone costs
+    // tens of µs per query). Entries are *checked out* (removed) while a query
+    // runs — run_pending releases the GIL between executor ticks, so another
+    // thread could otherwise grab the same statement and clear/rebind it
+    // mid-execution — and checked back in on success. Staleness is covered on
+    // two fronts: catalog changes rebind cached plans inside DuckDB
+    // (RebindPreparedStatement), and settings changes — which DuckDB does NOT
+    // rebind on, despite folding e.g. current_setting() into plans — flush the
+    // whole cache via keeps_stmt_cache() in connection.cpp.
+    struct CachedStmt {
+        std::string query;
+        duckdb_prepared_statement stmt;
+    };
+    // Returns the cached statement for `query` (removing it from the cache),
+    // or nullptr on a miss.
+    duckdb_prepared_statement stmt_cache_checkout(const std::string& query);
+    // Returns a statement to the cache as most-recently-used, evicting the
+    // least-recently-used entry past capacity.
+    void stmt_cache_checkin(const std::string& query, duckdb_prepared_statement stmt);
+    // Destroys every cached statement. Must run before the connection closes.
+    void stmt_cache_clear();
     // Shares ownership of the database/connection handle so the result (and
     // any Arrow stream from it) outlives this Connection.
     std::shared_ptr<Result> make_result(duckdb_result result);
@@ -135,6 +160,12 @@ class Connection {
     // run() for materialized queries only — streaming profiles would reflect
     // the previous query.
     void maybe_emit_profile(const std::string& query);
+
+    // Front = most recently used. The map indexes list nodes by query text;
+    // GIL builds serialize access via the GIL (the cache is only touched with
+    // it held), free-threaded builds via nb::lock_self() on execute()/sql().
+    std::list<CachedStmt> stmt_lru_;
+    tsl::robin_map<std::string, std::list<CachedStmt>::iterator> stmt_cache_;
 
     std::shared_ptr<DuckDBHandle> handle_;
     std::shared_ptr<Result> last_result_;

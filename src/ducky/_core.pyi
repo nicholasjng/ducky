@@ -348,6 +348,8 @@ class Connection:
         """
         Execute a SQL query and stash the result for the ``fetch*`` methods.
 
+        Repeated query text reuses a per-connection cache of prepared statements, skipping re-parsing and re-planning.
+
         Parameters
         ----------
         query : str

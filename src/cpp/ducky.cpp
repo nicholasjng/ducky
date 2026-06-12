@@ -368,6 +368,8 @@ NB_MODULE(_core, m) {
              nb::sig("def execute(self, query: str, parameters: list | tuple | "
                      "dict[str, typing.Any] | None = None, streaming: bool = False) -> Connection"),
              "Execute a SQL query and stash the result for the ``fetch*`` methods.\n\n"
+             "Repeated query text reuses a per-connection cache of prepared "
+             "statements, skipping re-parsing and re-planning.\n\n"
              "Parameters\n"
              "----------\n"
              "query : str\n"
