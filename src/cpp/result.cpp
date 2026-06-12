@@ -138,16 +138,18 @@ idx_t enum_index(void* data, idx_t row, duckdb_type internal) {
     }
 }
 
-// Recursively convert the value at `row` of `vector` to a Python object,
-// descending into LIST/STRUCT/ARRAY/MAP children. `logical` is borrowed: top-
-// level columns pass the Result's cached types so the hot path never allocates
-// per cell; nested children fetch and free their own per cell.
-nb::object convert_value(duckdb_vector vector, duckdb_logical_type logical, idx_t row) {
-    uint64_t* validity = duckdb_vector_get_validity(vector);
+nb::object convert_value(duckdb_vector vector, duckdb_logical_type logical, idx_t row);
+
+// Convert the value at `row` to a Python object. `tid`, `data` and `validity`
+// are hoisted by the caller — once per (chunk, column) on the row-decode hot
+// path (Result::ColumnCursor), or per cell by convert_value for nested
+// children — so flat types make zero C API calls per cell here. `vector` and
+// `logical` are borrowed; only the nested/dictionary cases below touch them.
+nb::object convert_cell(duckdb_type tid, duckdb_vector vector, duckdb_logical_type logical,
+                        void* data, uint64_t* validity, idx_t row) {
     if (validity && !duckdb_validity_row_is_valid(validity, row)) return nb::none();
 
-    void* data = duckdb_vector_get_data(vector);
-    switch (duckdb_get_type_id(logical)) {
+    switch (tid) {
         case DUCKDB_TYPE_BOOLEAN:
             return nb::cast(((bool*)data)[row]);
         case DUCKDB_TYPE_TINYINT:
@@ -263,9 +265,16 @@ nb::object convert_value(duckdb_vector vector, duckdb_logical_type logical, idx_
             return mapping;
         }
         default:
-            throw DuckyError(std::string("ducky: column type ") +
-                             duckdb_type_name(duckdb_get_type_id(logical)) + " is not decoded yet");
+            throw DuckyError(std::string("ducky: column type ") + duckdb_type_name(tid) +
+                             " is not decoded yet");
     }
+}
+
+// Recursive entry point for nested children (LIST/STRUCT/ARRAY/MAP elements):
+// resolves the per-vector state convert_cell expects, once per cell.
+nb::object convert_value(duckdb_vector vector, duckdb_logical_type logical, idx_t row) {
+    return convert_cell(duckdb_get_type_id(logical), vector, logical,
+                        duckdb_vector_get_data(vector), duckdb_vector_get_validity(vector), row);
 }
 
 // Byte width of a fixed-width column type whose DuckDB in-memory layout is
@@ -627,9 +636,10 @@ bool Result::ensure_row() {
         chunk_ = chunk;
         chunk_size_ = size;
         cursor_ = 0;
-        vectors_.resize(column_count_);
+        cursors_.resize(column_count_);
         for (idx_t i = 0; i < column_count_; ++i) {
-            vectors_[i] = duckdb_data_chunk_get_vector(chunk_, i);
+            duckdb_vector v = duckdb_data_chunk_get_vector(chunk_, i);
+            cursors_[i] = ColumnCursor{v, duckdb_vector_get_data(v), duckdb_vector_get_validity(v)};
         }
     }
     return true;
@@ -637,10 +647,13 @@ bool Result::ensure_row() {
 
 nb::object Result::build_row() {
     idx_t row = cursor_++;
+    rows_returned_++;
     PyObject* tuple = PyTuple_New((Py_ssize_t)column_count_);
     if (!tuple) throw nb::python_error();
     for (idx_t c = 0; c < column_count_; ++c) {
-        nb::object value = convert_value(vectors_[c], column_types_[c], row);
+        const ColumnCursor& cur = cursors_[c];
+        nb::object value =
+            convert_cell(types_[c], cur.vector, column_types_[c], cur.data, cur.validity, row);
         PyTuple_SET_ITEM(tuple, (Py_ssize_t)c, value.release().ptr());
     }
     return nb::steal(tuple);
@@ -660,6 +673,27 @@ nb::list Result::fetchmany(int64_t size) {
 }
 
 nb::list Result::fetchall() {
+    // Materialized results know their size (duckdb_row_count returns 0 for
+    // streaming): pre-size the list so 1M-row fetches skip append's repeated
+    // growth reallocations. rows_returned_ accounts for fetchone/fetchmany
+    // calls that already consumed part of the result.
+    idx_t total = duckdb_result_is_streaming(result_) ? 0 : duckdb_row_count(&result_);
+    if (total > rows_returned_) {
+        idx_t remaining = total - rows_returned_;
+        PyObject* list = PyList_New((Py_ssize_t)remaining);
+        if (!list) throw nb::python_error();
+        nb::list out = nb::steal<nb::list>(list);
+        for (idx_t i = 0; i < remaining; ++i) {
+            if (!ensure_row()) {  // defensive; a materialized count is exact
+                if (PyList_SetSlice(list, (Py_ssize_t)i, (Py_ssize_t)remaining, nullptr) < 0) {
+                    throw nb::python_error();
+                }
+                return out;
+            }
+            PyList_SET_ITEM(list, (Py_ssize_t)i, build_row().release().ptr());
+        }
+        return out;
+    }
     nb::list out;
     while (ensure_row()) out.append(build_row());
     return out;
@@ -676,7 +710,10 @@ nb::object Result::fetchitem() {
     // Decode then confirm no second row remains. value is materialized, so it
     // survives the chunk release that the follow-up ensure_row() may trigger.
     idx_t row = cursor_++;
-    nb::object value = convert_value(vectors_[0], column_types_[0], row);
+    rows_returned_++;
+    const ColumnCursor& cur = cursors_[0];
+    nb::object value =
+        convert_cell(types_[0], cur.vector, column_types_[0], cur.data, cur.validity, row);
     if (ensure_row()) {
         throw DuckyError("ducky: fetchitem() requires exactly 1 row; the result has more");
     }

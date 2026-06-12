@@ -82,11 +82,22 @@ class Result {
     // decoder doesn't allocate one per cell (a column's type is constant).
     std::vector<duckdb_logical_type> column_types_;
 
-    // State for the chunk currently being decoded: the per-column vectors are
-    // the entry point for the recursive decoder (it pulls data, validity, type
-    // and nested children from each vector).
+    // Per-column decode state for the chunk currently being decoded, resolved
+    // once per (chunk, column) in ensure_row() so the row decoder makes zero
+    // C API calls per cell on flat types (data/validity/type are constant
+    // across a vector). `vector` stays as the entry point for nested types,
+    // whose children the decoder still resolves per cell.
+    struct ColumnCursor {
+        duckdb_vector vector;
+        void* data;
+        uint64_t* validity;
+    };
+
     duckdb_data_chunk chunk_ = nullptr;
     idx_t chunk_size_ = 0;
     idx_t cursor_ = 0;
-    std::vector<duckdb_vector> vectors_;
+    // Rows handed out via fetchone/fetchmany/fetchall so far; lets fetchall
+    // pre-size its list from duckdb_row_count on materialized results.
+    idx_t rows_returned_ = 0;
+    std::vector<ColumnCursor> cursors_;
 };
