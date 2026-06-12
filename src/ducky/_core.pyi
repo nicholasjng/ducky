@@ -662,7 +662,7 @@ class Connection:
         Register an Arrow-PyCapsule source as a table named ``name``.
 
         Accepts anything exposing ``__arrow_c_stream__`` (pyarrow Table, polars / pandas-3 DataFrame, …).
-        Lazy and zero-copy: the source is kept and re-streamed on each query via a replacement scan, so it must support being streamed more than once.
+        The source is kept and re-streamed on each query via a replacement scan, so it must support being streamed more than once. Queries scan it in parallel; primitive columns are read zero-copy from the Arrow buffers, and each execution buffers the stream's batches (cheap chunk wraps for an in-memory table, a full materialization for an unbounded reader).
         """
 
     def close(self) -> None:
