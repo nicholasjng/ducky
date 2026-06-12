@@ -13,8 +13,11 @@ repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v6.0.0
     hooks:
+      # Excluded: trimming a diff's leading-space blank context lines corrupts it.
       - id: trailing-whitespace
+        exclude: '^(patches/.*\.patch|ext/duckdb/)'
       - id: end-of-file-fixer
+        exclude: '^(patches/.*\.patch|ext/duckdb/)'
       - id: check-yaml
       - id: check-toml
   - repo: https://github.com/astral-sh/uv-pre-commit

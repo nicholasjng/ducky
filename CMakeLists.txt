@@ -73,8 +73,9 @@ set(BUILD_BENCHMARKS OFF CACHE BOOL "")
 # The ext/duckdb submodule is a shallow clone with no tags, so DuckDB's own
 # `git describe` version detection falls back to "v0.0.1". Pin the version string
 # to the describe of the pinned commit so duckdb_library_version() is accurate.
-# Update this if you move the submodule to a different commit.
-set(OVERRIDE_GIT_DESCRIBE "v1.5.2-4685-g01eda16d6e" CACHE STRING "")
+# bump-duckdb.sh rewrites this. FORCE so the edit wins over a stale build cache —
+# without it `set(... CACHE)` is a no-op against an existing build dir.
+set(OVERRIDE_GIT_DESCRIBE "v1.5.2-6170-gd535c203a92" CACHE STRING "" FORCE)
 
 # DuckDB unconditionally loads its "essential" extensions — core_functions and
 # parquet — in ext/duckdb/extension/extension_config.cmake, and the generated

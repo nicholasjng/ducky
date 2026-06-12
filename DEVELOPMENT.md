@@ -27,6 +27,63 @@ ext/duckdb` and pulled the full tree, re-running it just trims the already-fat
 working tree rather than avoiding the download up front. The exact path list
 lives in the script.
 
+## DuckDB patch stack
+
+Local DuckDB edits live as a working-tree overlay in `patches/`
+(`NNNN-slug.patch`, applied in lexical order).
+`scripts/bump-duckdb.sh` re-applies the whole stack from a clean checkout
+(`--3way`, so patches survive context drift);
+applying is the default since the build needs them.
+
+```sh
+scripts/bump-duckdb.sh                # re-apply patches/ at the current pin (after init-duckdb.sh)
+scripts/bump-duckdb.sh --no-patches   # build against pristine upstream
+```
+
+Author a patch by editing the submodule tree and exporting with the next
+numeric prefix (prepend a header explaining why; `git apply` skips the
+preamble):
+
+```sh
+git -C ext/duckdb diff -- <paths> > patches/0002-my-change.patch
+```
+
+When a bump breaks a patch the script hard-fails and names it — either retire
+it (`rm patches/000X-*.patch`, if upstreamed) or refresh it (`git -C ext/duckdb
+apply --reject`, fix the `.rej` hunks, re-export). Past a handful of patches,
+use `quilt`.
+
+## Bumping the DuckDB submodule
+
+`scripts/bump-duckdb.sh <ref>` keeps the three pins in sync:
+
+1. The **gitlink** — the submodule commit in this repo's tree (`git ls-tree
+   HEAD ext/duckdb`). The canonical pin; `.gitmodules` holds only the URL.
+2. **`OVERRIDE_GIT_DESCRIBE`** in `CMakeLists.txt` — the version string for
+   `duckdb_library_version()`. **Don't remove it**: the checkout is shallow and
+   tagless, so without it DuckDB's `git describe` falls back to `v0.0.1` on
+   every fresh/CI clone (and sdist builds have no `.git` at all). It's set with
+   `CACHE STRING "" FORCE` — **keep the `FORCE`**, or the value is ignored
+   against an existing build dir and the bump never reaches the compiler. The
+   string is `git describe`'s output for the pin; the script derives it with
+   `git -C ext/duckdb describe --tags --long --match 'v[0-9]*'` (after fetching
+   tags). (Same reason to leave `shallow = true` in `.gitmodules` — it only
+   affects `git submodule update`, which we don't use.)
+3. The **`patches/` stack** — re-applied on the new revision (see above).
+
+```sh
+scripts/bump-duckdb.sh v1.6.3
+```
+
+The first bump unshallows the commit/tag graph (still blobless + sparse, ~50 MB)
+so `git describe` can derive the new version. Then:
+
+```sh
+uv sync --all-groups --reinstall-package=ducky
+uv run --no-sync pytest -q
+jj describe   # record the gitlink + CMakeLists bump
+```
+
 ## Build
 
 Builds run **without build isolation** (configured in `pyproject.toml` via
