@@ -268,13 +268,58 @@ nb::object convert_value(duckdb_vector vector, duckdb_logical_type logical, idx_
     }
 }
 
-// ArrowArrayStream backing for a duckdb_result: pulls chunks on demand and
-// exports each via the DuckDB Arrow C API. `owner` keeps the Result alive
-// for the stream's lifetime.
+// Byte width of a fixed-width column type whose DuckDB in-memory layout is
+// bit-identical to its Arrow primitive layout, or 0 if the type is not eligible
+// for the combined fast path. Eligible types are the ones whose flat DuckDB
+// buffer concatenates straight into Arrow's data buffer with no conversion: the
+// fixed-width numerics, plus the temporals whose storage matches Arrow's unit 1:1
+// (DATE=date32 days, TIME=time64[us], TIMESTAMP[_S/MS/NS/TZ]=timestamp of the same
+// unit — DuckDB stores and Arrow expects the identical native-unit int), each
+// verified bit-equal to duckdb_data_chunk_to_arrow in test_arrow.py. Excludes
+// BOOLEAN (Arrow packs it 1 bit/value), HUGEINT/DECIMAL/INTERVAL, and all
+// variable-length / nested types — those take the per-chunk fallback below.
+size_t fast_arrow_width(duckdb_type t) {
+    switch (t) {
+        case DUCKDB_TYPE_TINYINT:
+        case DUCKDB_TYPE_UTINYINT:
+            return 1;
+        case DUCKDB_TYPE_SMALLINT:
+        case DUCKDB_TYPE_USMALLINT:
+            return 2;
+        case DUCKDB_TYPE_INTEGER:
+        case DUCKDB_TYPE_UINTEGER:
+        case DUCKDB_TYPE_FLOAT:
+        case DUCKDB_TYPE_DATE:  // int32 days since epoch == Arrow date32
+            return 4;
+        case DUCKDB_TYPE_BIGINT:
+        case DUCKDB_TYPE_UBIGINT:
+        case DUCKDB_TYPE_DOUBLE:
+        case DUCKDB_TYPE_TIME:          // int64 µs == Arrow time64[us]
+        case DUCKDB_TYPE_TIMESTAMP:     // int64 µs == Arrow timestamp[us]
+        case DUCKDB_TYPE_TIMESTAMP_TZ:  // int64 µs == Arrow timestamp[us, tz=UTC]
+        case DUCKDB_TYPE_TIMESTAMP_S:   // int64 s  == Arrow timestamp[s]
+        case DUCKDB_TYPE_TIMESTAMP_MS:  // int64 ms == Arrow timestamp[ms]
+        case DUCKDB_TYPE_TIMESTAMP_NS:  // int64 ns == Arrow timestamp[ns]
+            return 8;
+        default:
+            return 0;
+    }
+}
+
+// ArrowArrayStream backing for a duckdb_result. The schema always comes from the
+// C API (duckdb_to_arrow_schema). get_next has two modes: when every column is a
+// fast-path-eligible fixed-width numeric, it drains the whole result and
+// hand-builds one combined Arrow record batch (concatenated data buffers +
+// validity bitmaps); otherwise it falls back to one Arrow array per DuckDB chunk
+// via duckdb_data_chunk_to_arrow, which handles every type. `owner` keeps the
+// ducky Result (and its duckdb_result) alive for the stream's lifetime.
 struct ArrowStreamState {
-    nb::object owner;              // keeps the Result (and its DuckDBHandle) alive
+    nb::object owner;              // keeps the Result (and its duckdb_result) alive
     duckdb_result* result;         // borrowed from owner
     duckdb_arrow_options options;  // owned by the stream, destroyed on release
+    bool fast;                     // all columns eligible -> one hand-built batch
+    bool done;                     // fast path emits exactly one combined batch
+    std::vector<size_t> widths;    // per-column element width (fast path only)
     std::string last_error;
 };
 
@@ -285,6 +330,27 @@ bool consume_error(ArrowStreamState* state, duckdb_error_data error) {
     if (has_error) state->last_error = duckdb_error_data_message(error);
     duckdb_destroy_error_data(&error);
     return has_error;
+}
+
+// Owns every heap allocation backing one hand-built record batch. The root
+// ArrowArray's release frees this; children carry a no-op release because the
+// importer only releases the root, which tears down the whole tree at once.
+struct FastBatch {
+    std::vector<void*> allocations;                      // data + validity buffers to free
+    std::vector<ArrowArray> children;                    // one struct per column (stable)
+    std::vector<ArrowArray*> child_ptrs;                 // root.children points here
+    std::vector<std::array<const void*, 2>> child_bufs;  // [validity, data] per column
+    const void* root_buf[1] = {nullptr};                 // struct array: one (null) validity buf
+};
+
+void fast_release_child(ArrowArray* a) { a->release = nullptr; }  // root owns the memory
+
+void fast_release_root(ArrowArray* a) {
+    auto* b = (FastBatch*)a->private_data;
+    for (void* p : b->allocations) std::free(p);
+    delete b;
+    a->release = nullptr;
+    a->private_data = nullptr;
 }
 
 int stream_get_schema(ArrowArrayStream* stream, ArrowSchema* out) {
@@ -302,9 +368,119 @@ int stream_get_schema(ArrowArrayStream* stream, ArrowSchema* out) {
     return consume_error(state, error) ? EIO : 0;
 }
 
+// Drain the whole result and hand-build one combined Arrow record batch. Only
+// called when every column is fast_arrow_width-eligible. Sets out->release to
+// nullptr (end-of-stream) for an empty result. Throws on allocation failure.
+void build_fast_batch(ArrowStreamState* state, ArrowArray* out) {
+    idx_t ncols = duckdb_column_count(state->result);
+
+    std::vector<duckdb_data_chunk> chunks;
+    std::vector<idx_t> sizes;
+    idx_t total = 0;
+    while (true) {
+        duckdb_data_chunk ch = duckdb_fetch_chunk(*state->result);
+        if (!ch) break;
+        idx_t sz = duckdb_data_chunk_get_size(ch);
+        if (sz == 0) {
+            duckdb_destroy_data_chunk(&ch);
+            continue;
+        }
+        chunks.push_back(ch);
+        sizes.push_back(sz);
+        total += sz;
+    }
+    auto cleanup_chunks = [&] {
+        for (duckdb_data_chunk ch : chunks) duckdb_destroy_data_chunk(&ch);
+    };
+    if (total == 0) {  // no rows -> emit no batch (out->release stays nullptr)
+        cleanup_chunks();
+        return;
+    }
+
+    auto* b = new FastBatch();
+    b->children.resize(ncols);
+    b->child_ptrs.resize(ncols);
+    b->child_bufs.resize(ncols);
+    size_t valid_bytes = (total + 7) / 8;
+
+    try {
+        for (idx_t c = 0; c < ncols; ++c) {
+            size_t width = state->widths[c];
+            void* data = std::malloc(total * width);
+            if (!data) throw std::bad_alloc();
+            b->allocations.push_back(data);
+
+            // Concatenate each chunk's flat data buffer; build a validity bitmap
+            // lazily and per-row (so it is correct regardless of chunk sizes) the
+            // first time a column actually carries nulls. No nulls anywhere -> no
+            // validity buffer at all, matching Arrow's all-valid convention.
+            uint8_t* validity = nullptr;
+            size_t row_off = 0;
+            for (size_t i = 0; i < chunks.size(); ++i) {
+                duckdb_vector v = duckdb_data_chunk_get_vector(chunks[i], (idx_t)c);
+                std::memcpy((char*)data + row_off * width, duckdb_vector_get_data(v),
+                            sizes[i] * width);
+                uint64_t* val = duckdb_vector_get_validity(v);
+                if (val) {
+                    if (!validity) {
+                        validity = (uint8_t*)std::malloc(valid_bytes);
+                        if (!validity) throw std::bad_alloc();
+                        b->allocations.push_back(validity);
+                        std::memset(validity, 0xFF, valid_bytes);  // start all-valid
+                    }
+                    for (idx_t r = 0; r < sizes[i]; ++r) {
+                        if (!duckdb_validity_row_is_valid(val, r)) {
+                            size_t bit = row_off + r;
+                            validity[bit / 8] &= (uint8_t)~(1u << (bit % 8));
+                        }
+                    }
+                }
+                row_off += sizes[i];
+            }
+
+            b->child_bufs[c] = {validity, data};
+            ArrowArray& child = b->children[c];
+            child = {};
+            child.length = (int64_t)total;
+            child.null_count = validity ? -1 : 0;  // -1: importer counts lazily
+            child.n_buffers = 2;
+            child.buffers = b->child_bufs[c].data();
+            child.release = fast_release_child;
+            b->child_ptrs[c] = &child;
+        }
+    } catch (...) {
+        cleanup_chunks();
+        for (void* p : b->allocations) std::free(p);
+        delete b;
+        throw;
+    }
+    cleanup_chunks();
+
+    *out = {};
+    out->length = (int64_t)total;
+    out->n_buffers = 1;  // struct validity buffer, null = all valid
+    out->n_children = (int64_t)ncols;
+    out->buffers = b->root_buf;
+    out->children = b->child_ptrs.data();
+    out->release = fast_release_root;
+    out->private_data = b;
+}
+
 int stream_get_next(ArrowArrayStream* stream, ArrowArray* out) {
     auto* state = (ArrowStreamState*)stream->private_data;
     out->release = nullptr;  // Arrow signals end-of-stream with a released array.
+    if (state->fast) {
+        if (state->done) return 0;  // the single combined batch was already emitted
+        state->done = true;
+        try {
+            build_fast_batch(state, out);
+        } catch (const std::exception& e) {
+            state->last_error = e.what();
+            return EIO;
+        }
+        return 0;
+    }
+    // Fallback: one Arrow array per DuckDB data chunk (correct for every type).
     duckdb_data_chunk chunk = duckdb_fetch_chunk(*state->result);
     if (!chunk) return 0;  // exhausted
     duckdb_error_data error = duckdb_data_chunk_to_arrow(state->options, chunk, out);
@@ -342,14 +518,31 @@ nb::object Result::arrow_c_stream(nb::object self) {
     if (!handle_ || !handle_->connection) {
         throw DuckyError("ducky: Arrow export is unavailable; the connection is closed");
     }
-    // Options carry a live client context from the connection; the stream
-    // owns them and frees them on release.
-    duckdb_arrow_options options = nullptr;
-    duckdb_connection_get_arrow_options(handle_->connection, &options);
+    // Options for the C-API schema path (and the per-chunk fallback). Taken from
+    // the result so the schema matches the arrays we produce. Owned by the stream.
+    duckdb_arrow_options options = duckdb_result_get_arrow_options(&result_);
+
+    // Pick the fast path only if every column's DuckDB layout is bit-identical to
+    // its Arrow layout, so the combined batch can be a raw buffer concatenation.
+    std::vector<size_t> widths(column_count_);
+    bool fast = column_count_ > 0;
+    for (idx_t c = 0; c < column_count_; ++c) {
+        widths[c] = fast_arrow_width(types_[c]);
+        fast &= widths[c] != 0;
+    }
 
     auto* stream = (ArrowArrayStream*)calloc(1, sizeof(ArrowArrayStream));
-    if (!stream) throw std::bad_alloc();
-    auto* state = new ArrowStreamState{self, &result_, options, std::string()};
+    if (!stream) {
+        if (options) duckdb_destroy_arrow_options(&options);
+        throw std::bad_alloc();
+    }
+    auto* state = new ArrowStreamState{};
+    state->owner = self;
+    state->result = &result_;
+    state->options = options;
+    state->fast = fast;
+    state->done = false;
+    state->widths = std::move(widths);
     stream->get_schema = stream_get_schema;
     stream->get_next = stream_get_next;
     stream->get_last_error = stream_get_last_error;

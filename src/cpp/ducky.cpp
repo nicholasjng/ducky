@@ -59,7 +59,8 @@ void def_conversions(Cls& cls, Src src) {
         "fetchnumpy",
         [src](nb::object self) { return conversions().attr("fetchnumpy")(src(self)); },
         nb::sig("def fetchnumpy(self) -> dict[str, numpy.ndarray]"),
-        "Return the result as a dict of column name -> numpy array.");
+        "Return the result as a dict of column name -> numpy array. Numeric / "
+        "temporal columns only; use arrow() for strings / nested types.");
     cls.def(
         "chunks", [src](nb::object self) { return conversions().attr("chunks")(src(self)); },
         nb::sig("def chunks(self) -> collections.abc.Iterator[Chunk]"),

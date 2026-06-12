@@ -64,13 +64,13 @@ def pl(source: ArrowSource, lazy: bool = False) -> polars.DataFrame | polars.Laz
     return frame.lazy() if lazy else frame
 
 
-def fetchnumpy(source: ArrowSource) -> dict[str, np.ndarray]:
-    """Return ``source`` as a ``{column: numpy.ndarray}`` dict."""
-    table = arrow(source)
-    return {
-        name: column.to_numpy(zero_copy_only=False)
-        for name, column in zip(table.column_names, table.columns, strict=True)
-    }
+def fetchnumpy(source: _ChunkSource) -> dict[str, np.ndarray]:
+    """Return ``source`` as a ``{column: numpy.ndarray}`` dict.
+
+    Delegates to the C++ :meth:`Result.to_numpy` chunk-direct path (numeric /
+    temporal columns only); for strings / nested types go through :func:`arrow`.
+    """
+    return source.to_numpy()
 
 
 # Numeric / temporal columns only; for strings / nested types go through .arrow().

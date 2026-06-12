@@ -117,7 +117,9 @@ class Result:
         """Return the result as a polars DataFrame (or LazyFrame)."""
 
     def fetchnumpy(self) -> dict[str, numpy.ndarray]:
-        """Return the result as a dict of column name -> numpy array."""
+        """
+        Return the result as a dict of column name -> numpy array. Numeric / temporal columns only; use arrow() for strings / nested types.
+        """
 
     def chunks(self) -> Iterator[Chunk]:
         """Iterate over the result one Chunk at a time. Drains the result."""
@@ -458,7 +460,9 @@ class Connection:
         """Return the result as a polars DataFrame (or LazyFrame)."""
 
     def fetchnumpy(self) -> dict[str, numpy.ndarray]:
-        """Return the result as a dict of column name -> numpy array."""
+        """
+        Return the result as a dict of column name -> numpy array. Numeric / temporal columns only; use arrow() for strings / nested types.
+        """
 
     def chunks(self) -> Iterator[Chunk]:
         """Iterate over the result one Chunk at a time. Drains the result."""
