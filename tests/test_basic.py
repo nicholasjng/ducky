@@ -29,6 +29,26 @@ def test_fetchone_and_fetchmany():
     assert con.fetchone() is None
 
 
+def test_fetchall_spans_chunks_and_repeats():
+    # > STANDARD_VECTOR_SIZE rows so the pre-sized fetchall list crosses chunk
+    # boundaries; a second fetchall on the drained result is empty.
+    con = ducky.connect()
+    result = con.sql("SELECT * FROM range(5000) t(i)")
+    rows = result.fetchall()
+    assert len(rows) == 5000
+    assert rows[0] == (0,) and rows[-1] == (4999,)
+    assert result.fetchall() == []
+
+
+def test_fetchall_streaming_result():
+    # Streaming results don't know their row count up front (the pre-size
+    # path must fall back to appending).
+    con = ducky.connect()
+    rows = con.sql("SELECT * FROM range(5000) t(i)", streaming=True).fetchall()
+    assert len(rows) == 5000
+    assert rows[-1] == (4999,)
+
+
 def test_fetchitem():
     con = ducky.connect()
     # The 1x1 happy path, on Result and on Connection (via current_result).

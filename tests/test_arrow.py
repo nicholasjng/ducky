@@ -81,9 +81,7 @@ def test_fast_path_multi_column_combined() -> None:
 def test_fallback_handles_strings_and_nested() -> None:
     # Ineligible types still export correctly via the per-chunk fallback.
     con = ducky.connect()
-    tbl = con.execute(
-        "SELECT i::VARCHAR s, [i, i + 1] AS lst FROM range(5000) s(i)"
-    ).arrow()
+    tbl = con.execute("SELECT i::VARCHAR s, [i, i + 1] AS lst FROM range(5000) s(i)").arrow()
     assert tbl.num_rows == 5000
     assert tbl.column("s").to_pylist()[:3] == ["0", "1", "2"]
     assert tbl.column("lst").to_pylist()[0] == [0, 1]

@@ -47,6 +47,48 @@ def test_replace_on_reregister() -> None:
     assert con.execute("SELECT * FROM t").fetchall() == [(99,)]
 
 
+def test_reregister_with_different_schema() -> None:
+    con = ducky.connect()
+    con.register_arrow("t", pa.Table.from_pydict({"x": [1]}))
+    assert con.execute("SELECT * FROM t").fetchall() == [(1,)]
+    # A different shape under the same name must re-plan, not reuse the old
+    # plan's schema.
+    con.register_arrow("t", pa.Table.from_pydict({"a": ["u"], "b": [2]}))
+    assert con.execute("SELECT * FROM t").fetchall() == [("u", 2)]
+
+
+def test_large_single_batch_sliced_emit() -> None:
+    # One Arrow batch far beyond STANDARD_VECTOR_SIZE: every emitted window
+    # past row 0 goes through the zero-copy dictionary-slice path, including
+    # the VARCHAR column. Verify exact contents, not just counts.
+    n = 10_000
+    con = ducky.connect()
+    tbl = pa.Table.from_pydict(
+        {"i": list(range(n)), "s": [f"row-{j}" for j in range(n)]}
+    ).combine_chunks()
+    assert tbl.column("i").num_chunks == 1
+    con.register_arrow("t", tbl)
+    assert con.execute("SELECT count(*), sum(i) FROM t").fetchall() == [(n, n * (n - 1) // 2)]
+    # Rows from a non-aligned window, materialized through a filter + sort.
+    rows = con.execute("SELECT i, s FROM t WHERE i BETWEEN 5000 AND 5002 ORDER BY i").fetchall()
+    assert rows == [(5000, "row-5000"), (5001, "row-5001"), (5002, "row-5002")]
+    # INSERT ... SELECT pushes the sliced vectors into a table sink.
+    con.execute("CREATE TABLE copy_t AS SELECT * FROM t")
+    assert con.execute("SELECT count(*), min(s), max(i) FROM copy_t").fetchall() == [
+        (n, "row-0", n - 1)
+    ]
+
+
+def test_prepared_statement_rescans_arrow_source() -> None:
+    con = ducky.connect()
+    con.register_arrow("t", pa.Table.from_pydict({"x": [1, 2, 3]}))
+    # Each execution opens a fresh stream from the registered source, so a
+    # plan bound once stays re-executable.
+    stmt = con.prepare("SELECT sum(x) FROM t")
+    assert stmt.execute().fetchitem() == 6
+    assert stmt.execute().fetchitem() == 6
+
+
 def test_polars_dataframe() -> None:
     pl = pytest.importorskip("polars")
     con = ducky.connect()
