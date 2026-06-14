@@ -122,10 +122,17 @@ add_subdirectory(${DUCKDB_DIR} duckdb EXCLUDE_FROM_ALL)
 # (3.13t+): nanobind emits Py_MOD_GIL_NOT_USED so importing it doesn't re-enable
 # the GIL. It's a no-op on regular (GIL-enabled) interpreters. See the
 # free-threading item in ROADMAP.md for the scaling rationale + audit status.
+# NOMINSIZE: nanobind size-optimizes the module by default (appends -Os, which
+# wins over Release's -O3). That suits thin dispatch glue, but ducky does real
+# CPU work in tight per-row / per-chunk loops (value conversion, validity-bitmap
+# unpacking, memcpy, tuple building). Disable the size override so those loops
+# build at -O3 and the compiler can unroll/vectorize them. The binary-size cost
+# is negligible next to the statically-linked DuckDB.
 nanobind_add_module(
   _core
   NB_STATIC
   FREE_THREADED
+  NOMINSIZE
   src/cpp/ducky.cpp
   src/cpp/appender.cpp
   src/cpp/connection.cpp
