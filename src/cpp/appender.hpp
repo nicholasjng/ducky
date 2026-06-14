@@ -53,7 +53,8 @@ class Appender {
 
     // Append one row's worth of values. `values` length must match the
     // target column count; types are coerced per-column against the cached
-    // logical types.
+    // logical types. Pass `ducky.DEFAULT` for a value to fall back on that
+    // column's DEFAULT expression (raises if the column has no default).
     void append_row(nb::args values);
 
     // Append a batch of columns. Keys must be a subset of column_names();
@@ -93,5 +94,8 @@ class Appender {
     tsl::robin_map<std::string, idx_t> name_to_idx_;
     std::vector<duckdb_logical_type> types_;  // owned; destroyed in dtor
     std::vector<duckdb_type> type_ids_;
+    // Per-column "has a DEFAULT expression", from table introspection. Lets
+    // append_row reject a `ducky.DEFAULT` for a column that has no default.
+    std::vector<bool> has_default_;
     std::shared_ptr<DuckDBHandle> connection_;
 };

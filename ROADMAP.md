@@ -324,13 +324,22 @@ ducky's data-science / ML audience, roughly highest-value first.
     hooked yet — the in-scope entrypoints are `execute()`/`sql()`, which is
     what `ducky.dataset` and the typical training loop drive.
 
-- ⬜ **Table introspection + appender DEFAULTs** (`duckdb_table_description_*`,
-  `duckdb_append_default` / `duckdb_append_default_to_chunk`). The
-  `table_description` API gives column names / types / default-ness directly,
-  letting the appender drop its `SELECT * FROM t LIMIT 0` column-discovery hack
-  (`appender.cpp:discover_column_names`). It also unlocks appending rows that
-  fall back to a column's `DEFAULT` (e.g. autoincrement / `now()` columns)
-  instead of requiring every column — a common ergonomic gap in bulk insert.
+- ✅ **Table introspection + appender DEFAULTs** (`duckdb_table_description_*`,
+  `duckdb_append_default`). The `table_description` API gives column names /
+  types / default-ness directly, letting the appender drop its
+  `SELECT * FROM t LIMIT 0` column-discovery hack — `Appender`'s constructor now
+  introspects via `duckdb_table_description_*` (`appender.cpp:introspect_table`)
+  for both names and per-column DEFAULT-ness.
+
+  Landed: a `ducky.DEFAULT` sentinel passed to `Appender.append_row` in place of
+  a value falls back on the column's DEFAULT expression via
+  `duckdb_append_default`. Constants and foldable defaults (e.g. `now()`) work;
+  passing `DEFAULT` for a column with no default raises early (we check the
+  introspected flag), and non-foldable defaults (sequences / `nextval`) surface
+  DuckDB's own "not supported" message. Still open: `duckdb_append_default_to_chunk`
+  for the columnar `append_columns` path (constant defaults only) — deferred
+  since the row API covers the headline use case and the columnar default would
+  change the established "missing column → NULL" semantics.
 
 - 🟡 **Stateful / volatile / NULL-aware scalar UDFs**
   (`duckdb_scalar_function_set_bind` / `set_init` / `get_state` /

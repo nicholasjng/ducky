@@ -19,6 +19,13 @@ __duckdb_version__: str = "v1.6.3-dev7406"
 class Error(Exception):
     pass
 
+class Default:
+    """Sentinel type for appender DEFAULT values; use ``ducky.DEFAULT``."""
+
+    def __repr__(self) -> str: ...
+
+DEFAULT: Default = ...
+
 class Chunk:
     """
     A column-major batch of up to STANDARD_VECTOR_SIZE rows.

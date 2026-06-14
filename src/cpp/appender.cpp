@@ -46,32 +46,53 @@ std::string quote_ident(const std::string& s) {
     return out;
 }
 
-// Discover column names via `SELECT * FROM <qualified> LIMIT 0`. Called once
-// at construction so callers can use append_columns({name: ndarray}).
-std::vector<std::string> discover_column_names(duckdb_connection con,
-                                               const std::optional<std::string>& catalog,
-                                               const std::optional<std::string>& schema,
-                                               const std::string& table) {
-    std::string qualified;
-    if (catalog) qualified += quote_ident(*catalog) + ".";
-    if (schema) qualified += quote_ident(*schema) + ".";
-    qualified += quote_ident(table);
-
-    duckdb_result result;
-    std::string query = "SELECT * FROM " + qualified + " LIMIT 0";
-    if (duckdb_query(con, query.c_str(), &result) == DuckDBError) {
-        std::string message = duckdb_result_error(&result);
-        duckdb_destroy_result(&result);
-        throw DuckyError("ducky: appender column discovery failed: " + message);
-    }
-    idx_t n = duckdb_column_count(&result);
+// Column names + per-column DEFAULT-ness for the target table, read from
+// DuckDB's `table_description` introspection API. Called once at construction
+// so callers can use append_columns({name: ndarray}) and append_row's
+// `ducky.DEFAULT` sentinel.
+struct TableIntrospection {
     std::vector<std::string> names;
-    names.reserve(n);
-    for (idx_t i = 0; i < n; ++i) {
-        names.emplace_back(duckdb_column_name(&result, i));
+    std::vector<bool> has_default;
+};
+
+TableIntrospection introspect_table(duckdb_connection con,
+                                    const std::optional<std::string>& catalog,
+                                    const std::optional<std::string>& schema,
+                                    const std::string& table) {
+    duckdb_table_description desc = nullptr;
+    duckdb_state state;
+    if (catalog) {
+        state = duckdb_table_description_create_ext(
+            con, catalog->c_str(), schema ? schema->c_str() : nullptr, table.c_str(), &desc);
+    } else {
+        state = duckdb_table_description_create(con, schema ? schema->c_str() : nullptr,
+                                                table.c_str(), &desc);
     }
-    duckdb_destroy_result(&result);
-    return names;
+    // desc must be destroyed even on error (per the C API contract).
+    if (state == DuckDBError) {
+        std::string message = "ducky: appender table introspection failed";
+        if (desc) {
+            const char* m = duckdb_table_description_error(desc);
+            if (m) message += std::string(": ") + m;
+        }
+        duckdb_table_description_destroy(&desc);
+        throw DuckyError(message);
+    }
+
+    TableIntrospection out;
+    idx_t n = duckdb_table_description_get_column_count(desc);
+    out.names.reserve(n);
+    out.has_default.reserve(n);
+    for (idx_t i = 0; i < n; ++i) {
+        char* name = duckdb_table_description_get_column_name(desc, i);
+        out.names.emplace_back(name ? name : "");
+        duckdb_free(name);
+        bool def = false;
+        duckdb_column_has_default(desc, i, &def);
+        out.has_default.push_back(def);
+    }
+    duckdb_table_description_destroy(&desc);
+    return out;
 }
 
 // 1-D, C-contiguous ndarray view of unknown dtype; we dtype-check manually
@@ -120,9 +141,12 @@ Appender::Appender(Connection& connection, std::string table, std::optional<std:
         types_.push_back(lt);  // ownership transferred
     }
 
-    // Names need a separate query — the appender API doesn't expose them.
+    // Names + DEFAULT-ness need a separate lookup — the appender API exposes
+    // neither. table_description gives both directly.
     try {
-        names_ = discover_column_names(con, catalog, schema, table);
+        TableIntrospection info = introspect_table(con, catalog, schema, table);
+        names_ = std::move(info.names);
+        has_default_ = std::move(info.has_default);
     } catch (...) {
         for (auto& lt : types_) duckdb_destroy_logical_type(&lt);
         types_.clear();
@@ -281,6 +305,15 @@ void Appender::append_row(nb::args values) {
                          std::to_string(values.size()));
     }
     for (idx_t i = 0; i < n_cols; ++i) {
+        if (nb::isinstance<DefaultSentinel>(values[i])) {
+            if (i < has_default_.size() && !has_default_[i]) {
+                throw DuckyError("ducky: column '" + names_[i] +
+                                 "' has no DEFAULT value; pass an explicit value");
+            }
+            check_state(duckdb_append_default(handle_),
+                        ("append_default failed at column " + std::to_string(i)).c_str());
+            continue;
+        }
         append_one(handle_, type_ids_[i], values[i], i);
     }
     check_state(duckdb_appender_end_row(handle_), "end_row failed");

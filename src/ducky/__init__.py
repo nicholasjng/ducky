@@ -9,6 +9,7 @@ else:
 
 from ._conversions import ArrowSource
 from ._core import (
+    DEFAULT,
     Appender,
     Connection,
     Error,
@@ -89,6 +90,7 @@ def connect(
 
 
 __all__ = [
+    "DEFAULT",
     "Appender",
     "ArrowSource",
     "Connection",

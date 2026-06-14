@@ -145,6 +145,16 @@ NB_MODULE(_core, m) {
     // NOLINTNEXTLINE(bugprone-unused-raii)
     nb::exception<DuckyError>(m, "Error");
 
+    // `ducky.DEFAULT`: a singleton sentinel passed to Appender.append_row in
+    // place of a value to fall back on the target column's DEFAULT expression
+    // (constants and foldable expressions like now()). The `Default` type has
+    // no public constructor, so the exposed instance is the only one that can
+    // exist.
+    nb::class_<DefaultSentinel>(m, "Default",
+                                "Sentinel type for appender DEFAULT values; use ``ducky.DEFAULT``.")
+        .def("__repr__", [](const DefaultSentinel&) { return "ducky.DEFAULT"; });
+    m.attr("DEFAULT") = nb::cast(DefaultSentinel{});
+
     nb::class_<Chunk>(m, "Chunk",
                       "A column-major batch of up to STANDARD_VECTOR_SIZE rows.\n\n"
                       "Numeric and temporal columns are exposed as zero-copy ndarrays "

@@ -81,6 +81,50 @@ def test_appender_schema_qualified():
     assert con.execute("SELECT SUM(id) FROM s.t").fetchall() == [(3,)]
 
 
+# ── DEFAULT values (append_row + ducky.DEFAULT) ──────────────────────────────
+
+
+def test_appender_default_constant():
+    con = ducky.connect()
+    con.execute("CREATE TABLE t (id INTEGER DEFAULT 42, name VARCHAR)")
+    with con.appender("t") as app:
+        app.append_row(ducky.DEFAULT, "a")
+        app.append_row(7, "b")
+    assert con.execute("SELECT * FROM t ORDER BY name").fetchall() == [(42, "a"), (7, "b")]
+
+
+def test_appender_default_foldable_now():
+    # now() is a foldable default — duckdb_append_default resolves it.
+    con = ducky.connect()
+    con.execute("CREATE TABLE t (id INTEGER, ts TIMESTAMP DEFAULT now())")
+    with con.appender("t") as app:
+        app.append_row(1, ducky.DEFAULT)
+    assert con.execute("SELECT id, ts IS NOT NULL FROM t").fetchall() == [(1, True)]
+
+
+def test_appender_default_on_column_without_default_raises():
+    con = ducky.connect()
+    con.execute("CREATE TABLE t (a INTEGER, b INTEGER)")
+    with con.appender("t") as app, pytest.raises(ducky.Error, match="no DEFAULT value"):
+        app.append_row(ducky.DEFAULT, 5)
+
+
+def test_appender_default_non_foldable_surfaces_duckdb_error():
+    # Sequence defaults aren't foldable; DuckDB's appender rejects them and we
+    # surface its message rather than a generic failure.
+    con = ducky.connect()
+    con.execute("CREATE SEQUENCE seq START 100")
+    con.execute("CREATE TABLE t (id INTEGER DEFAULT nextval('seq'), v INTEGER)")
+    with con.appender("t") as app, pytest.raises(ducky.Error, match="not supported"):
+        app.append_row(ducky.DEFAULT, 1)
+
+
+def test_default_sentinel_is_singleton_and_not_constructible():
+    assert repr(ducky.DEFAULT) == "ducky.DEFAULT"
+    with pytest.raises(TypeError):
+        type(ducky.DEFAULT)()
+
+
 # ── Arrow ingest (append_arrow) ──────────────────────────────────────────────
 
 

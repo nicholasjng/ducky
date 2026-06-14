@@ -15,6 +15,11 @@ struct DuckyError : std::runtime_error {
     using std::runtime_error::runtime_error;
 };
 
+// Sentinel for "use this column's DEFAULT value" in Appender.append_row. Bound
+// in ducky.cpp as the `_Default` type; the lone instance is exposed as
+// `ducky.DEFAULT`. The appender checks for it via nb::isinstance<DefaultSentinel>.
+struct DefaultSentinel {};
+
 // Lazily construct a process-wide singleton of type T from `init`, caching it
 // behind an atomic pointer guarded by a free-threading mutex. The instance is
 // intentionally leaked so its destructor never runs at interpreter shutdown,
