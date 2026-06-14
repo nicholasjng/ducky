@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "arrow_abi.h"
+#include "arrow_util.hpp"
 #include "connection.hpp"
 #include "ducky.hpp"
 
@@ -15,28 +16,6 @@ namespace nb = nanobind;
 namespace {
 
 const char* const SCAN_FUNCTION = "ducky_arrow_scan";
-
-bool drain_arrow_error(duckdb_error_data err, std::string& out) {
-    if (!err) return false;
-    bool has = duckdb_error_data_has_error(err);
-    if (has) out = duckdb_error_data_message(err);
-    duckdb_destroy_error_data(&err);
-    return has;
-}
-
-// Release-on-scope-exit for Arrow C structs we own.
-struct SchemaRelease {
-    ArrowSchema* s;
-    ~SchemaRelease() {
-        if (s && s->release) s->release(s);
-    }
-};
-struct ArrayRelease {
-    ArrowArray* a;
-    ~ArrayRelease() {
-        if (a && a->release) a->release(a);
-    }
-};
 
 // Plan-time state, immutable after bind. Plans outlive single executions —
 // Connection.run()'s statement cache and explicit PreparedStatements re-execute

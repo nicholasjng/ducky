@@ -10,6 +10,7 @@
 #include <string>
 
 #include "arrow_abi.h"
+#include "arrow_util.hpp"
 #include "connection.hpp"
 #include "ducky.hpp"
 #include "function.hpp"
@@ -393,41 +394,6 @@ void Appender::append_columns(nb::dict columns, nb::object masks) {
     }
 }
 
-namespace {
-
-// Drain a duckdb_error_data into `out`; returns true if it carried an error.
-// (Mirrors the helper on the Arrow UDF path in function.cpp.)
-bool drain_arrow_error(duckdb_error_data err, std::string& out) {
-    if (!err) return false;
-    bool has = duckdb_error_data_has_error(err);
-    if (has) out = duckdb_error_data_message(err);
-    duckdb_destroy_error_data(&err);
-    return has;
-}
-
-// Release-on-scope-exit for owned Arrow C structs (stream path only; the
-// __arrow_c_array__ path has the capsules own their structs).
-struct SchemaRelease {
-    ArrowSchema* s;
-    ~SchemaRelease() {
-        if (s && s->release) s->release(s);
-    }
-};
-struct ArrayRelease {
-    ArrowArray* a;
-    ~ArrayRelease() {
-        if (a && a->release) a->release(a);
-    }
-};
-struct ConvertedSchemaRelease {
-    duckdb_arrow_converted_schema c = nullptr;
-    ~ConvertedSchemaRelease() {
-        if (c) duckdb_destroy_arrow_converted_schema(&c);
-    }
-};
-
-}  // namespace
-
 void Appender::append_arrow(nb::object source) {
     ensure_open();
     duckdb_connection con = connection_->connection;
@@ -473,7 +439,7 @@ void Appender::append_arrow(nb::object source) {
 
         std::string err;
         ConvertedSchemaRelease conv;
-        if (drain_arrow_error(duckdb_schema_from_arrow(con, &schema, &conv.c), err)) {
+        if (drain_arrow_error(duckdb_schema_from_arrow(con, &schema, &conv.schema), err)) {
             throw DuckyError("ducky: failed to convert the Arrow schema: " + err);
         }
 
@@ -486,7 +452,7 @@ void Appender::append_arrow(nb::object source) {
             }
             if (!array.release) break;  // end of stream
             ArrayRelease array_guard{&array};
-            append_batch(conv.c, &array);
+            append_batch(conv.schema, &array);
         }
     } else if (nb::hasattr(source, "__arrow_c_array__")) {
         // Single-batch path: a pyarrow RecordBatch. The (schema, array) capsules
@@ -502,10 +468,10 @@ void Appender::append_arrow(nb::object source) {
         }
         std::string err;
         ConvertedSchemaRelease conv;
-        if (drain_arrow_error(duckdb_schema_from_arrow(con, schema, &conv.c), err)) {
+        if (drain_arrow_error(duckdb_schema_from_arrow(con, schema, &conv.schema), err)) {
             throw DuckyError("ducky: failed to convert the Arrow schema: " + err);
         }
-        append_batch(conv.c, array);
+        append_batch(conv.schema, array);
     } else {
         throw DuckyError(
             "ducky: append_arrow() needs an object implementing the Arrow PyCapsule interface "

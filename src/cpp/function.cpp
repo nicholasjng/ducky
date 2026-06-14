@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "arrow_abi.h"
+#include "arrow_util.hpp"
 #include "connection.hpp"
 #include "ducky.hpp"
 
@@ -323,16 +324,6 @@ void arrow_udf_extra_info_destroy(void* ptr) {
     }
 }
 
-// Drains a duckdb_error_data into a std::string. Returns true if an error was
-// present (and copied out); the error_data is always destroyed.
-bool drain_arrow_error(duckdb_error_data err, std::string& out) {
-    if (!err) return false;
-    bool has = duckdb_error_data_has_error(err);
-    if (has) out = duckdb_error_data_message(err);
-    duckdb_destroy_error_data(&err);
-    return has;
-}
-
 // RAII for an ArrowSchema/ArrowArray pair on the stack: releases whichever
 // halves still own data when we leave scope (e.g. on exception).
 struct ArrowPair {
@@ -347,19 +338,10 @@ struct ArrowPair {
 // RAII wrappers for DuckDB heap objects used in the Arrow trampoline.
 struct ChunkGuard {
     duckdb_data_chunk chunk = nullptr;
-    explicit ChunkGuard(duckdb_data_chunk c) : chunk(c) {}
     ~ChunkGuard() {
         if (chunk) duckdb_destroy_data_chunk(&chunk);
     }
 };
-struct ConvertedSchemaGuard {
-    duckdb_arrow_converted_schema schema = nullptr;
-    explicit ConvertedSchemaGuard(duckdb_arrow_converted_schema s) : schema(s) {}
-    ~ConvertedSchemaGuard() {
-        if (schema) duckdb_destroy_arrow_converted_schema(&schema);
-    }
-};
-
 void arrow_udf_trampoline(duckdb_function_info info, duckdb_data_chunk input,
                           duckdb_vector output) {
     auto* ctx = (ArrowUDFContext*)duckdb_scalar_function_get_extra_info(info);
@@ -413,24 +395,22 @@ void arrow_udf_trampoline(duckdb_function_info info, duckdb_data_chunk input,
             ArrowPair out;
             out_rb.attr("_export_to_c")((uintptr_t)(&out.array), (uintptr_t)(&out.schema));
 
-            duckdb_arrow_converted_schema raw_converted = nullptr;
-            if (drain_arrow_error(duckdb_schema_from_arrow(ctx->con, &out.schema, &raw_converted),
-                                  err)) {
-                if (raw_converted) duckdb_destroy_arrow_converted_schema(&raw_converted);
+            // Each guard owns its out-param from construction, so a failed
+            // conversion (or the throw below) cleans up via the destructor.
+            ConvertedSchemaRelease converted;
+            if (drain_arrow_error(
+                    duckdb_schema_from_arrow(ctx->con, &out.schema, &converted.schema), err)) {
                 throw DuckyError("ducky: failed to convert UDF output schema: " + err);
             }
-            ConvertedSchemaGuard converted(raw_converted);
 
-            duckdb_data_chunk raw_chunk = nullptr;
+            ChunkGuard out_chunk;
             if (drain_arrow_error(duckdb_data_chunk_from_arrow(ctx->con, &out.array,
-                                                               converted.schema, &raw_chunk),
+                                                               converted.schema, &out_chunk.chunk),
                                   err)) {
-                if (raw_chunk) duckdb_destroy_data_chunk(&raw_chunk);
                 throw DuckyError("ducky: failed to convert UDF output chunk: " + err);
             }
             // duckdb_data_chunk_from_arrow has taken ownership of out.array.
             out.array.release = nullptr;
-            ChunkGuard out_chunk(raw_chunk);
 
             idx_t n_rows = duckdb_data_chunk_get_size(out_chunk.chunk);
             idx_t expected = duckdb_data_chunk_get_size(input);
