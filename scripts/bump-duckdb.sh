@@ -83,6 +83,9 @@ git -C "$submodule" sparse-checkout reapply 2>/dev/null || true
 new_sha="$(git -C "$submodule" rev-parse HEAD)"
 
 # --3way so patches survive context drift across a bump; any failure is fatal.
+# Run the real apply inside the `if` (exempt from `set -e`) and trust its exit
+# code: --3way returns non-zero AND leaves conflict markers when context lines
+# changed upstream, which a separate `--check` does not predict.
 applied=0
 if [ "$patches" -eq 1 ] && [ -d "$patch_dir" ]; then
     echo ">> Applying patch stack from $patch_dir/..."
@@ -90,8 +93,7 @@ if [ "$patches" -eq 1 ] && [ -d "$patch_dir" ]; then
     for p in "$patch_dir"/*.patch; do
         [ -e "$p" ] || break
         name="$(basename "$p")"
-        if git -C "$submodule" apply --3way --check "$repo_root/$p" 2>/dev/null; then
-            git -C "$submodule" apply --3way "$repo_root/$p"
+        if git -C "$submodule" apply --3way "$repo_root/$p"; then
             echo "   applied  $name"
             applied=$((applied + 1))
         else
@@ -100,8 +102,9 @@ if [ "$patches" -eq 1 ] && [ -d "$patch_dir" ]; then
         fi
     done
     if [ -n "$failed" ]; then
-        echo "error: patch(es) did not apply against $new_sha:$failed" >&2
-        echo "       Refresh or retire them (see DEVELOPMENT.md), then re-run." >&2
+        echo "error: patch(es) need rebasing onto $new_sha:$failed" >&2
+        echo "       Conflict markers are left in the tree — resolve them, regenerate the patch" >&2
+        echo "       (git -C $submodule diff HEAD > $patch_dir/...), or retire it. See DEVELOPMENT.md." >&2
         exit 1
     fi
 fi

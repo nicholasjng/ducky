@@ -18,8 +18,10 @@ Measured on an M-series mac: in-memory database open drops from ~10.7 ms to
 registration and the per-instance grammar build on first parse).
 
 
+
+
 diff --git a/extension/json/json_extension.cpp b/extension/json/json_extension.cpp
-index 9ff72e490c..a3a64c189f 100644
+index a871bbba8c7..ca9e922efd1 100644
 --- a/extension/json/json_extension.cpp
 +++ b/extension/json/json_extension.cpp
 @@ -6,6 +6,7 @@
@@ -30,13 +32,12 @@ index 9ff72e490c..a3a64c189f 100644
  #include "duckdb/main/extension/extension_loader.hpp"
  #include "duckdb/parser/expression/function_expression.hpp"
  
-@@ -63,9 +64,12 @@ static void LoadInternal(ExtensionLoader &loader) {
- 	copy_fun.name = "jsonl";
+@@ -63,9 +64,11 @@ static void LoadInternal(ExtensionLoader &loader) {
+ 	copy_fun.SetName("jsonl");
  	loader.RegisterFunction(copy_fun);
  
 -	// JSON macro's
-+	// JSON macro's. Parse with the database's ParserCache so the parser's
-+	// matcher is not rebuilt once per macro on every database instantiation.
++	// Pass the database's ParserCache so the parser matcher is reused, not rebuilt per macro.
 +	ParserOptions parser_options;
 +	parser_options.parser_cache = &loader.GetDatabaseInstance().GetParserCache();
  	for (idx_t index = 0; JSON_MACROS[index].name != nullptr; index++) {
@@ -46,7 +47,7 @@ index 9ff72e490c..a3a64c189f 100644
  	}
  }
 diff --git a/src/catalog/default/default_functions.cpp b/src/catalog/default/default_functions.cpp
-index df651376c4..fa7b5ffbc0 100644
+index afe503e16f3..174d3150741 100644
 --- a/src/catalog/default/default_functions.cpp
 +++ b/src/catalog/default/default_functions.cpp
 @@ -4,6 +4,7 @@
@@ -57,8 +58,8 @@ index df651376c4..fa7b5ffbc0 100644
  
  namespace duckdb {
  
-@@ -166,11 +167,16 @@ static const DefaultMacro internal_macros[] = {
- 	};
+@@ -222,11 +223,16 @@ static const DefaultMacro internal_macros[] = {
+     {nullptr, nullptr, nullptr}};
  
  unique_ptr<CreateMacroInfo> DefaultFunctionGenerator::CreateInternalMacroInfo(const DefaultMacro &default_macro) {
 +	return CreateInternalMacroInfo(default_macro, ParserOptions());
@@ -75,15 +76,15 @@ index df651376c4..fa7b5ffbc0 100644
  	parser.ParseQuery(sql);
  	D_ASSERT(parser.statements.size() == 1);
  	D_ASSERT(parser.statements[0]->type == StatementType::CREATE_STATEMENT);
-@@ -198,12 +204,13 @@ static bool DefaultFunctionMatches(const DefaultMacro &macro, const string &sche
+@@ -254,12 +260,13 @@ static bool DefaultFunctionMatches(const DefaultMacro &macro, const Identifier &
  	return macro.schema == schema && macro.name == name;
  }
  
--static unique_ptr<CreateFunctionInfo> GetDefaultFunction(const string &input_schema, const string &input_name) {
-+static unique_ptr<CreateFunctionInfo> GetDefaultFunction(const string &input_schema, const string &input_name,
-+                                                         ParserOptions options) {
- 	auto schema = StringUtil::Lower(input_schema);
- 	auto name = StringUtil::Lower(input_name);
+-static unique_ptr<CreateFunctionInfo> GetDefaultFunction(const Identifier &input_schema, const Identifier &input_name) {
++static unique_ptr<CreateFunctionInfo> GetDefaultFunction(const Identifier &input_schema,
++                                                         const Identifier &input_name, ParserOptions options) {
+ 	auto &schema = input_schema;
+ 	auto &name = input_name;
  	for (idx_t index = 0; internal_macros[index].name != nullptr; index++) {
  		if (DefaultFunctionMatches(internal_macros[index], schema, name)) {
 -			return DefaultFunctionGenerator::CreateInternalMacroInfo(internal_macros[index]);
@@ -91,17 +92,17 @@ index df651376c4..fa7b5ffbc0 100644
  		}
  	}
  	return nullptr;
-@@ -215,7 +222,7 @@ DefaultFunctionGenerator::DefaultFunctionGenerator(Catalog &catalog, SchemaCatal
+@@ -271,7 +278,7 @@ DefaultFunctionGenerator::DefaultFunctionGenerator(Catalog &catalog, SchemaCatal
  
  unique_ptr<CatalogEntry> DefaultFunctionGenerator::CreateDefaultEntry(ClientContext &context,
-                                                                       const string &entry_name) {
+                                                                       const Identifier &entry_name) {
 -	auto info = GetDefaultFunction(schema.name, entry_name);
 +	auto info = GetDefaultFunction(schema.name, entry_name, context.GetParserOptions());
  	if (info) {
  		return make_uniq_base<CatalogEntry, ScalarMacroCatalogEntry>(catalog, schema, info->Cast<CreateMacroInfo>());
  	}
 diff --git a/src/catalog/default/default_table_functions.cpp b/src/catalog/default/default_table_functions.cpp
-index 62c06a630a..5187853a24 100644
+index e2bc4f5844b..b58ac208e54 100644
 --- a/src/catalog/default/default_table_functions.cpp
 +++ b/src/catalog/default/default_table_functions.cpp
 @@ -4,6 +4,7 @@
@@ -126,33 +127,30 @@ index 62c06a630a..5187853a24 100644
  	parser.ParseQuery(default_macro.macro);
  	if (parser.statements.size() != 1 || parser.statements[0]->type != StatementType::SELECT_STATEMENT) {
  		throw InternalException("Expected a single select statement in CreateTableMacroInfo internal");
-@@ -129,12 +135,13 @@ DefaultTableFunctionGenerator::CreateTableMacroInfo(const DefaultTableMacro &def
- 	return CreateInternalTableMacroInfo(default_macro, std::move(result));
+@@ -130,10 +136,10 @@ DefaultTableFunctionGenerator::CreateTableMacroInfo(const DefaultTableMacro &def
  }
  
--static unique_ptr<CreateFunctionInfo> GetDefaultTableFunction(const string &input_schema, const string &input_name) {
-+static unique_ptr<CreateFunctionInfo> GetDefaultTableFunction(const string &input_schema, const string &input_name,
-+                                                              ParserOptions options) {
- 	auto schema = StringUtil::Lower(input_schema);
- 	auto name = StringUtil::Lower(input_name);
+ static unique_ptr<CreateFunctionInfo> GetDefaultTableFunction(const Identifier &input_schema,
+-                                                              const Identifier &input_name) {
++                                                              const Identifier &input_name, ParserOptions options) {
  	for (idx_t index = 0; internal_table_macros[index].name != nullptr; index++) {
- 		if (internal_table_macros[index].schema == schema && internal_table_macros[index].name == name) {
+ 		if (internal_table_macros[index].schema == input_schema && internal_table_macros[index].name == input_name) {
 -			return DefaultTableFunctionGenerator::CreateTableMacroInfo(internal_table_macros[index]);
 +			return DefaultTableFunctionGenerator::CreateTableMacroInfo(internal_table_macros[index], options);
  		}
  	}
  	return nullptr;
-@@ -142,7 +149,7 @@ static unique_ptr<CreateFunctionInfo> GetDefaultTableFunction(const string &inpu
+@@ -141,7 +147,7 @@ static unique_ptr<CreateFunctionInfo> GetDefaultTableFunction(const Identifier &
  
  unique_ptr<CatalogEntry> DefaultTableFunctionGenerator::CreateDefaultEntry(ClientContext &context,
-                                                                            const string &entry_name) {
+                                                                            const Identifier &entry_name) {
 -	auto info = GetDefaultTableFunction(schema.name, entry_name);
 +	auto info = GetDefaultTableFunction(schema.name, entry_name, context.GetParserOptions());
  	if (info) {
  		return make_uniq_base<CatalogEntry, TableMacroCatalogEntry>(catalog, schema, info->Cast<CreateMacroInfo>());
  	}
 diff --git a/src/include/duckdb/catalog/default/default_functions.hpp b/src/include/duckdb/catalog/default/default_functions.hpp
-index c9a5b89971..0cce35ee76 100644
+index 6aa04a38056..0cc8019643b 100644
 --- a/src/include/duckdb/catalog/default/default_functions.hpp
 +++ b/src/include/duckdb/catalog/default/default_functions.hpp
 @@ -10,6 +10,7 @@
@@ -163,19 +161,18 @@ index c9a5b89971..0cce35ee76 100644
  
  namespace duckdb {
  class SchemaCatalogEntry;
-@@ -27,6 +28,10 @@ public:
+@@ -27,6 +28,9 @@ public:
  	SchemaCatalogEntry &schema;
  
  	DUCKDB_API static unique_ptr<CreateMacroInfo> CreateInternalMacroInfo(const DefaultMacro &default_macro);
-+	//! Variant that parses with the given options. Pass options carrying the database's ParserCache
-+	//! (e.g. ClientContext::GetParserOptions) to avoid rebuilding the parser's matcher per macro.
++	//! Overload taking ParserOptions, so the caller's ParserCache is reused instead of rebuilt per macro.
 +	DUCKDB_API static unique_ptr<CreateMacroInfo> CreateInternalMacroInfo(const DefaultMacro &default_macro,
 +	                                                                      ParserOptions options);
  
  public:
- 	unique_ptr<CatalogEntry> CreateDefaultEntry(ClientContext &context, const string &entry_name) override;
+ 	unique_ptr<CatalogEntry> CreateDefaultEntry(ClientContext &context, const Identifier &entry_name) override;
 diff --git a/src/include/duckdb/catalog/default/default_table_functions.hpp b/src/include/duckdb/catalog/default/default_table_functions.hpp
-index c0eee28552..9c3ad4ed28 100644
+index 2901a46841c..252981ae7b6 100644
 --- a/src/include/duckdb/catalog/default/default_table_functions.hpp
 +++ b/src/include/duckdb/catalog/default/default_table_functions.hpp
 @@ -10,6 +10,7 @@
@@ -186,12 +183,11 @@ index c0eee28552..9c3ad4ed28 100644
  
  namespace duckdb {
  class SchemaCatalogEntry;
-@@ -38,6 +39,10 @@ public:
- 	vector<string> GetDefaultEntries() override;
+@@ -38,6 +39,9 @@ public:
+ 	vector<Identifier> GetDefaultEntries() override;
  
  	static unique_ptr<CreateMacroInfo> CreateTableMacroInfo(const DefaultTableMacro &default_macro);
-+	//! Variant that parses with the given options. Pass options carrying the database's ParserCache
-+	//! (e.g. ClientContext::GetParserOptions) to avoid rebuilding the parser's matcher per macro.
++	//! Overload taking ParserOptions, so the caller's ParserCache is reused instead of rebuilt per macro.
 +	static unique_ptr<CreateMacroInfo> CreateTableMacroInfo(const DefaultTableMacro &default_macro,
 +	                                                        ParserOptions options);
  
