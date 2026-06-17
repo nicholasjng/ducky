@@ -161,7 +161,9 @@ NB_MODULE(_core, m) {
         .def("__repr__", [](const DefaultSentinel&) { return "ducky.DEFAULT"; });
     m.attr("DEFAULT") = nb::cast(DefaultSentinel{});
 
-    nb::class_<Chunk>(m, "Chunk",
+    // nb::pooled(): Chunk is short-lived and minted per fetch_chunk; pooling
+    // recycles the released Python wrapper instead of reallocating it.
+    nb::class_<Chunk>(m, "Chunk", nb::pooled(),
                       "A column-major batch of up to STANDARD_VECTOR_SIZE rows.\n\n"
                       "Numeric and temporal columns are exposed as zero-copy ndarrays "
                       "over DuckDB's internal buffers.")

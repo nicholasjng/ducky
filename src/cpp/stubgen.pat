@@ -1,22 +1,17 @@
 # nanobind stubgen pattern file.
 #
-# Format: each entry is a Python-regex matched against the qualified symbol
-# name (e.g. ``ducky._core.Result.pl``), followed by an indented block of
-# replacement lines. ``\doc`` inserts the original docstring; ``\from <mod>
-# import <name>`` adds an import.
-#
 # We use this to emit ``@typing.overload`` variants for methods whose return
 # type depends on a boolean argument — something nb::sig can't express
 # directly because each .def has a single signature string.
 
 pl:
     \from typing import overload, Literal
-    \from polars import DataFrame as _PolarsDataFrame, LazyFrame as _PolarsLazyFrame
+    \import polars
     @overload
-    def pl(self, lazy: Literal[False] = False) -> _PolarsDataFrame: ...
+    def pl(self, lazy: Literal[False] = False) -> polars.DataFrame: ...
     @overload
-    def pl(self, lazy: Literal[True]) -> _PolarsLazyFrame: ...
-    def pl(self, lazy: bool = False) -> _PolarsDataFrame | _PolarsLazyFrame:
+    def pl(self, lazy: Literal[True]) -> polars.LazyFrame: ...
+    def pl(self, lazy: bool = False) -> polars.DataFrame | polars.LazyFrame:
         \doc
 
 # __exit__: rewrite the traceback annotation to use `TracebackType` directly.

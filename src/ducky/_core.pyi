@@ -9,10 +9,9 @@ import jax
 import mlx.core
 import numpy
 import pandas
+import polars
 import pyarrow
 import torch
-from polars import DataFrame as _PolarsDataFrame
-from polars import LazyFrame as _PolarsLazyFrame
 
 __duckdb_version__: str = "v1.6.3-dev7662"
 
@@ -122,10 +121,10 @@ class Result:
         """Return the result as a pandas.DataFrame."""
 
     @overload
-    def pl(self, lazy: Literal[False] = False) -> _PolarsDataFrame: ...
+    def pl(self, lazy: Literal[False] = False) -> polars.DataFrame: ...
     @overload
-    def pl(self, lazy: Literal[True]) -> _PolarsLazyFrame: ...
-    def pl(self, lazy: bool = False) -> _PolarsDataFrame | _PolarsLazyFrame:
+    def pl(self, lazy: Literal[True]) -> polars.LazyFrame: ...
+    def pl(self, lazy: bool = False) -> polars.DataFrame | polars.LazyFrame:
         """Return the result as a polars DataFrame (or LazyFrame)."""
 
     def fetchnumpy(self) -> dict[str, numpy.ndarray]:
@@ -481,10 +480,10 @@ class Connection:
         """Return the result as a pandas.DataFrame."""
 
     @overload
-    def pl(self, lazy: Literal[False] = False) -> _PolarsDataFrame: ...
+    def pl(self, lazy: Literal[False] = False) -> polars.DataFrame: ...
     @overload
-    def pl(self, lazy: Literal[True]) -> _PolarsLazyFrame: ...
-    def pl(self, lazy: bool = False) -> _PolarsDataFrame | _PolarsLazyFrame:
+    def pl(self, lazy: Literal[True]) -> polars.LazyFrame: ...
+    def pl(self, lazy: bool = False) -> polars.DataFrame | polars.LazyFrame:
         """Return the result as a polars DataFrame (or LazyFrame)."""
 
     def fetchnumpy(self) -> dict[str, numpy.ndarray]:

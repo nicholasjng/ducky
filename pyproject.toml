@@ -16,7 +16,7 @@ dynamic = ["version"]
 
 [dependency-groups]
 build = [
-    "nanobind >=2.2",
+    "nanobind>=2.13.0",
     "ruff>=0.15.12",  # for CMake's post-build stub formatting step.
     "scikit-build-core >=0.10",
 ]
@@ -51,6 +51,7 @@ mew = { path = "../mew", editable = true }
 # (nanobind etc.) in compile_commands.json survive across rebuilds.
 no-build-isolation-package = ["ducky"]
 exclude-newer = "1 week"
+exclude-newer-package = { nanobind = false }
 # Require the "build" group by default, due to no build isolation.
 default-groups = ["build"]
 
