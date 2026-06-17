@@ -91,8 +91,17 @@ set(OVERRIDE_GIT_DESCRIBE "v1.5.3-7662-g7ada856c4f5" CACHE STRING "" FORCE)
 # BUILD_EXTENSIONS — it reads .github/config/extensions/<name>.cmake which
 # contains the GIT_URL/GIT_TAG. The sparse-checkout pattern must include the
 # matching .cmake file (and any .github/patches/extensions/<name>/ entry).
-set(BUILD_EXTENSIONS "httpfs;json" CACHE STRING "" FORCE)
-set(DUCKDB_STATIC_EXTENSIONS core_functions parquet httpfs json)
+# icu (timezones, collations, ICU date math) matches duckdb-python's shipped
+# static set; httpfs is our extra (duckdb-python autoinstalls it on demand, which
+# we can't on a dev-pinned commit, so we link it).
+#
+# Note: DuckDB's embedded BUILD_EXTENSIONS model force-links every listed
+# extension (each is registered in the generated static loader), so there's no
+# clean way to emit a *loadable-only* extension here for the load_extension
+# integration test. That test instead consumes an externally-built binary via
+# the DUCKY_EXT_BINARY env var (skipped if unset). See tests/test_extensions.py.
+set(BUILD_EXTENSIONS "httpfs;json;icu" CACHE STRING "" FORCE)
+set(DUCKDB_STATIC_EXTENSIONS core_functions parquet httpfs json icu)
 
 add_subdirectory(${DUCKDB_DIR} duckdb EXCLUDE_FROM_ALL)
 

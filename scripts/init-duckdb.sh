@@ -46,6 +46,7 @@ sparse_patterns='/CMakeLists.txt
 /extension/core_functions/
 /extension/parquet/
 /extension/json/
+/extension/icu/
 /.github/config/extensions/httpfs.cmake
 /.github/patches/extensions/httpfs/'
 
