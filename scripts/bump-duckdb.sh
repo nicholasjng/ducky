@@ -74,6 +74,18 @@ if [ "$bump" -eq 1 ]; then
     # shellcheck disable=SC2086
     git -C "$submodule" fetch --tags --filter=blob:none $unshallow origin \
         '+refs/heads/*:refs/remotes/origin/*'
+
+    # A bare branch name (e.g. `main`) resolves to the *local* branch ref, which
+    # the fetch above never advances — only refs/remotes/origin/* moves. Without
+    # this, `bump-duckdb.sh main` silently re-pins the stale local `main`. Prefer
+    # the just-fetched remote-tracking branch when one exists by that name. (SHAs
+    # and tags have no refs/remotes/origin/<ref>, so they fall through unchanged;
+    # an explicit `origin/main` has no refs/remotes/origin/origin/main either.)
+    if git -C "$submodule" rev-parse --verify --quiet \
+        "refs/remotes/origin/$ref" >/dev/null; then
+        echo ">> Resolving '$ref' to 'origin/$ref' (fresh remote-tracking ref)."
+        ref="origin/$ref"
+    fi
 fi
 
 echo ">> Checking out $ref..."

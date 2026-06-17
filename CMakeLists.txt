@@ -75,7 +75,7 @@ set(BUILD_BENCHMARKS OFF CACHE BOOL "")
 # to the describe of the pinned commit so duckdb_library_version() is accurate.
 # bump-duckdb.sh rewrites this. FORCE so the edit wins over a stale build cache —
 # without it `set(... CACHE)` is a no-op against an existing build dir.
-set(OVERRIDE_GIT_DESCRIBE "v1.5.3-7406-g72e5a0f30cc" CACHE STRING "" FORCE)
+set(OVERRIDE_GIT_DESCRIBE "v1.5.3-7624-g4dd446c8052" CACHE STRING "" FORCE)
 
 # DuckDB unconditionally loads its "essential" extensions — core_functions and
 # parquet — in ext/duckdb/extension/extension_config.cmake, and the generated
@@ -141,9 +141,15 @@ nanobind_add_module(
   src/cpp/aggregate.cpp
   src/cpp/table.cpp
   src/cpp/arrow_scan.cpp
+  src/cpp/arrow_collector.cpp
   src/cpp/result.cpp)
 
 target_include_directories(_core PRIVATE ${DUCKDB_DIR}/src/include)
+# arrow_collector.cpp includes DuckDB's internal C++ headers (the only TU that
+# does), which transitively pull in bundled fmt. DuckDB exposes its third_party
+# include dirs via global include_directories() that don't propagate to this
+# sibling target, so add the one our internal-header includes need.
+target_include_directories(_core PRIVATE ${DUCKDB_DIR}/third_party/fmt/include)
 # tsl::robin_map is vendored by nanobind under ext/robin_map/include and exposed
 # as an IMPORTED target by nanobind-config.cmake; link it so the headers are
 # visible to our sources (nanobind itself only links it PRIVATE to its own
