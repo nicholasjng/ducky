@@ -47,6 +47,12 @@ void def_conversions(Cls& cls, Src src) {
         "arrow", [src](nb::object self) { return conversions().attr("arrow")(src(self)); },
         nb::sig("def arrow(self) -> pyarrow.Table"), "Return the result as a pyarrow.Table.");
     cls.def(
+        "arrow_batches",
+        [src](nb::object self) { return conversions().attr("arrow_batches")(src(self)); },
+        nb::sig("def arrow_batches(self) -> pyarrow.RecordBatchReader"),
+        "Stream the result as a pyarrow.RecordBatchReader, one RecordBatch per chunk "
+        "(~2048 rows). The lazy, Arrow-native counterpart of iter_batches.");
+    cls.def(
         "df", [src](nb::object self) { return conversions().attr("df")(src(self)); },
         nb::sig("def df(self) -> pandas.DataFrame"), "Return the result as a pandas.DataFrame.");
     cls.def(
@@ -230,7 +236,17 @@ NB_MODULE(_core, m) {
             "requested_schema"_a = nb::none(),
             nb::sig("def __arrow_c_stream__(self, requested_schema: typing.Any = None) "
                     "-> typing.Any"),
-            "Export the result via the Arrow PyCapsule stream interface.");
+            "Export the result via the Arrow PyCapsule stream interface.")
+        .def(
+            "_arrow_chunk_stream",
+            [](nb::object self) {
+                return nb::cast<Result&>(self).arrow_c_stream(self, /*allow_fast=*/false);
+            },
+            nb::sig("def _arrow_chunk_stream(self) -> typing.Any"),
+            "Per-chunk Arrow C stream capsule (one batch per ~2048-row chunk, bounded "
+            "memory); backs arrow_batches(). Unlike __arrow_c_stream__ it never coalesces "
+            "the result into a single batch.",
+            nb::lock_self());
     // The Result *is* the Arrow/chunk source the conversion helpers consume.
     def_conversions(result_cls, [](nb::object self) { return self; });
     result_cls
@@ -410,6 +426,14 @@ NB_MODULE(_core, m) {
         .def("query", &Connection::sql, "query"_a, "streaming"_a = false,
              nb::sig("def query(self, query: str, streaming: bool = False) -> Result"),
              "Alias for :meth:`sql`.", nb::lock_self())
+        .def("_arrow_collected_stream", &Connection::arrow_collected_stream, "query"_a,
+             "parameters"_a = nb::none(), "rows_per_batch"_a = 1000000,
+             nb::sig("def _arrow_collected_stream(self, query: str, parameters: list | tuple | "
+                     "dict[str, typing.Any] | None = None, rows_per_batch: int = 1000000) "
+                     "-> typing.Any"),
+             "Low-level born-as-Arrow capsule producer backing :meth:`arrow` and "
+             ":meth:`arrow_reader`. Returns an ``arrow_array_stream`` PyCapsule.",
+             nb::lock_self())
         .def(
             "aexecute",
             [](nb::object self, const std::string& query, nb::object parameters, bool streaming) {
@@ -477,6 +501,37 @@ NB_MODULE(_core, m) {
     def_conversions(conn_cls, [](nb::object self) {
         return nb::cast(nb::cast<Connection&>(self).current_result());
     });
+    // Born-as-Arrow entry points: take a query and execute it with DuckDB's
+    // Arrow result collector (batches assembled during execution, no
+    // chunk->Arrow conversion pass). Distinct from the accessors above, which
+    // convert an already-executed result. `arrow(query)` overloads the no-arg
+    // arrow() accessor: with a query it collects, without one it converts the
+    // current result.
+    conn_cls.def(
+        "arrow",
+        [](nb::object self, const std::string& query, nb::object parameters) {
+            return conversions().attr("arrow_query")(self, query, parameters);
+        },
+        "query"_a, "parameters"_a = nb::none(),
+        nb::sig("def arrow(self, query: str, parameters: list | tuple | "
+                "dict[str, typing.Any] | None = None) -> pyarrow.Table"),
+        "Execute `query` born-as-Arrow (DuckDB's Arrow collector) and return a "
+        "pyarrow.Table — the fast whole-result path, equivalent in result to "
+        "execute(query, parameters).arrow(). `parameters` binds like execute().");
+    conn_cls.def(
+        "arrow_reader",
+        [](nb::object self, const std::string& query, nb::object parameters,
+           uint64_t rows_per_batch) {
+            return conversions().attr("arrow_reader")(self, query, parameters, rows_per_batch);
+        },
+        "query"_a, "parameters"_a = nb::none(), "rows_per_batch"_a = 1000000,
+        nb::sig("def arrow_reader(self, query: str, parameters: list | tuple | "
+                "dict[str, typing.Any] | None = None, rows_per_batch: int = 1000000) -> "
+                "pyarrow.RecordBatchReader"),
+        "Execute `query` born-as-Arrow and return a pyarrow.RecordBatchReader. The "
+        "whole result is materialized as Arrow, then streamed in `rows_per_batch`-row "
+        "batches; for bounded-memory streaming use sql(query).arrow_batches() instead. "
+        "`parameters` binds like execute().");
     // to_numpy is bound directly (not via def_conversions) so it doesn't
     // detour through the Python conversions module — the C++ method runs the
     // chunk loop without leaving the binding.

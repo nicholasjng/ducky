@@ -8,6 +8,7 @@
 #include <cstring>
 #include <thread>
 
+#include "arrow_collector.hpp"
 #include "arrow_scan.hpp"
 #include "ducky.hpp"
 #include "prepared.hpp"
@@ -652,6 +653,59 @@ Connection& Connection::execute(const std::string& query, nb::object parameters,
 
 std::shared_ptr<Result> Connection::sql(const std::string& query, bool streaming) {
     return make_result(run(query, nb::none(), streaming));
+}
+
+nb::object Connection::arrow_collected_stream(const std::string& query, nb::object parameters,
+                                              uint64_t rows_per_batch) {
+    ensure_open();
+    duckdb_connection con = handle_->connection;
+
+    // Same cached-statement dance as run(): reuse the parsed+planned statement
+    // for repeated query text.
+    duckdb_prepared_statement stmt = stmt_cache_checkout(query);
+    if (stmt && duckdb_clear_bindings(stmt) == DuckDBError) {
+        duckdb_destroy_prepare(&stmt);
+        stmt = nullptr;
+    }
+    if (!stmt) {
+        if (duckdb_prepare(con, query.c_str(), &stmt) == DuckDBError) {
+            std::string message = duckdb_prepare_error(stmt);
+            duckdb_destroy_prepare(&stmt);
+            throw DuckyError(message);
+        }
+    }
+    if (!parameters.is_none()) {
+        try {
+            bind_parameters(stmt, parameters);
+        } catch (...) {
+            duckdb_destroy_prepare(&stmt);
+            throw;
+        }
+    }
+
+    nb::object capsule;
+    try {
+        // Install the Arrow collector across execution, then run the normal
+        // pending loop so the query stays Ctrl-C interruptible. The collector is
+        // consumed at plan time inside run_pending's duckdb_pending_prepared;
+        // the guard stays alive over the whole loop and restores on scope exit.
+        duckdb_result result;
+        {
+            CollectorGuard guard(con, rows_per_batch);
+            result = run_pending(con, stmt, /*streaming=*/false);
+        }
+        capsule = arrow_stream_from_result(&result);
+    } catch (...) {
+        duckdb_destroy_prepare(&stmt);
+        throw;
+    }
+    if (keeps_stmt_cache(duckdb_prepared_statement_type(stmt))) {
+        stmt_cache_checkin(query, stmt);
+    } else {
+        stmt_cache_clear();
+        duckdb_destroy_prepare(&stmt);
+    }
+    return capsule;
 }
 
 PendingResult::PendingResult(duckdb_pending_result pending, duckdb_prepared_statement stmt,

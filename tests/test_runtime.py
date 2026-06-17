@@ -114,6 +114,35 @@ def test_interrupt_cancels_long_query():
     assert isinstance(err[0], ducky.Error)
 
 
+def test_interrupt_cancels_born_as_arrow_query():
+    # The born-as-Arrow path (Connection.arrow) runs the same pending loop, so a
+    # long collector query is just as interruptible as execute().fetchall().
+    con = ducky.connect(threads=2)
+
+    err: list[BaseException] = []
+
+    def runner():
+        try:
+            # count(*): a long scan but a one-row result, so the Arrow collector
+            # materializes ~nothing — the time is all interruptible scan work.
+            con.arrow("SELECT count(*) FROM range(10_000_000_000) t(i) WHERE i % 7 = 0")
+        except Exception as e:
+            err.append(e)
+
+    t = threading.Thread(target=runner)
+    t.start()
+    # Settle longer than execute()'s interrupt test: the collected path takes an
+    # extra Python hop (arrow -> arrow_query -> _arrow_collected_stream) before
+    # the executor starts, and interrupting before then would no-op.
+    time.sleep(0.2)
+    con.interrupt()
+    t.join(timeout=10)
+    assert not t.is_alive(), "born-as-Arrow query did not respond to interrupt within 10s"
+    assert err and isinstance(err[0], ducky.Error)
+    # Connection survives: a fresh collector query still runs.
+    assert con.arrow("SELECT 1 AS x").column("x").to_pylist() == [1]
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="SIGINT-on-self is unreliable on Windows")
 def test_keyboard_interrupt_lands_mid_query():
     # The pending-execute loop checks PyErr_CheckSignals() between ticks, so

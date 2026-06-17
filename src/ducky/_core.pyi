@@ -14,7 +14,7 @@ import torch
 from polars import DataFrame as _PolarsDataFrame
 from polars import LazyFrame as _PolarsLazyFrame
 
-__duckdb_version__: str = "v1.6.3-dev7406"
+__duckdb_version__: str = "v1.6.3-dev7624"
 
 class Error(Exception):
     pass
@@ -112,6 +112,11 @@ class Result:
 
     def arrow(self) -> pyarrow.Table:
         """Return the result as a pyarrow.Table."""
+
+    def arrow_batches(self) -> pyarrow.RecordBatchReader:
+        """
+        Stream the result as a pyarrow.RecordBatchReader, one RecordBatch per chunk (~2048 rows). The lazy, Arrow-native counterpart of iter_batches.
+        """
 
     def df(self) -> pandas.DataFrame:
         """Return the result as a pandas.DataFrame."""
@@ -455,8 +460,22 @@ class Connection:
         The conversion accessors (``arrow`` / ``df`` / ``pl`` / …) delegate to this.
         """
 
+    @overload
     def arrow(self) -> pyarrow.Table:
         """Return the result as a pyarrow.Table."""
+
+    @overload
+    def arrow(
+        self, query: str, parameters: list | tuple | dict[str, Any] | None = None
+    ) -> pyarrow.Table:
+        """
+        Execute `query` born-as-Arrow (DuckDB's Arrow collector) and return a pyarrow.Table — the fast whole-result path, equivalent in result to execute(query, parameters).arrow(). `parameters` binds like execute().
+        """
+
+    def arrow_batches(self) -> pyarrow.RecordBatchReader:
+        """
+        Stream the result as a pyarrow.RecordBatchReader, one RecordBatch per chunk (~2048 rows). The lazy, Arrow-native counterpart of iter_batches.
+        """
 
     def df(self) -> pandas.DataFrame:
         """Return the result as a pandas.DataFrame."""
@@ -522,6 +541,16 @@ class Connection:
 
     def to_mlx(self, columns: Iterable[str] | None = None) -> dict[str, mlx.core.array]:
         """Eagerly concatenate all chunks into {name: mlx.core.array}."""
+
+    def arrow_reader(
+        self,
+        query: str,
+        parameters: list | tuple | dict[str, Any] | None = None,
+        rows_per_batch: int = 1000000,
+    ) -> pyarrow.RecordBatchReader:
+        """
+        Execute `query` born-as-Arrow and return a pyarrow.RecordBatchReader. The whole result is materialized as Arrow, then streamed in `rows_per_batch`-row batches; for bounded-memory streaming use sql(query).arrow_batches() instead. `parameters` binds like execute().
+        """
 
     def to_numpy(self, columns: Iterable[str] | None = None) -> dict[str, numpy.ndarray]:
         """

@@ -32,6 +32,8 @@ class ArrowSource(Protocol):
 
     def __arrow_c_stream__(self, requested_schema: Any = None) -> Any: ...
 
+    def _arrow_chunk_stream(self) -> Any: ...
+
 
 class _ChunkSource(Protocol):
     """Anything that produces ducky :class:`Chunk` objects on demand."""
@@ -46,6 +48,68 @@ def arrow(source: ArrowSource) -> pyarrow.Table:
     import pyarrow as pa
 
     return pa.table(source)
+
+
+def arrow_batches(source: ArrowSource) -> pyarrow.RecordBatchReader:
+    """Stream ``source`` as a ``pyarrow.RecordBatchReader`` (one batch per chunk).
+
+    The lazy, Arrow-native counterpart of :func:`iter_batches`: it yields one
+    ``RecordBatch`` per DuckDB chunk (~2048 rows) without materializing the whole
+    table. Emitting a single Arrow object per chunk (rather than a dict of N
+    column ndarrays) makes it cheaper than :func:`iter_batches` for wide results.
+    Wraps ``source``'s per-chunk Arrow C stream, so it stays zero-copy where
+    DuckDB's Arrow export is.
+    """
+    import pyarrow as pa
+
+    # Use the per-chunk stream (not __arrow_c_stream__, which coalesces an
+    # all-flat result into a single batch — defeating bounded-memory streaming).
+    return pa.RecordBatchReader._import_from_c_capsule(source._arrow_chunk_stream())
+
+
+class _CollectedArrowSource(Protocol):
+    """A ducky :class:`Connection` that can execute a query straight into Arrow."""
+
+    def _arrow_collected_stream(
+        self, query: str, parameters: Any = ..., rows_per_batch: int = ...
+    ) -> Any: ...
+
+
+def arrow_reader(
+    con: _CollectedArrowSource,
+    query: str,
+    parameters: Any = None,
+    rows_per_batch: int = 1_000_000,
+) -> pyarrow.RecordBatchReader:
+    """Born-as-Arrow ``RecordBatchReader`` for ``query`` (backs Connection.arrow_reader).
+
+    Executes ``query`` with DuckDB's Arrow result collector, which assembles
+    Arrow record batches *during* execution (in parallel) — no
+    DuckDB-chunk-to-Arrow conversion pass. Each ``RecordBatch`` holds up to
+    ``rows_per_batch`` rows. ``parameters`` binds like ``execute()``.
+
+    Unlike :func:`arrow_batches` (which streams one chunk at a time and is
+    memory-bounded), the collector fully materializes the result as Arrow before
+    the reader yields anything — peak memory is the whole result, not one batch.
+    Use :func:`arrow_batches` when bounded memory matters; use this when you want
+    the whole result as Arrow as fast as possible.
+    """
+    import pyarrow as pa
+
+    return pa.RecordBatchReader._import_from_c_capsule(
+        con._arrow_collected_stream(query, parameters, rows_per_batch)
+    )
+
+
+def arrow_query(con: _CollectedArrowSource, query: str, parameters: Any = None) -> pyarrow.Table:
+    """Born-as-Arrow ``pyarrow.Table`` for ``query`` (backs Connection.arrow(query)).
+
+    The fastest path from a query to a whole Arrow table: executes with DuckDB's
+    Arrow result collector and concatenates the collected batches. Equivalent in
+    result to ``con.execute(query, parameters).arrow()`` but skips the
+    chunk->Arrow conversion pass. ``parameters`` binds like ``execute()``.
+    """
+    return arrow_reader(con, query, parameters).read_all()
 
 
 def df(source: ArrowSource) -> pd.DataFrame:

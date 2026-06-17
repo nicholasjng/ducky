@@ -137,6 +137,28 @@ def bench_select_iter_batches(state: mew.State, n: int) -> None:
 
 
 @mew.parametrize(_PARAMS, ids=_IDS, tags=(*_TAGS, "ml"), min_time=0.2)
+def bench_select_arrow_reader(state: mew.State, n: int) -> None:
+    """arrow_batches: per-chunk pyarrow RecordBatchReader (one batch per chunk)."""
+    con = _populate(n)
+    for _ in state:
+        for _batch in con.execute("SELECT * FROM t").arrow_batches():
+            pass
+
+
+@mew.parametrize(_PARAMS, ids=_IDS, tags=(*_TAGS, "ml"), min_time=0.2)
+def bench_select_arrow_collected(state: mew.State, n: int) -> None:
+    """Born-as-Arrow: DuckDB's Arrow collector builds batches during execution.
+
+    A/B against bench_select_arrow_reader (chunk-by-chunk conversion). Matches
+    duckdb's to_arrow_reader(2048) in bench_duckdb.py — both born-as-Arrow.
+    """
+    con = _populate(n)
+    for _ in state:
+        for _batch in con.arrow_reader("SELECT * FROM t", rows_per_batch=2048):
+            pass
+
+
+@mew.parametrize(_PARAMS, ids=_IDS, tags=(*_TAGS, "ml"), min_time=0.2)
 def bench_select_to_torch(state: mew.State, n: int) -> None:
     """to_torch: DLPack into torch tensor dict."""
     import torch  # noqa: F401  # keep the one-time import out of the timed loop

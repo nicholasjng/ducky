@@ -523,7 +523,7 @@ void stream_capsule_destructor(PyObject* capsule) {
 
 }  // namespace
 
-nb::object Result::arrow_c_stream(nb::object self) {
+nb::object Result::arrow_c_stream(nb::object self, bool allow_fast) {
     if (!handle_ || !handle_->connection) {
         throw DuckyError("ducky: Arrow export is unavailable; the connection is closed");
     }
@@ -533,8 +533,10 @@ nb::object Result::arrow_c_stream(nb::object self) {
 
     // Pick the fast path only if every column's DuckDB layout is bit-identical to
     // its Arrow layout, so the combined batch can be a raw buffer concatenation.
+    // `allow_fast` callers that want per-chunk streaming (bounded memory) force
+    // the fallback, which emits one batch per data chunk instead.
     std::vector<size_t> widths(column_count_);
-    bool fast = column_count_ > 0;
+    bool fast = allow_fast && column_count_ > 0;
     for (idx_t c = 0; c < column_count_; ++c) {
         widths[c] = fast_arrow_width(types_[c]);
         fast &= widths[c] != 0;

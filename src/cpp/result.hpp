@@ -61,7 +61,12 @@ class Result {
     // Arrow PyCapsule interface: exports the remaining result as an Arrow C
     // stream. `self` is the owning Python object, kept alive for the stream's
     // lifetime. Consumes the result (mutually exclusive with the fetch* path).
-    nb::object arrow_c_stream(nb::object self);
+    //
+    // `allow_fast` (the default, used by __arrow_c_stream__) lets all-flat
+    // results be drained into a single combined batch — cheapest for whole-table
+    // consumers. Pass false for a per-chunk stream (one batch per ~2048-row
+    // chunk), which keeps peak memory bounded to one batch for streaming.
+    nb::object arrow_c_stream(nb::object self, bool allow_fast = true);
 
    private:
     // Ensures a row is available at the cursor, advancing to the next chunk as

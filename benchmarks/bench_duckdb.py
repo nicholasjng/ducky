@@ -144,6 +144,16 @@ def bench_select_iter_batches(state: mew.State, n: int) -> None:
 
 
 @mew.parametrize(_PARAMS, ids=_IDS, tags=(*_TAGS, "ml"), min_time=0.2)
+def bench_select_arrow_reader(state: mew.State, n: int) -> None:
+    """Same 2048-row Arrow reader; pairs with ducky's arrow_batches()."""
+    con = _populate(n)
+    for _ in state:
+        reader = con.execute("SELECT * FROM t").to_arrow_reader(2048)
+        for _batch in reader:
+            pass
+
+
+@mew.parametrize(_PARAMS, ids=_IDS, tags=(*_TAGS, "ml"), min_time=0.2)
 def bench_select_to_torch(state: mew.State, n: int) -> None:
     """torch(): native DLPack tensor dict."""
     import torch  # noqa: F401  # keep the one-time import out of the timed loop

@@ -75,6 +75,14 @@ class Connection {
     // Run a query and return its Result directly.
     std::shared_ptr<Result> sql(const std::string& query, bool streaming);
 
+    // Execute `query` with DuckDB's Arrow result collector and return an
+    // `arrow_array_stream` PyCapsule (born-as-Arrow: batches assembled during
+    // execution, no chunk->Arrow conversion pass). One batch per
+    // `rows_per_batch`-row collector batch. `parameters` binds like execute().
+    // See arrow_collector.cpp.
+    nb::object arrow_collected_stream(const std::string& query, nb::object parameters,
+                                      uint64_t rows_per_batch);
+
     // Prepare + bind without driving the executor — substrate for ducky._aio.
     // The returned handle owns a throwaway prepared statement.
     PendingResult* make_pending(const std::string& query, nb::object parameters, bool streaming);

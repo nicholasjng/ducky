@@ -43,6 +43,71 @@ _FAST_EXPRS = {
 _N = 20_000
 
 
+def test_arrow_batches_streams_per_chunk():
+    import pyarrow as pa
+
+    con = ducky.connect()
+    con.execute("CREATE TABLE t AS SELECT range AS a, range * 2 AS b FROM range(5000)")
+    # Result.arrow_batches() yields a lazy RecordBatchReader, one batch per chunk.
+    reader = con.sql("SELECT * FROM t").arrow_batches()
+    assert isinstance(reader, pa.RecordBatchReader)
+    batches = list(reader)
+    assert len(batches) > 1  # 5000 rows > STANDARD_VECTOR_SIZE → multiple chunks
+    assert sum(b.num_rows for b in batches) == 5000
+    # Same data as the eager table.
+    assert pa.Table.from_batches(batches).equals(con.sql("SELECT * FROM t").arrow())
+    # Also reachable via the Connection (delegates to the current result).
+    rows = sum(b.num_rows for b in con.execute("SELECT * FROM t").arrow_batches())
+    assert rows == 5000
+
+
+def test_arrow_reader_born_as_arrow():
+    import pyarrow as pa
+
+    con = ducky.connect()
+    con.execute("CREATE TABLE t AS SELECT range AS a, range * 2 AS b FROM range(20000)")
+    # Connection.arrow_reader(query): DuckDB's collector assembles batches during execution.
+    reader = con.arrow_reader("SELECT * FROM t", rows_per_batch=2048)
+    assert isinstance(reader, pa.RecordBatchReader)
+    batches = list(reader)
+    assert sum(b.num_rows for b in batches) == 20000
+    # Same schema + data as the chunk-converted path.
+    table = pa.Table.from_batches(batches)
+    assert table.sort_by("a").equals(con.sql("SELECT * FROM t ORDER BY a").arrow())
+    # A second execution reuses the cached statement and starts clean.
+    again = list(con.arrow_reader("SELECT * FROM t", rows_per_batch=2048))
+    assert sum(b.num_rows for b in again) == 20000
+
+
+def test_arrow_query_overload_born_as_arrow():
+    import pyarrow as pa
+
+    con = ducky.connect()
+    con.execute("CREATE TABLE t AS SELECT range AS a, range * 2 AS b FROM range(20000)")
+    # arrow(query) collects; arrow() (no arg) converts the current result. Both equal.
+    collected = con.arrow("SELECT * FROM t")
+    assert isinstance(collected, pa.Table)
+    converted = con.execute("SELECT * FROM t").arrow()
+    assert collected.sort_by("a").equals(converted.sort_by("a"))
+    assert collected.num_rows == 20000
+
+
+def test_arrow_collected_parameter_binding():
+    con = ducky.connect()
+    con.execute("CREATE TABLE t AS SELECT range AS a, range * 2 AS b FROM range(20000)")
+    # Positional params on both born-as-Arrow entry points.
+    table = con.arrow("SELECT * FROM t WHERE a >= ? AND a < ?", [100, 200])
+    assert table.num_rows == 100
+    assert table.column("a").to_pylist() == list(range(100, 200))
+    reader = con.arrow_reader("SELECT * FROM t WHERE a < ?", [50], rows_per_batch=16)
+    assert sum(b.num_rows for b in reader) == 50
+    # Named params (dict) work too.
+    named = con.arrow("SELECT * FROM t WHERE a = $x", {"x": 12345})
+    assert named.column("b").to_pylist() == [24690]
+    # A bound query then an unbound one reuses the cached statement, unbound clean.
+    assert con.arrow("SELECT count(*) AS n FROM t").column("n").to_pylist() == [20000]
+
+
 @pytest.mark.parametrize("expr", _FAST_EXPRS.values(), ids=list(_FAST_EXPRS))
 def test_fast_path_equals_fallback(expr: str) -> None:
     con = ducky.connect()
