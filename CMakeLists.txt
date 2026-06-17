@@ -75,7 +75,11 @@ set(BUILD_BENCHMARKS OFF CACHE BOOL "")
 # to the describe of the pinned commit so duckdb_library_version() is accurate.
 # bump-duckdb.sh rewrites this. FORCE so the edit wins over a stale build cache —
 # without it `set(... CACHE)` is a no-op against an existing build dir.
-set(OVERRIDE_GIT_DESCRIBE "v1.5.3-7662-g7ada856c4f5" CACHE STRING "" FORCE)
+set(_describe "")
+  if(EXISTS "${CMAKE_SOURCE_DIR}/cmake/duckdb-describe.txt")
+      file(STRINGS "${CMAKE_SOURCE_DIR}/cmake/duckdb-describe.txt" _describe LIMIT_COUNT 1)
+  endif()
+  set(OVERRIDE_GIT_DESCRIBE "${_describe}" CACHE STRING "" FORCE)
 
 # DuckDB unconditionally loads its "essential" extensions — core_functions and
 # parquet — in ext/duckdb/extension/extension_config.cmake, and the generated

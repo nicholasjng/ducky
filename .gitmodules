@@ -2,3 +2,24 @@
 	path = ext/duckdb
 	url = https://github.com/duckdb/duckdb.git
 	shallow = true
+[picky "ext/duckdb"]
+	sparse = /CMakeLists.txt
+	sparse = /DuckDBConfig.cmake.in
+	sparse = /DuckDBConfigVersion.cmake.in
+	sparse = /LICENSE
+	sparse = /src/
+	sparse = /third_party/
+	sparse = /scripts/
+	sparse = /tools/CMakeLists.txt
+	sparse = /tools/utils/
+	sparse = /extension/CMakeLists.txt
+	sparse = /extension/*.cmake
+	sparse = /extension/*.in
+	sparse = /extension/loader/
+	sparse = /extension/core_functions/
+	sparse = /extension/parquet/
+	sparse = /extension/json/
+	sparse = /extension/icu/
+	sparse = /.github/config/extensions/httpfs.cmake
+	sparse = /.github/patches/extensions/httpfs/
+	postUpdate = sh \"$PICKY_ROOT/scripts/override-describe.sh\"
