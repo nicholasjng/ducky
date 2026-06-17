@@ -14,7 +14,7 @@ import torch
 from polars import DataFrame as _PolarsDataFrame
 from polars import LazyFrame as _PolarsLazyFrame
 
-__duckdb_version__: str = "v1.6.3-dev7624"
+__duckdb_version__: str = "v1.6.3-dev7662"
 
 class Error(Exception):
     pass

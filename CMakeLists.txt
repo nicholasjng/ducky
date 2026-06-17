@@ -75,7 +75,7 @@ set(BUILD_BENCHMARKS OFF CACHE BOOL "")
 # to the describe of the pinned commit so duckdb_library_version() is accurate.
 # bump-duckdb.sh rewrites this. FORCE so the edit wins over a stale build cache —
 # without it `set(... CACHE)` is a no-op against an existing build dir.
-set(OVERRIDE_GIT_DESCRIBE "v1.5.3-7624-g4dd446c8052" CACHE STRING "" FORCE)
+set(OVERRIDE_GIT_DESCRIBE "v1.5.3-7662-g7ada856c4f5" CACHE STRING "" FORCE)
 
 # DuckDB unconditionally loads its "essential" extensions — core_functions and
 # parquet — in ext/duckdb/extension/extension_config.cmake, and the generated
@@ -93,25 +93,6 @@ set(OVERRIDE_GIT_DESCRIBE "v1.5.3-7624-g4dd446c8052" CACHE STRING "" FORCE)
 # matching .cmake file (and any .github/patches/extensions/<name>/ entry).
 set(BUILD_EXTENSIONS "httpfs;json" CACHE STRING "" FORCE)
 set(DUCKDB_STATIC_EXTENSIONS core_functions parquet httpfs json)
-
-# Out-of-tree extensions (httpfs, azure, …) take DuckDB's APPLY_PATCHES path,
-# which hardcodes ${CMAKE_SOURCE_DIR}/scripts/apply_extension_patches.py and
-# ${CMAKE_SOURCE_DIR}/.github/patches/extensions/<ext>/ instead of using the
-# DuckDB submodule's own DUCKDB_MODULE_BASE_DIR. Stage symlinks into our
-# source root so the build finds them. The patches keep the upstream httpfs
-# repo buildable against the DuckDB commit we vendored — skipping them isn't
-# safe across DuckDB version bumps.
-file(MAKE_DIRECTORY
-     "${CMAKE_CURRENT_SOURCE_DIR}/scripts"
-     "${CMAKE_CURRENT_SOURCE_DIR}/.github/patches/extensions")
-foreach(_link IN ITEMS
-        "scripts/apply_extension_patches.py"
-        ".github/patches/extensions/httpfs")
-  if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${_link}")
-    file(CREATE_LINK "${DUCKDB_DIR}/${_link}"
-                     "${CMAKE_CURRENT_SOURCE_DIR}/${_link}" SYMBOLIC)
-  endif()
-endforeach()
 
 add_subdirectory(${DUCKDB_DIR} duckdb EXCLUDE_FROM_ALL)
 
