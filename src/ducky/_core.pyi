@@ -702,6 +702,16 @@ class Connection:
         The source is kept and re-streamed on each query via a replacement scan, so it must support being streamed more than once. Queries scan it in parallel; primitive columns are read zero-copy from the Arrow buffers, and each execution buffers the stream's batches (cheap chunk wraps for an in-memory table, a full materialization for an unbounded reader).
         """
 
+    def load_extension(self, name: str) -> None:
+        """
+        Load a DuckDB extension by name or by path to a ``.duckdb_extension`` binary.
+
+        Issues ``LOAD '<name>'``. DuckDB validates the binary's platform, ABI type, version, and signature against this build.
+        Unsigned or self-built extensions require the connection to have been opened with ``allow_unsigned_extensions=True``.
+        Because ducky pins a development DuckDB commit, prebuilt C++-ABI extensions from the official repository generally won't match; the reliable routes are C-API (``C_STRUCT``) extensions within the CAPI version range, or extensions built against ducky's pinned commit.
+        Raises :class:`Error` with DuckDB's message on failure.
+        """
+
     def close(self) -> None:
         """Close the connection."""
 

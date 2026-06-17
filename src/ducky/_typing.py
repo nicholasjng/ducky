@@ -43,6 +43,11 @@ class DuckDBConfig(TypedDict, total=False):
     autoinstall_known_extensions: bool
     """Install extensions on first reference."""
 
+    allow_unsigned_extensions: bool
+    """Permit loading unsigned / self-built extensions via
+    :meth:`Connection.load_extension`. Open-only: it cannot be changed after the
+    connection is opened, so it must be passed to :func:`ducky.connect`."""
+
     enable_progress_bar: bool
     """Show a progress bar for long-running queries."""
 

@@ -360,6 +360,39 @@ void Connection::interrupt() {
     if (handle_ && handle_->connection) duckdb_interrupt(handle_->connection);
 }
 
+void Connection::load_extension(const std::string& name) {
+    ensure_open();
+
+    // Build `LOAD '<name>'`, doubling single quotes for the SQL string literal.
+    std::string literal;
+    literal.reserve(name.size() + 2);
+    for (char c : name) {
+        if (c == '\'') literal.push_back('\'');
+        literal.push_back(c);
+    }
+    std::string sql = "LOAD '" + literal + "'";
+
+    duckdb_result result;
+    duckdb_state state;
+    {
+        // dlopen + metadata/signature checks touch the filesystem; release the
+        // GIL so other threads run during the load.
+        nb::gil_scoped_release release;
+        state = duckdb_query(handle_->connection, sql.c_str(), &result);
+    }
+    if (state == DuckDBError) {
+        const char* err = duckdb_result_error(&result);
+        std::string message = err ? err : "unknown error";
+        duckdb_destroy_result(&result);
+        throw DuckyError("ducky: failed to load extension '" + name + "': " + message);
+    }
+    duckdb_destroy_result(&result);
+
+    // LOAD can register new functions / types / settings, so drop cached plans
+    // — mirrors run()'s keeps_stmt_cache() flush for LOAD statements.
+    stmt_cache_clear();
+}
+
 nb::tuple Connection::progress() const {
     if (!handle_ || !handle_->connection) {
         throw DuckyError("ducky: connection is closed");

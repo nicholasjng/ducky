@@ -133,6 +133,15 @@ class Connection {
     // is kept and re-streamed on each query via a replacement scan.
     void register_arrow(const std::string& name, nb::object obj);
 
+    // Load a DuckDB extension by name (if already installed) or by path to a
+    // `.duckdb_extension` binary. Issues `LOAD '<name>'`; DuckDB validates the
+    // binary's platform, ABI type, version, and signature. Unsigned / self-built
+    // binaries require the connection to have been opened with allow_unsigned
+    // (allow_unsigned_extensions=true), which is an open-only setting. Raises
+    // DuckyError carrying DuckDB's message (incl. the metadata-mismatch /
+    // unsigned hints) on failure.
+    void load_extension(const std::string& name);
+
     void close();
 
    private:

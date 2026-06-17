@@ -718,6 +718,20 @@ NB_MODULE(_core, m) {
              "chunk wraps for an in-memory table, a full materialization for an "
              "unbounded reader).",
              nb::lock_self())
+        .def("load_extension", &Connection::load_extension, "name"_a,
+             nb::sig("def load_extension(self, name: str) -> None"),
+             "Load a DuckDB extension by name or by path to a "
+             "``.duckdb_extension`` binary.\n\n"
+             "Issues ``LOAD '<name>'``. DuckDB validates the binary's platform, "
+             "ABI type, version, and signature against this build.\n"
+             "Unsigned or self-built extensions require the connection to have "
+             "been opened with ``allow_unsigned_extensions=True``.\n"
+             "Because ducky pins a development DuckDB commit, prebuilt C++-ABI "
+             "extensions from the official repository generally won't match; the "
+             "reliable routes are C-API (``C_STRUCT``) extensions within the CAPI "
+             "version range, or extensions built against ducky's pinned commit.\n"
+             "Raises :class:`Error` with DuckDB's message on failure.",
+             nb::lock_self())
         .def("close", &Connection::close, "Close the connection.", nb::lock_self())
         .def(
             "__enter__", [](Connection& self) -> Connection& { return self; },

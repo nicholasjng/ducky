@@ -65,6 +65,8 @@ def connect(
     --------
     >>> con = ducky.connect(memory_limit="2GB", threads=4)
     >>> con = ducky.connect("mydb.duckdb", access_mode="READ_ONLY")
+    >>> con = ducky.connect(allow_unsigned_extensions=True)
+    >>> con.load_extension("/path/to/my.duckdb_extension")
     """
 
     def coerce(value: object) -> str:
