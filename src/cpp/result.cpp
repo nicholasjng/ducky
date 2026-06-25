@@ -67,14 +67,17 @@ nb::object uhugeint_to_py(duckdb_uhugeint value) {
     return combine_128(steal_checked(PyLong_FromUnsignedLongLong(value.upper)), value.lower);
 }
 
+// The temporal constructors below can fail — DuckDB's DATE/TIMESTAMP range
+// exceeds Python's year 1..9999 — so every PyDateTime_* call goes through
+// steal_checked to surface the ValueError instead of leaking a NULL object.
 nb::object date_to_py(int32_t days) {
     duckdb_date_struct s = duckdb_from_date(duckdb_date{days});
-    return nb::steal(PyDate_FromDate(s.year, s.month, s.day));
+    return steal_checked(PyDate_FromDate(s.year, s.month, s.day));
 }
 
 nb::object time_to_py(int64_t micros) {
     duckdb_time_struct s = duckdb_from_time(duckdb_time{micros});
-    return nb::steal(PyTime_FromTime(s.hour, s.min, s.sec, s.micros));
+    return steal_checked(PyTime_FromTime(s.hour, s.min, s.sec, s.micros));
 }
 
 nb::object timestamp_to_py(int64_t micros, bool utc) {
@@ -84,8 +87,8 @@ nb::object timestamp_to_py(int64_t micros, bool utc) {
         return py_types().datetime(s.date.year, s.date.month, s.date.day, s.time.hour, s.time.min,
                                    s.time.sec, s.time.micros, py_types().timezone_utc);
     }
-    return nb::steal(PyDateTime_FromDateAndTime(s.date.year, s.date.month, s.date.day, s.time.hour,
-                                                s.time.min, s.time.sec, s.time.micros));
+    return steal_checked(PyDateTime_FromDateAndTime(
+        s.date.year, s.date.month, s.date.day, s.time.hour, s.time.min, s.time.sec, s.time.micros));
 }
 
 // DuckDB stores UUIDs as int128 with the high bit flipped (so signed ordering
@@ -120,9 +123,18 @@ nb::object decimal_to_py(void* data, idx_t row, duckdb_type internal, uint8_t sc
 
 nb::object interval_to_py(duckdb_interval value) {
     // timedelta has no months; approximate 1 month as 30 days. Use the Arrow
-    // path for an exact month / day / micros interval.
-    int days = value.days + value.months * 30;
-    return nb::steal(PyDelta_FromDSU(days, 0, value.micros));
+    // path for an exact month / day / micros interval. Normalize in 64-bit —
+    // months * 30 and the raw micros can each overflow the int arguments
+    // PyDelta_FromDSU takes — and range-check days against timedelta's
+    // documented ±999999999-day limit so oversized intervals raise cleanly.
+    int64_t seconds = value.micros / 1000000;
+    int64_t micros = value.micros - seconds * 1000000;
+    int64_t days = (int64_t)value.days + (int64_t)value.months * 30 + seconds / 86400;
+    seconds %= 86400;
+    if (days < -999999999 || days > 999999999) {
+        throw DuckyError("ducky: INTERVAL value overflows datetime.timedelta");
+    }
+    return steal_checked(PyDelta_FromDSU((int)days, (int)seconds, (int)micros));
 }
 
 idx_t enum_index(void* data, idx_t row, duckdb_type internal) {
@@ -650,15 +662,17 @@ bool Result::ensure_row() {
 nb::object Result::build_row() {
     idx_t row = cursor_++;
     rows_returned_++;
-    PyObject* tuple = PyTuple_New((Py_ssize_t)column_count_);
-    if (!tuple) throw nb::python_error();
+    // Held as an owning nb::object so a throwing convert_cell (e.g. an
+    // out-of-range DATE) releases the partial tuple; tuple dealloc tolerates
+    // the not-yet-filled NULL slots.
+    nb::object tuple = steal_checked(PyTuple_New((Py_ssize_t)column_count_));
     for (idx_t c = 0; c < column_count_; ++c) {
         const ColumnCursor& cur = cursors_[c];
         nb::object value =
             convert_cell(types_[c], cur.vector, column_types_[c], cur.data, cur.validity, row);
-        PyTuple_SET_ITEM(tuple, (Py_ssize_t)c, value.release().ptr());
+        PyTuple_SET_ITEM(tuple.ptr(), (Py_ssize_t)c, value.release().ptr());
     }
-    return nb::steal(tuple);
+    return tuple;
 }
 
 // The cursor methods below mutate chunk_/cursor_/vectors_; nb::lock_self() in

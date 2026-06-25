@@ -310,18 +310,27 @@ struct ArrowUDFContext {
     //   record_batch=false, dict_style=true  → fn({"name": col, ...})  [dict of pa.Array]
     bool record_batch = false;
     bool dict_style = false;
+
+    ArrowUDFContext() = default;
+    ArrowUDFContext(const ArrowUDFContext&) = delete;
+    ArrowUDFContext& operator=(const ArrowUDFContext&) = delete;
+
+    // Owns the DuckDB heap objects so a create_arrow_scalar_function that
+    // throws mid-parse (e.g. an invalid second parameter type) frees the ones
+    // already built, not just the extra-info destroy path.
+    ~ArrowUDFContext() {
+        for (duckdb_logical_type& t : param_types) duckdb_destroy_logical_type(&t);
+        if (return_type) duckdb_destroy_logical_type(&return_type);
+        if (options) duckdb_destroy_arrow_options(&options);
+    }
 };
 
 void arrow_udf_extra_info_destroy(void* ptr) {
     if (!ptr) return;
-    auto* ctx = (ArrowUDFContext*)ptr;
-    for (duckdb_logical_type& t : ctx->param_types) duckdb_destroy_logical_type(&t);
-    if (ctx->return_type) duckdb_destroy_logical_type(&ctx->return_type);
-    if (ctx->options) duckdb_destroy_arrow_options(&ctx->options);
-    {
-        nb::gil_scoped_acquire gil;
-        delete ctx;
-    }
+    // ~ArrowUDFContext frees the owned DuckDB objects; the GIL covers the
+    // nb::callable member's decref.
+    nb::gil_scoped_acquire gil;
+    delete (ArrowUDFContext*)ptr;
 }
 
 // RAII for an ArrowSchema/ArrowArray pair on the stack: releases whichever
@@ -480,6 +489,7 @@ const TypeSpec* typespec_for(duckdb_type type) {
 void create_scalar_function(Connection& con, const std::string& name, nb::callable fn,
                             nb::object parameters, nb::object return_type, nb::object varargs,
                             nb::object init, bool is_volatile, bool special_handling) {
+    duckdb_connection raw = con.raw_connection();
     auto ctx = std::make_unique<UDFContext>();
     bool has_varargs = !varargs.is_none();
     if (has_varargs && !parameters.is_none()) {
@@ -536,22 +546,20 @@ void create_scalar_function(Connection& con, const std::string& name, nb::callab
     if (is_volatile) duckdb_scalar_function_set_volatile(f);
     if (special_handling) duckdb_scalar_function_set_special_handling(f);
     if (ctx->init_callable) duckdb_scalar_function_set_init(f, &udf_init_trampoline);
-    // DuckDB takes ownership of ctx via the destroy callback; release on success.
+    // Ownership of ctx passes to the function object here: its destroy callback
+    // runs whether or not registration succeeds — on failure the
+    // duckdb_destroy_scalar_function below drops the last reference to the
+    // shared function info, whose destructor invokes the callback.
     duckdb_scalar_function_set_extra_info(f, ctx.get(), &udf_extra_info_destroy);
+    // NOLINTNEXTLINE(bugprone-unused-return-value)
+    (void)ctx.release();
 
-    duckdb_connection raw = con.raw_connection();
     duckdb_state state = duckdb_register_scalar_function(raw, f);
     duckdb_destroy_scalar_function(&f);
     if (state == DuckDBError) {
-        // Registration failed: DuckDB didn't take ownership of extra_info, so
-        // ctx is still ours and unique_ptr will free it.
         throw DuckyError("ducky: failed to register UDF '" + name +
                          "' (name in use, or invalid types?)");
     }
-    // Hand off ownership of ctx to DuckDB; release() returns the raw pointer
-    // (already stashed via set_extra_info above), which we intentionally drop.
-    // NOLINTNEXTLINE(bugprone-unused-return-value)
-    (void)ctx.release();
 }
 
 void create_arrow_scalar_function(Connection& con, const std::string& name, nb::callable fn,
@@ -599,7 +607,11 @@ void create_arrow_scalar_function(Connection& con, const std::string& name, nb::
     }
     duckdb_scalar_function_set_return_type(f, ctx->return_type);
     duckdb_scalar_function_set_function(f, &arrow_udf_trampoline);
+    // Ownership of ctx passes to the function object here; see
+    // create_scalar_function.
     duckdb_scalar_function_set_extra_info(f, ctx.get(), &arrow_udf_extra_info_destroy);
+    // NOLINTNEXTLINE(bugprone-unused-return-value)
+    (void)ctx.release();
 
     duckdb_state state = duckdb_register_scalar_function(raw, f);
     duckdb_destroy_scalar_function(&f);
@@ -607,6 +619,4 @@ void create_arrow_scalar_function(Connection& con, const std::string& name, nb::
         throw DuckyError("ducky: failed to register arrow UDF '" + name +
                          "' (name in use, or invalid types?)");
     }
-    // NOLINTNEXTLINE(bugprone-unused-return-value)
-    (void)ctx.release();
 }

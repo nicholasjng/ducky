@@ -163,7 +163,14 @@ Appender::Appender(Connection& connection, std::string table, std::optional<std:
 }
 
 Appender::~Appender() {
-    close();
+    // Not close(): a destructor must not throw, and the final implicit flush
+    // can fail (e.g. a constraint violation). duckdb_appender_destroy closes
+    // internally; its error state is dropped here. Call close() (or use a
+    // `with` block) to observe flush errors.
+    if (handle_) {
+        duckdb_appender_destroy(&handle_);
+        handle_ = nullptr;
+    }
     for (auto& lt : types_) {
         if (lt) duckdb_destroy_logical_type(&lt);
     }
@@ -381,11 +388,16 @@ void Appender::append_columns(nb::dict columns, nb::object masks) {
 
     idx_t vec_size = duckdb_vector_size();
 
-    // Stream chunks of up to vec_size rows.
+    // Stream slices of up to vec_size rows through one reusable chunk:
+    // duckdb_append_data_chunk copies the data into the appender, and
+    // duckdb_data_chunk_reset restores capacity and all-valid validity masks
+    // (StandardVectorBuffer::ResetCapacity), so per-slice re-allocation is
+    // pure overhead.
+    duckdb_data_chunk chunk = duckdb_create_data_chunk(types_.data(), n_cols);
     for (int64_t offset = 0; offset < n_rows; offset += (int64_t)vec_size) {
         idx_t this_n = (idx_t)std::min<int64_t>(vec_size, n_rows - offset);
 
-        duckdb_data_chunk chunk = duckdb_create_data_chunk(types_.data(), n_cols);
+        duckdb_data_chunk_reset(chunk);
         duckdb_data_chunk_set_size(chunk, this_n);
 
         for (idx_t i = 0; i < n_cols; ++i) {
@@ -422,9 +434,12 @@ void Appender::append_columns(nb::dict columns, nb::object masks) {
         }
 
         duckdb_state state = duckdb_append_data_chunk(handle_, chunk);
-        duckdb_destroy_data_chunk(&chunk);
-        check_state(state, "append_data_chunk failed");
+        if (state == DuckDBError) {
+            duckdb_destroy_data_chunk(&chunk);
+            check_state(state, "append_data_chunk failed");
+        }
     }
+    duckdb_destroy_data_chunk(&chunk);
 }
 
 void Appender::append_arrow(nb::object source) {

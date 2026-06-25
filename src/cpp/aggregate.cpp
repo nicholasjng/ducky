@@ -197,6 +197,7 @@ void agg_finalize(duckdb_function_info info, duckdb_aggregate_state* source, duc
 
 void create_aggregate_function(Connection& con, const std::string& name, nb::object cls,
                                nb::object parameters, const std::string& return_type) {
+    duckdb_connection raw = con.raw_connection();
     auto ctx = std::make_unique<AggregateUDFContext>();
     ctx->cls = nb::cast<nb::callable>(cls);
     ctx->return_type = &lookup_typespec(return_type);
@@ -235,14 +236,16 @@ void create_aggregate_function(Connection& con, const std::string& name, nb::obj
                                             ctx->has_combine ? &agg_combine : &agg_combine_copy,
                                             &agg_finalize);
     duckdb_aggregate_function_set_destructor(f, &agg_destroy);
+    // Ownership of ctx passes to the function object here: its destroy callback
+    // runs whether or not registration succeeds (a failed registration's
+    // duckdb_destroy_aggregate_function drops the last reference).
     duckdb_aggregate_function_set_extra_info(f, ctx.get(), &agg_extra_info_destroy);
+    // NOLINTNEXTLINE(bugprone-unused-return-value)
+    (void)ctx.release();
 
-    duckdb_connection raw = con.raw_connection();
     duckdb_state state = duckdb_register_aggregate_function(raw, f);
     duckdb_destroy_aggregate_function(&f);
     if (state == DuckDBError) {
         throw DuckyError("ducky: failed to register aggregate function '" + name + "'");
     }
-    // NOLINTNEXTLINE(bugprone-unused-return-value)
-    (void)ctx.release();
 }

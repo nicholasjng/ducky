@@ -18,6 +18,17 @@ struct TableUDFContext {
     std::vector<std::string> col_names;
     std::vector<duckdb_logical_type> col_types;  // owned
     std::vector<duckdb_type> col_type_ids;
+
+    TableUDFContext() = default;
+    TableUDFContext(const TableUDFContext&) = delete;
+    TableUDFContext& operator=(const TableUDFContext&) = delete;
+
+    // Owns the logical types so a create_table_function that throws mid-parse
+    // cleans up the ones already built, not just the extra-info destroy path.
+    ~TableUDFContext() {
+        for (duckdb_logical_type& t : param_types) duckdb_destroy_logical_type(&t);
+        for (duckdb_logical_type& t : col_types) duckdb_destroy_logical_type(&t);
+    }
 };
 
 struct TableUDFBindData {

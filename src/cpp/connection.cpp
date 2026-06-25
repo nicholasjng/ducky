@@ -572,10 +572,13 @@ void Connection::maybe_emit_profile(const std::string& query) {
     duckdb_profiling_info info = duckdb_get_profiling_info(handle_->connection);
     if (!info) return;
     nb::object tree = walk_profiling_node(info);
-    // Sink errors must not break the query — print to stderr and continue.
+    // Sink errors must not break the query — report via sys.unraisablehook and
+    // continue. python_error's constructor fetched (cleared) the error
+    // indicator; restore it first or WriteUnraisable has nothing to report.
     try {
         profile_sink_(query, tree);
     } catch (nb::python_error& e) {
+        e.restore();
         PyErr_WriteUnraisable(profile_sink_.ptr());
     }
 }
@@ -624,7 +627,36 @@ void Connection::close() {
     // they reference the connection they were prepared on.
     stmt_cache_clear();
     last_result_.reset();
+    // Drop the Python objects a closed connection can no longer use, so
+    // registered Arrow sources / the profile sink don't stay pinned until the
+    // wrapper is garbage-collected. The registry itself stays alive: the
+    // replacement-scan callback registered on the database still points at it.
+    if (arrow_registry_) {
+        std::lock_guard<std::mutex> lock(arrow_registry_->mu);
+        arrow_registry_->sources.clear();
+    }
+    profile_sink_ = nb::none();
     handle_.reset();
+}
+
+int Connection::gc_traverse(visitproc visit, void* arg) const {
+    Py_VISIT(profile_sink_.ptr());
+    // No arrow_registry_->mu here: on GIL builds the sources map is only
+    // mutated with the GIL held (which the GC holds too), and on free-threaded
+    // builds the GC stops the world — while a suspended thread holding the
+    // mutex would deadlock us.
+    if (arrow_registry_) {
+        for (const auto& [name, obj] : arrow_registry_->sources) Py_VISIT(obj.ptr());
+    }
+    return 0;
+}
+
+void Connection::gc_clear() {
+    if (arrow_registry_) {
+        std::lock_guard<std::mutex> lock(arrow_registry_->mu);
+        arrow_registry_->sources.clear();
+    }
+    profile_sink_ = nb::none();
 }
 
 namespace {

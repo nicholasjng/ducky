@@ -224,17 +224,26 @@ def test_set_profile_sink_skips_streaming():
     assert "SELECT 2 FROM range(10) t(i)" not in sqls
 
 
-def test_set_profile_sink_swallows_sink_errors(capsys):
+def test_set_profile_sink_swallows_sink_errors():
     # A buggy sink must not break the query; the exception is forwarded to
-    # PyErr_WriteUnraisable (which lands on stderr).
+    # sys.unraisablehook instead of propagating.
+    import sys
+
     con = ducky.connect()
 
     def bad(_sql, _info):
         raise RuntimeError("sink boom")
 
-    con.set_profile_sink(bad)
-    # Query still succeeds.
-    assert con.execute("SELECT 1").fetchall() == [(1,)]
+    seen = []
+    previous_hook = sys.unraisablehook
+    sys.unraisablehook = seen.append
+    try:
+        con.set_profile_sink(bad)
+        # Query still succeeds.
+        assert con.execute("SELECT 1").fetchall() == [(1,)]
+    finally:
+        sys.unraisablehook = previous_hook
+    assert [u.exc_type for u in seen] == [RuntimeError]
 
 
 def test_jsonl_profile_sink_writes_lines(tmp_path):

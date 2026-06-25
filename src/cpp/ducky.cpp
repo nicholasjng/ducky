@@ -141,6 +141,30 @@ void def_conversions(Cls& cls, Src src) {
         "Eagerly concatenate all chunks into {name: mlx.core.array}.");
 }
 
+// Cyclic-GC slots for Connection: a profile sink or registered Arrow source
+// usually closes over its connection, and without tp_traverse that cycle is
+// invisible to the collector (nanobind instances aren't GC-tracked by
+// default). nanobind detects the Py_tp_traverse slot and enables GC on the
+// type. See Connection::gc_traverse / gc_clear.
+int connection_tp_traverse(PyObject* self, visitproc visit, void* arg) {
+    // Heap types visit their own type (Python 3.9+ requirement).
+    Py_VISIT(Py_TYPE(self));
+    // The C++ instance may not be constructed yet when the GC first looks.
+    if (!nb::inst_ready(self)) return 0;
+    return nb::inst_ptr<Connection>(self)->gc_traverse(visit, arg);
+}
+
+int connection_tp_clear(PyObject* self) {
+    if (nb::inst_ready(self)) nb::inst_ptr<Connection>(self)->gc_clear();
+    return 0;
+}
+
+PyType_Slot connection_slots[] = {
+    {Py_tp_traverse, (void*)connection_tp_traverse},
+    {Py_tp_clear, (void*)connection_tp_clear},
+    {0, nullptr},
+};
+
 }  // namespace
 
 NB_MODULE(_core, m) {
@@ -385,7 +409,7 @@ NB_MODULE(_core, m) {
         .def("drain", &PendingResult::drain, nb::sig("def drain(self) -> None"),
              "Interrupt the query and drain the executor (cancellation teardown).");
 
-    nb::class_<Connection> conn_cls(m, "Connection",
+    nb::class_<Connection> conn_cls(m, "Connection", nb::type_slots(connection_slots),
                                     "A connection to a DuckDB database.\n\n"
                                     "Each :func:`connect` returns one connection that owns its own "
                                     "database handle; two ``connect(\":memory:\")`` calls are "

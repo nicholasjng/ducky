@@ -58,9 +58,16 @@ void write_column_value(duckdb_vector vec, idx_t row, nb::object val, duckdb_typ
         return;
     }
 
-    if (tid == DUCKDB_TYPE_VARCHAR || tid == DUCKDB_TYPE_BLOB) {
+    if (tid == DUCKDB_TYPE_BLOB) {
+        // Length-aware assignment: blobs (and Python strings) may carry
+        // embedded NUL bytes, which the strlen-based variant would truncate at.
+        nb::bytes b = nb::cast<nb::bytes>(val);
+        duckdb_vector_assign_string_element_len(vec, row, b.c_str(), b.size());
+        return;
+    }
+    if (tid == DUCKDB_TYPE_VARCHAR) {
         std::string s = nb::cast<std::string>(val);
-        duckdb_vector_assign_string_element(vec, row, s.c_str());
+        duckdb_vector_assign_string_element_len(vec, row, s.data(), s.size());
         return;
     }
 
@@ -104,7 +111,7 @@ void write_column_value(duckdb_vector vec, idx_t row, nb::object val, duckdb_typ
             // For unsupported types fall back to string assignment.
             {
                 std::string s = nb::cast<std::string>(nb::str(val));
-                duckdb_vector_assign_string_element(vec, row, s.c_str());
+                duckdb_vector_assign_string_element_len(vec, row, s.data(), s.size());
             }
             break;
     }
@@ -112,13 +119,10 @@ void write_column_value(duckdb_vector vec, idx_t row, nb::object val, duckdb_typ
 
 void table_extra_info_destroy(void* ptr) {
     if (!ptr) return;
-    auto* ctx = (TableUDFContext*)ptr;
-    for (duckdb_logical_type& t : ctx->param_types) duckdb_destroy_logical_type(&t);
-    for (duckdb_logical_type& t : ctx->col_types) duckdb_destroy_logical_type(&t);
-    {
-        nb::gil_scoped_acquire gil;
-        delete ctx;
-    }
+    // ~TableUDFContext frees the owned logical types; the GIL covers the
+    // nb::callable member's decref.
+    nb::gil_scoped_acquire gil;
+    delete (TableUDFContext*)ptr;
 }
 
 void bind_data_destroy(void* ptr) {
@@ -259,7 +263,12 @@ void create_table_function(Connection& con, const std::string& name, nb::callabl
     for (duckdb_logical_type t : ctx->param_types) {
         duckdb_table_function_add_parameter(f, t);
     }
+    // Ownership of ctx passes to the function object here: its destroy callback
+    // runs whether or not registration succeeds (a failed registration's
+    // duckdb_destroy_table_function drops the last reference).
     duckdb_table_function_set_extra_info(f, ctx.get(), &table_extra_info_destroy);
+    // NOLINTNEXTLINE(bugprone-unused-return-value)
+    (void)ctx.release();
     duckdb_table_function_set_bind(f, &table_bind);
     duckdb_table_function_set_init(f, &table_init);
     duckdb_table_function_set_function(f, &table_main);
@@ -270,6 +279,4 @@ void create_table_function(Connection& con, const std::string& name, nb::callabl
     if (state == DuckDBError) {
         throw DuckyError("ducky: failed to register table function '" + name + "'");
     }
-    // NOLINTNEXTLINE(bugprone-unused-return-value)
-    (void)ctx.release();
 }

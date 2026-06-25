@@ -144,6 +144,15 @@ class Connection {
 
     void close();
 
+    // Cyclic-GC integration, wired to Py_tp_traverse / Py_tp_clear in
+    // ducky.cpp. A profile sink or registered Arrow source usually closes over
+    // the connection (its __globals__ or a bound self points back here), and
+    // without traversal support that cycle is uncollectable. gc_traverse
+    // visits the Python objects this connection owns; gc_clear drops them to
+    // break the cycle.
+    int gc_traverse(visitproc visit, void* arg) const;
+    void gc_clear();
+
    private:
     void ensure_open() const;
     duckdb_result run(const std::string& query, nb::object parameters, bool streaming);
