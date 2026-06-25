@@ -390,6 +390,16 @@ class Dataset(Generic[ArrayT]):
 _N_BUCKETS = 1000
 
 
+def _quote_literal(s: str) -> str:
+    """Quote a string for embedding as a SQL string literal ('' escapes ')."""
+    return "'" + s.replace("'", "''") + "'"
+
+
+def _quote_ident(s: str) -> str:
+    """Quote an identifier for embedding in SQL ("" escapes ")."""
+    return '"' + s.replace('"', '""') + '"'
+
+
 def _fold_ranges(fractions: dict[str, float]) -> list[tuple[str, int, int]]:
     """Cumulative-threshold conversion: each fold gets a [lo, hi) bucket range.
     The last fold absorbs any rounding drift so the ranges always tile [0, N).
@@ -447,7 +457,7 @@ def _compile_sql(
         dupes = sorted({a for a in aliases if aliases.count(a) > 1})
         raise ValueError(f"duplicate field/column aliases: {dupes}")
 
-    from_clause = f"'{source}'"
+    from_clause = _quote_literal(source)
 
     if split_spec is not None:
         ranges = _fold_ranges(split_spec.fractions)
@@ -474,8 +484,8 @@ def _compile_sql(
         stats_cols: list[str] = []
         for alias, _, spec in columns:
             if spec.standardize:
-                stats_cols.append(f"avg({spec.expr}) AS _{alias}_mean")
-                stats_cols.append(f"stddev_pop({spec.expr}) AS _{alias}_std")
+                stats_cols.append(f"avg({spec.expr}) AS {_quote_ident(f'_{alias}_mean')}")
+                stats_cols.append(f"stddev_pop({spec.expr}) AS {_quote_ident(f'_{alias}_std')}")
         stats_sql = f"SELECT {', '.join(stats_cols)} FROM raw WHERE {is_train}"
         ctes = f"WITH raw AS ({raw_sql}), stats AS ({stats_sql})"
         from_outer = "raw, stats"
@@ -486,10 +496,18 @@ def _compile_sql(
     select_items: list[str] = []
     for alias, _, spec in columns:
         if spec.standardize:
-            expr = f"({spec.expr} - stats._{alias}_mean) / stats._{alias}_std"
+            # coalesce(nullif(std, 0), 1): a constant column (std = 0) yields 0
+            # (sklearn's StandardScaler convention) instead of a division by
+            # zero, whose NULL result would surface as garbage in the dense
+            # ndarrays downstream.
+            mean = f"stats.{_quote_ident(f'_{alias}_mean')}"
+            std = f"stats.{_quote_ident(f'_{alias}_std')}"
+            expr = f"({spec.expr} - {mean}) / coalesce(nullif({std}, 0), 1)"
         else:
             expr = spec.expr
-        select_items.append(f"CAST({expr} AS {_to_duckdb_dtype(spec.dtype)}) AS {alias}")
+        select_items.append(
+            f"CAST({expr} AS {_to_duckdb_dtype(spec.dtype)}) AS {_quote_ident(alias)}"
+        )
     select_items.append("CAST(_bucket AS BIGINT) AS _bucket")
 
     sql = f"{ctes} SELECT {', '.join(select_items)} FROM {from_outer}"
