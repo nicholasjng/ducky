@@ -118,3 +118,63 @@ def test_bind_unsupported_type():
     con = ducky.connect()
     with pytest.raises(ducky.Error, match="unsupported parameter type"):
         con.execute("SELECT ?", [object()])
+
+
+# Integer parameters bind at the width the statement expects (see
+# bind_int64_as_param_type in connection.cpp): a BIGINT value bound into e.g.
+# an INTEGER parameter would otherwise force DuckDB to re-bind and re-plan the
+# statement on every execute.
+
+
+def test_bind_int_widths_roundtrip():
+    con = ducky.connect()
+    con.execute(
+        "CREATE TABLE widths (t TINYINT, s SMALLINT, i INTEGER, b BIGINT, "
+        "ut UTINYINT, us USMALLINT, ui UINTEGER, ub UBIGINT, h HUGEINT)"
+    )
+    row = (
+        -128,
+        -32768,
+        -2147483648,
+        -(2**63),
+        255,
+        65535,
+        4294967295,
+        2**64 - 1,  # exceeds int64: takes the uhugeint path, cast on execute
+        -7,  # int64-fitting value into a HUGEINT parameter
+    )
+    con.execute("INSERT INTO widths VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", list(row))
+    assert con.sql("SELECT * FROM widths").fetchone() == row
+
+
+def test_bind_float_param_roundtrip():
+    assert roundtrip(1.5, "FLOAT") == 1.5
+    assert roundtrip(1.5, "DOUBLE") == 1.5
+
+
+def test_bind_small_int_into_hugeint_param():
+    assert roundtrip(-5, "HUGEINT") == -5
+    assert roundtrip(5, "HUGEINT") == 5
+
+
+def test_bind_int_overflowing_narrow_column_errors():
+    con = ducky.connect()
+    con.execute("CREATE TABLE narrow (t TINYINT)")
+    with pytest.raises(ducky.Error):
+        con.execute("INSERT INTO narrow VALUES (?)", [300])
+
+
+def test_bind_negative_into_unsigned_column_errors():
+    con = ducky.connect()
+    con.execute("CREATE TABLE u (x UINTEGER)")
+    with pytest.raises(ducky.Error):
+        con.execute("INSERT INTO u VALUES (?)", [-1])
+
+
+def test_executemany_typed_widths_roundtrip():
+    con = ducky.connect()
+    con.execute("CREATE TABLE typed (a INT, b BIGINT, c DOUBLE, f FLOAT)")
+    rows = [(i, i * 2, float(i), float(i)) for i in range(-50, 50)]
+    stmt = con.prepare("INSERT INTO typed VALUES (?, ?, ?, ?)")
+    stmt.executemany(rows)
+    assert con.sql("SELECT * FROM typed ORDER BY a").fetchall() == rows

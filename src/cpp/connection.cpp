@@ -5,6 +5,7 @@
 #include <nanobind/stl/vector.h>
 
 #include <atomic>
+#include <cstdint>
 #include <cstring>
 #include <thread>
 
@@ -98,6 +99,72 @@ void bind_check(duckdb_state state, idx_t idx) {
     }
 }
 
+// Bind an int64-fitting Python int at the width the statement expects.
+// DuckDB re-binds *and re-plans* a prepared statement on every execute whose
+// bound value type differs from the planned parameter type
+// (PreparedStatementData::RequireRebind), so always binding BIGINT turns a
+// prepared loop over e.g. an INTEGER column into a per-row replan (~2x
+// slowdown on executemany). Values outside the expected type's range fall
+// back to int64: that execute pays the rebind, and DuckDB's cast (or
+// out-of-range error) behaves exactly as before.
+void bind_int64_as_param_type(duckdb_prepared_statement stmt, idx_t idx, int64_t v) {
+    switch (duckdb_param_type(stmt, idx)) {
+        case DUCKDB_TYPE_TINYINT:
+            if (v >= INT8_MIN && v <= INT8_MAX) {
+                bind_check(duckdb_bind_int8(stmt, idx, (int8_t)v), idx);
+                return;
+            }
+            break;
+        case DUCKDB_TYPE_SMALLINT:
+            if (v >= INT16_MIN && v <= INT16_MAX) {
+                bind_check(duckdb_bind_int16(stmt, idx, (int16_t)v), idx);
+                return;
+            }
+            break;
+        case DUCKDB_TYPE_INTEGER:
+            if (v >= INT32_MIN && v <= INT32_MAX) {
+                bind_check(duckdb_bind_int32(stmt, idx, (int32_t)v), idx);
+                return;
+            }
+            break;
+        case DUCKDB_TYPE_UTINYINT:
+            if (v >= 0 && v <= UINT8_MAX) {
+                bind_check(duckdb_bind_uint8(stmt, idx, (uint8_t)v), idx);
+                return;
+            }
+            break;
+        case DUCKDB_TYPE_USMALLINT:
+            if (v >= 0 && v <= UINT16_MAX) {
+                bind_check(duckdb_bind_uint16(stmt, idx, (uint16_t)v), idx);
+                return;
+            }
+            break;
+        case DUCKDB_TYPE_UINTEGER:
+            if (v >= 0 && v <= (int64_t)UINT32_MAX) {
+                bind_check(duckdb_bind_uint32(stmt, idx, (uint32_t)v), idx);
+                return;
+            }
+            break;
+        case DUCKDB_TYPE_UBIGINT:
+            if (v >= 0) {
+                bind_check(duckdb_bind_uint64(stmt, idx, (uint64_t)v), idx);
+                return;
+            }
+            break;
+        case DUCKDB_TYPE_HUGEINT: {
+            // Any int64 fits; sign-extend into the upper half.
+            duckdb_hugeint h{(uint64_t)v, v < 0 ? (int64_t)-1 : (int64_t)0};
+            bind_check(duckdb_bind_hugeint(stmt, idx, h), idx);
+            return;
+        }
+        default:
+            // BIGINT, DUCKDB_TYPE_INVALID (type not resolved at plan time),
+            // and everything a BIGINT must be cast into (DECIMAL, DOUBLE, ...).
+            break;
+    }
+    bind_check(duckdb_bind_int64(stmt, idx, v), idx);
+}
+
 void bind_one(duckdb_prepared_statement stmt, idx_t idx, nb::handle value) {
     const BindTypes& T = bind_types();
 
@@ -114,7 +181,7 @@ void bind_one(duckdb_prepared_statement stmt, idx_t idx, nb::handle value) {
         // nb::cast_error throw on the common path.
         int64_t v = PyLong_AsLongLong(value.ptr());
         if (v != -1 || !PyErr_Occurred()) {
-            bind_check(duckdb_bind_int64(stmt, idx, v), idx);
+            bind_int64_as_param_type(stmt, idx, v);
             return;
         }
         PyErr_Clear();
@@ -132,7 +199,15 @@ void bind_one(duckdb_prepared_statement stmt, idx_t idx, nb::handle value) {
         return;
     }
     if (nb::isinstance<nb::float_>(value)) {
-        bind_check(duckdb_bind_double(stmt, idx, nb::cast<double>(value)), idx);
+        double v = nb::cast<double>(value);
+        // Same rebind-avoidance as the int path: a FLOAT parameter fed a
+        // DOUBLE value replans per execute; the narrowing cast here equals
+        // the DOUBLE→FLOAT cast DuckDB would apply on that rebind.
+        if (duckdb_param_type(stmt, idx) == DUCKDB_TYPE_FLOAT) {
+            bind_check(duckdb_bind_float(stmt, idx, (float)v), idx);
+        } else {
+            bind_check(duckdb_bind_double(stmt, idx, v), idx);
+        }
         return;
     }
     if (nb::isinstance<nb::str>(value)) {
