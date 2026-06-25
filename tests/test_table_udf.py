@@ -1,3 +1,5 @@
+import datetime as dt
+
 import pytest
 
 import ducky
@@ -123,3 +125,84 @@ def test_single_value_row():
     con.create_table_function("scalars", scalars, parameters=["BIGINT"], columns={"v": "BIGINT"})
     rows = con.sql("SELECT v FROM scalars(3)").fetchall()
     assert [r[0] for r in rows] == [0, 1, 2]
+
+
+def test_temporal_columns():
+    def rows():
+        yield (
+            dt.date(2024, 1, 2),
+            dt.time(3, 4, 5, 6),
+            dt.datetime(2024, 1, 2, 3, 4, 5, 6),
+        )
+        # Raw integer storage values are accepted alongside the objects.
+        yield (0, 0, 0)
+
+    con = ducky.connect()
+    con.create_table_function(
+        "temporals",
+        rows,
+        parameters=[],
+        columns={"d": "DATE", "t": "TIME", "ts": "TIMESTAMP"},
+    )
+    got = con.sql("SELECT d, t, ts FROM temporals()").fetchall()
+    assert got == [
+        (dt.date(2024, 1, 2), dt.time(3, 4, 5, 6), dt.datetime(2024, 1, 2, 3, 4, 5, 6)),
+        (dt.date(1970, 1, 1), dt.time(0, 0), dt.datetime(1970, 1, 1)),
+    ]
+
+
+def test_timestamp_tz_column_shifts_aware_to_utc():
+    tz = dt.timezone(dt.timedelta(hours=2))
+    aware = dt.datetime(2024, 6, 1, 12, 30, 0, tzinfo=tz)
+
+    def rows():
+        yield (aware,)
+
+    con = ducky.connect()
+    con.create_table_function("tz_rows", rows, parameters=[], columns={"ts": "TIMESTAMPTZ"})
+    (row,) = con.sql("SELECT ts FROM tz_rows()").fetchall()
+    # aware datetime comparison normalizes across offsets.
+    assert row[0] == aware
+
+
+def test_unsupported_column_type_rejected_at_registration():
+    def gen():
+        yield (1,)
+
+    con = ducky.connect()
+    # These used to corrupt memory at query time via the string-assignment
+    # fallback; now they raise up front.
+    with pytest.raises(ducky.Error, match="unsupported type DECIMAL"):
+        con.create_table_function("dec_fn", gen, parameters=[], columns={"v": "DECIMAL(9,2)"})
+    with pytest.raises(ducky.Error, match="unsupported type LIST"):
+        con.create_table_function("list_fn", gen, parameters=[], columns={"v": "INTEGER[]"})
+
+
+def test_wrong_arity_row_raises():
+    def short_rows():
+        yield (1,)
+
+    def long_rows():
+        yield (1, 2, 3)
+
+    con = ducky.connect()
+    con.create_table_function(
+        "short_rows", short_rows, parameters=[], columns={"a": "BIGINT", "b": "BIGINT"}
+    )
+    con.create_table_function(
+        "long_rows", long_rows, parameters=[], columns={"a": "BIGINT", "b": "BIGINT"}
+    )
+    with pytest.raises(ducky.Error, match="has 1 values; expected 2"):
+        con.sql("SELECT * FROM short_rows()").fetchall()
+    with pytest.raises(ducky.Error, match="has 3 values; expected 2"):
+        con.sql("SELECT * FROM long_rows()").fetchall()
+
+
+def test_out_of_range_int_raises():
+    def gen():
+        yield (300,)
+
+    con = ducky.connect()
+    con.create_table_function("overflow_gen", gen, parameters=[], columns={"v": "TINYINT"})
+    with pytest.raises(ducky.Error, match="out of range for TINYINT"):
+        con.sql("SELECT v FROM overflow_gen()").fetchall()

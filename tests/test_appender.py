@@ -65,6 +65,23 @@ def test_appender_columns_dtype_mismatch():
         app.append_columns({"id": np.arange(3, dtype=np.int32)})
 
 
+def test_appender_mask_wide_dtype_rejected():
+    # uint16/32/64 share the uint8 DLPack type code; they must not pass as masks.
+    con = ducky.connect()
+    con.execute("CREATE TABLE t (score DOUBLE)")
+    scores = np.array([0.1, 0.2, 0.3], dtype=np.float64)
+    with con.appender("t") as app, pytest.raises(ducky.Error, match="bool/uint8"):
+        app.append_columns({"score": scores}, masks={"score": np.ones(3, dtype=np.uint64)})
+
+
+def test_appender_mask_without_column_rejected():
+    con = ducky.connect()
+    con.execute("CREATE TABLE t (id BIGINT, score DOUBLE)")
+    mask = np.ones(3, dtype=np.uint8)
+    with con.appender("t") as app, pytest.raises(ducky.Error, match="no matching entry"):
+        app.append_columns({"id": np.arange(3, dtype=np.int64)}, masks={"score": mask})
+
+
 def test_appender_unknown_table():
     con = ducky.connect()
     with pytest.raises(ducky.Error):
@@ -197,3 +214,50 @@ def test_append_arrow_rejects_non_arrow():
     con.execute("CREATE TABLE t (id BIGINT)")
     with con.appender("t") as app, pytest.raises(ducky.Error, match="Arrow PyCapsule"):
         app.append_arrow(object())
+
+
+def test_appender_row_temporals():
+    import datetime as dt
+
+    con = ducky.connect()
+    con.execute("CREATE TABLE t (d DATE, tm TIME, ts TIMESTAMP, iv INTERVAL)")
+    with con.appender("t") as app:
+        app.append_row(
+            dt.date(2024, 1, 2),
+            dt.time(3, 4, 5, 6),
+            dt.datetime(2024, 1, 2, 3, 4, 5, 6),
+            dt.timedelta(days=1, seconds=2, microseconds=3),
+        )
+        app.append_row(None, None, None, None)
+    rows = con.execute("SELECT * FROM t").fetchall()
+    assert rows == [
+        (
+            dt.date(2024, 1, 2),
+            dt.time(3, 4, 5, 6),
+            dt.datetime(2024, 1, 2, 3, 4, 5, 6),
+            dt.timedelta(days=1, seconds=2, microseconds=3),
+        ),
+        (None, None, None, None),
+    ]
+
+
+def test_appender_row_aware_datetime_lands_in_utc():
+    import datetime as dt
+
+    tz = dt.timezone(dt.timedelta(hours=2))
+    aware = dt.datetime(2024, 6, 1, 12, 30, tzinfo=tz)
+    con = ducky.connect()
+    con.execute("CREATE TABLE t (ts TIMESTAMPTZ)")
+    with con.appender("t") as app:
+        app.append_row(aware)
+    (row,) = con.execute("SELECT ts FROM t").fetchall()
+    assert row[0] == aware
+
+
+def test_appender_row_date_rejects_datetime():
+    import datetime as dt
+
+    con = ducky.connect()
+    con.execute("CREATE TABLE t (d DATE)")
+    with con.appender("t") as app, pytest.raises(ducky.Error, match="expected datetime.date"):
+        app.append_row(dt.datetime(2024, 1, 2, 3, 4))

@@ -339,3 +339,31 @@ def test_tensors_requires_X_and_y(weighted_csv_path):
     assert ds.train is not None
     with pytest.raises(AttributeError, match="tensors\\(\\) requires"):
         ds.train.tensors()
+
+
+def test_source_path_with_single_quote(tmp_path):
+    # The source is embedded as a SQL string literal; quotes must be escaped.
+    p = tmp_path / "it's data.csv"
+    p.write_text("x,y\n1.0,0\n2.0,1\n")
+    ds = ducky.dataset(
+        str(p),
+        columns={"x": ducky.feature("x")},
+        target=ducky.target("y", dtype="i64"),
+    )
+    assert ds.train is not None
+    assert ds.train.n_rows == 2
+
+
+def test_standardize_constant_column_yields_zeros(tmp_path):
+    # std = 0 must not divide by zero; the standardized value is 0
+    # (StandardScaler convention), not NULL-turned-garbage.
+    p = tmp_path / "const.csv"
+    p.write_text("x,y\n" + "\n".join("3.0,1" for _ in range(50)))
+    ds = ducky.dataset(
+        p.as_posix(),
+        columns={"x": ducky.feature("x", standardize=True)},
+        target=ducky.target("y", dtype="i64"),
+    )
+    assert ds.train is not None
+    X, _ = ds.train.tensors()
+    assert np.all(X == 0.0)

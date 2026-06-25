@@ -258,3 +258,31 @@ def test_large_result_spans_chunks():
     assert len(rows) == 5000
     assert rows[0] == (0,)
     assert rows[-1] == (4999,)
+
+
+def test_connection_executemany():
+    con = ducky.connect()
+    con.execute("CREATE TABLE t (a INTEGER, b VARCHAR)")
+    con.executemany("INSERT INTO t VALUES (?, ?)", [(1, "x"), (2, "y"), (3, None)])
+    assert con.execute("SELECT * FROM t ORDER BY a").fetchall() == [
+        (1, "x"),
+        (2, "y"),
+        (3, None),
+    ]
+
+
+def test_connection_executemany_error_propagates():
+    con = ducky.connect()
+    con.execute("CREATE TABLE t (a INTEGER PRIMARY KEY)")
+    with pytest.raises(ducky.Error):
+        con.executemany("INSERT INTO t VALUES (?)", [(1,), (1,)])
+
+
+def test_rows_changed():
+    con = ducky.connect()
+    con.execute("CREATE TABLE t (a INTEGER)")
+    assert con.execute("INSERT INTO t VALUES (1), (2), (3)").rows_changed == 3
+    assert con.execute("UPDATE t SET a = a + 1 WHERE a > 1").rows_changed == 2
+    assert con.execute("DELETE FROM t").rows_changed == 3
+    # SELECTs don't report changed rows.
+    assert con.execute("SELECT 1").rows_changed == 0
