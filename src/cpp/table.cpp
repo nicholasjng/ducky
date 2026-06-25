@@ -3,11 +3,13 @@
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/string.h>
 
+#include <cstdint>
 #include <cstring>
 
 #include "connection.hpp"
 #include "ducky.hpp"
 #include "function.hpp"
+#include "py_datetime.hpp"
 
 namespace nb = nanobind;
 
@@ -49,6 +51,55 @@ nb::object duckdb_value_to_python(duckdb_value val) {
     }
 }
 
+// Column types write_column_value can encode. Everything else is rejected at
+// registration time in create_table_function — the old fallback (string
+// assignment into an arbitrarily-typed vector) corrupted non-VARCHAR buffers.
+bool table_output_type_supported(duckdb_type t) {
+    switch (t) {
+        case DUCKDB_TYPE_BOOLEAN:
+        case DUCKDB_TYPE_TINYINT:
+        case DUCKDB_TYPE_SMALLINT:
+        case DUCKDB_TYPE_INTEGER:
+        case DUCKDB_TYPE_BIGINT:
+        case DUCKDB_TYPE_UTINYINT:
+        case DUCKDB_TYPE_USMALLINT:
+        case DUCKDB_TYPE_UINTEGER:
+        case DUCKDB_TYPE_UBIGINT:
+        case DUCKDB_TYPE_FLOAT:
+        case DUCKDB_TYPE_DOUBLE:
+        case DUCKDB_TYPE_VARCHAR:
+        case DUCKDB_TYPE_BLOB:
+        case DUCKDB_TYPE_DATE:
+        case DUCKDB_TYPE_TIME:
+        case DUCKDB_TYPE_TIMESTAMP:
+        case DUCKDB_TYPE_TIMESTAMP_S:
+        case DUCKDB_TYPE_TIMESTAMP_MS:
+        case DUCKDB_TYPE_TIMESTAMP_NS:
+        case DUCKDB_TYPE_TIMESTAMP_TZ:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// Range-checked narrowing for the integer column writes below: a Python 300
+// written to a TINYINT column must raise, not silently wrap to 44.
+int64_t checked_signed(nb::handle val, int64_t lo, int64_t hi, const char* type) {
+    int64_t v = nb::cast<int64_t>(val);
+    if (v < lo || v > hi) {
+        throw DuckyError("ducky: value " + std::to_string(v) + " out of range for " + type);
+    }
+    return v;
+}
+
+uint64_t checked_unsigned(nb::handle val, uint64_t hi, const char* type) {
+    uint64_t v = nb::cast<uint64_t>(val);
+    if (v > hi) {
+        throw DuckyError("ducky: value " + std::to_string(v) + " out of range for " + type);
+    }
+    return v;
+}
+
 // Write a Python scalar value into a duckdb_vector at position `row`.
 void write_column_value(duckdb_vector vec, idx_t row, nb::object val, duckdb_type tid) {
     if (val.is_none()) {
@@ -66,8 +117,14 @@ void write_column_value(duckdb_vector vec, idx_t row, nb::object val, duckdb_typ
         return;
     }
     if (tid == DUCKDB_TYPE_VARCHAR) {
-        std::string s = nb::cast<std::string>(val);
-        duckdb_vector_assign_string_element_len(vec, row, s.data(), s.size());
+        // Borrow PyUnicode's cached UTF-8 buffer; no std::string copy.
+        if (!nb::isinstance<nb::str>(val)) {
+            throw DuckyError("ducky: expected str for VARCHAR column");
+        }
+        Py_ssize_t size = 0;
+        const char* s = PyUnicode_AsUTF8AndSize(val.ptr(), &size);
+        if (!s) throw nb::python_error();
+        duckdb_vector_assign_string_element_len(vec, row, s, (idx_t)size);
         return;
     }
 
@@ -78,25 +135,25 @@ void write_column_value(duckdb_vector vec, idx_t row, nb::object val, duckdb_typ
             ((bool*)data)[row] = nb::cast<bool>(val);
             break;
         case DUCKDB_TYPE_TINYINT:
-            ((int8_t*)data)[row] = (int8_t)nb::cast<int64_t>(val);
+            ((int8_t*)data)[row] = (int8_t)checked_signed(val, INT8_MIN, INT8_MAX, "TINYINT");
             break;
         case DUCKDB_TYPE_SMALLINT:
-            ((int16_t*)data)[row] = (int16_t)nb::cast<int64_t>(val);
+            ((int16_t*)data)[row] = (int16_t)checked_signed(val, INT16_MIN, INT16_MAX, "SMALLINT");
             break;
         case DUCKDB_TYPE_INTEGER:
-            ((int32_t*)data)[row] = (int32_t)nb::cast<int64_t>(val);
+            ((int32_t*)data)[row] = (int32_t)checked_signed(val, INT32_MIN, INT32_MAX, "INTEGER");
             break;
         case DUCKDB_TYPE_BIGINT:
             ((int64_t*)data)[row] = nb::cast<int64_t>(val);
             break;
         case DUCKDB_TYPE_UTINYINT:
-            ((uint8_t*)data)[row] = (uint8_t)nb::cast<uint64_t>(val);
+            ((uint8_t*)data)[row] = (uint8_t)checked_unsigned(val, UINT8_MAX, "UTINYINT");
             break;
         case DUCKDB_TYPE_USMALLINT:
-            ((uint16_t*)data)[row] = (uint16_t)nb::cast<uint64_t>(val);
+            ((uint16_t*)data)[row] = (uint16_t)checked_unsigned(val, UINT16_MAX, "USMALLINT");
             break;
         case DUCKDB_TYPE_UINTEGER:
-            ((uint32_t*)data)[row] = (uint32_t)nb::cast<uint64_t>(val);
+            ((uint32_t*)data)[row] = (uint32_t)checked_unsigned(val, UINT32_MAX, "UINTEGER");
             break;
         case DUCKDB_TYPE_UBIGINT:
             ((uint64_t*)data)[row] = nb::cast<uint64_t>(val);
@@ -107,13 +164,53 @@ void write_column_value(duckdb_vector vec, idx_t row, nb::object val, duckdb_typ
         case DUCKDB_TYPE_DOUBLE:
             ((double*)data)[row] = nb::cast<double>(val);
             break;
-        default:
-            // For unsupported types fall back to string assignment.
-            {
-                std::string s = nb::cast<std::string>(nb::str(val));
-                duckdb_vector_assign_string_element_len(vec, row, s.data(), s.size());
+        // Temporal columns accept the matching datetime object or the raw
+        // integer storage value (days for DATE, the timestamp's native unit
+        // otherwise). datetime.datetime is a date subclass, so DATE excludes it
+        // rather than silently truncating the time part.
+        case DUCKDB_TYPE_DATE: {
+            PyObject* raw = val.ptr();
+            if (PyDate_Check(raw) && !PyDateTime_Check(raw)) {
+                ((int32_t*)data)[row] = pydt::date_to_duckdb(raw).days;
+            } else {
+                ((int32_t*)data)[row] = (int32_t)checked_signed(val, INT32_MIN, INT32_MAX, "DATE");
             }
             break;
+        }
+        case DUCKDB_TYPE_TIME: {
+            PyObject* raw = val.ptr();
+            if (PyTime_Check(raw)) {
+                ((int64_t*)data)[row] = pydt::time_to_duckdb(raw).micros;
+            } else {
+                ((int64_t*)data)[row] = nb::cast<int64_t>(val);
+            }
+            break;
+        }
+        case DUCKDB_TYPE_TIMESTAMP:
+        case DUCKDB_TYPE_TIMESTAMP_TZ:
+            ((int64_t*)data)[row] = PyDateTime_Check(val.ptr()) ? pydt::datetime_to_micros(val)
+                                                                : nb::cast<int64_t>(val);
+            break;
+        case DUCKDB_TYPE_TIMESTAMP_S:
+            ((int64_t*)data)[row] = PyDateTime_Check(val.ptr())
+                                        ? pydt::datetime_to_micros(val) / 1000000
+                                        : nb::cast<int64_t>(val);
+            break;
+        case DUCKDB_TYPE_TIMESTAMP_MS:
+            ((int64_t*)data)[row] = PyDateTime_Check(val.ptr())
+                                        ? pydt::datetime_to_micros(val) / 1000
+                                        : nb::cast<int64_t>(val);
+            break;
+        case DUCKDB_TYPE_TIMESTAMP_NS:
+            ((int64_t*)data)[row] = PyDateTime_Check(val.ptr())
+                                        ? pydt::datetime_to_micros(val) * 1000
+                                        : nb::cast<int64_t>(val);
+            break;
+        default:
+            // Unreachable: create_table_function rejects unsupported column
+            // types at registration (table_output_type_supported).
+            throw DuckyError(std::string("ducky: table function column type ") +
+                             duckdb_type_name(tid) + " is not supported");
     }
 }
 
@@ -210,6 +307,14 @@ void table_main(duckdb_function_info info, duckdb_data_chunk output) {
                 } else {
                     row = nb::make_tuple(row_obj);
                 }
+                // row[c] below is unchecked (PyTuple_GET_ITEM), so a wrong-arity
+                // row must be rejected here, not discovered by reading past the
+                // tuple's end.
+                if (nb::len(row) != (size_t)n_cols) {
+                    throw DuckyError("ducky: table function row has " +
+                                     std::to_string(nb::len(row)) + " values; expected " +
+                                     std::to_string(n_cols));
+                }
 
                 for (idx_t c = 0; c < n_cols; ++c) {
                     duckdb_vector vec = duckdb_data_chunk_get_vector(output, c);
@@ -228,6 +333,10 @@ void table_main(duckdb_function_info info, duckdb_data_chunk output) {
 
 void create_table_function(Connection& con, const std::string& name, nb::callable factory,
                            nb::object parameters, nb::object columns) {
+    // PyDateTimeAPI is static per TU; prime ours so the temporal branches in
+    // write_column_value / pydt:: helpers work when the trampolines run.
+    // Registration always precedes execution, so priming here suffices.
+    if (!PyDateTimeAPI) PyDateTime_IMPORT;
     duckdb_connection raw = con.raw_connection();
     auto ctx = std::make_unique<TableUDFContext>();
     ctx->factory = factory;
@@ -253,9 +362,17 @@ void create_table_function(Connection& con, const std::string& name, nb::callabl
         std::string col_name = nb::cast<std::string>(item.first);
         std::string type_str = nb::cast<std::string>(item.second);
         duckdb_logical_type lt = parse_logical_type(raw, type_str);
+        // Push before validating so ~TableUDFContext owns (and frees) lt on throw.
         ctx->col_names.push_back(col_name);
         ctx->col_types.push_back(lt);
         ctx->col_type_ids.push_back(duckdb_get_type_id(lt));
+        if (!table_output_type_supported(ctx->col_type_ids.back())) {
+            throw DuckyError("ducky: table function '" + name + "': column '" + col_name +
+                             "' has unsupported type " +
+                             duckdb_type_name(ctx->col_type_ids.back()) +
+                             " (supported: BOOLEAN, [U]TINYINT..BIGINT, FLOAT, DOUBLE, VARCHAR, "
+                             "BLOB, DATE, TIME, TIMESTAMP[_S/MS/NS/TZ])");
+        }
     }
 
     duckdb_table_function f = duckdb_create_table_function();

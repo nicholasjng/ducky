@@ -14,6 +14,7 @@
 #include "connection.hpp"
 #include "ducky.hpp"
 #include "function.hpp"
+#include "py_datetime.hpp"
 
 namespace {
 
@@ -107,6 +108,9 @@ bool dtype_eq(nb::dlpack::dtype a, nb::dlpack::dtype b) {
 
 Appender::Appender(Connection& connection, std::string table, std::optional<std::string> schema,
                    std::optional<std::string> catalog) {
+    // PyDateTimeAPI is static per TU; prime ours so append_one's temporal
+    // branches (pydt:: helpers) work. Construction precedes every append.
+    if (!PyDateTimeAPI) PyDateTime_IMPORT;
     duckdb_connection con = connection.raw_connection();
 
     duckdb_state state;
@@ -282,8 +286,15 @@ void append_one(duckdb_appender app, duckdb_type t, nb::handle value, idx_t col)
             state = duckdb_append_double(app, nb::cast<double>(value));
             break;
         case DUCKDB_TYPE_VARCHAR: {
-            std::string s = nb::cast<std::string>(value);
-            state = duckdb_append_varchar_length(app, s.data(), s.size());
+            // Borrow PyUnicode's cached UTF-8 buffer; no std::string copy.
+            if (!nb::isinstance<nb::str>(value)) {
+                throw DuckyError("ducky: expected str for VARCHAR at column " +
+                                 std::to_string(col));
+            }
+            Py_ssize_t size = 0;
+            const char* s = PyUnicode_AsUTF8AndSize(value.ptr(), &size);
+            if (!s) throw nb::python_error();
+            state = duckdb_append_varchar_length(app, s, (idx_t)size);
             break;
         }
         case DUCKDB_TYPE_BLOB: {
@@ -291,10 +302,57 @@ void append_one(duckdb_appender app, duckdb_type t, nb::handle value, idx_t col)
             state = duckdb_append_blob(app, b.c_str(), b.size());
             break;
         }
+        // Temporal columns take the matching datetime object, mirroring what
+        // bind_parameters accepts for `INSERT ... VALUES (?)`.
+        case DUCKDB_TYPE_DATE: {
+            PyObject* raw = value.ptr();
+            // datetime.datetime is a date subclass; reject it rather than
+            // silently truncating the time part.
+            if (!PyDate_Check(raw) || PyDateTime_Check(raw)) {
+                throw DuckyError("ducky: expected datetime.date for DATE at column " +
+                                 std::to_string(col));
+            }
+            state = duckdb_append_date(app, pydt::date_to_duckdb(raw));
+            break;
+        }
+        case DUCKDB_TYPE_TIME: {
+            PyObject* raw = value.ptr();
+            if (!PyTime_Check(raw)) {
+                throw DuckyError("ducky: expected datetime.time for TIME at column " +
+                                 std::to_string(col));
+            }
+            state = duckdb_append_time(app, pydt::time_to_duckdb(raw));
+            break;
+        }
+        case DUCKDB_TYPE_TIMESTAMP:
+        case DUCKDB_TYPE_TIMESTAMP_TZ: {
+            if (!PyDateTime_Check(value.ptr())) {
+                throw DuckyError("ducky: expected datetime.datetime for " +
+                                 std::string(duckdb_type_name(t)) + " at column " +
+                                 std::to_string(col));
+            }
+            // Aware values land in UTC micros; naive values are taken as-is.
+            state = duckdb_append_timestamp(app, duckdb_timestamp{pydt::datetime_to_micros(value)});
+            break;
+        }
+        case DUCKDB_TYPE_INTERVAL: {
+            PyObject* raw = value.ptr();
+            if (!PyDelta_Check(raw)) {
+                throw DuckyError("ducky: expected datetime.timedelta for INTERVAL at column " +
+                                 std::to_string(col));
+            }
+            duckdb_interval iv{};
+            iv.months = 0;
+            iv.days = PyDateTime_DELTA_GET_DAYS(raw);
+            iv.micros = (int64_t)PyDateTime_DELTA_GET_SECONDS(raw) * 1000000 +
+                        PyDateTime_DELTA_GET_MICROSECONDS(raw);
+            state = duckdb_append_interval(app, iv);
+            break;
+        }
         default:
             throw DuckyError(std::string("ducky: row-API append for type ") + duckdb_type_name(t) +
                              " not yet supported at column " + std::to_string(col) +
-                             "; use append_columns or open a roadmap issue");
+                             "; use append_columns or append_arrow");
     }
     if (state == DuckDBError) {
         throw DuckyError(std::string("ducky: append failed at column ") + std::to_string(col) +
@@ -371,9 +429,18 @@ void Appender::append_columns(nb::dict columns, nb::object masks) {
         for (auto [key, val] : nb::cast<nb::dict>(masks)) {
             std::string name = nb::cast<std::string>(key);
             idx_t idx = resolve(name);
+            if (!col_present[idx]) {
+                // A mask over a missing (memset-NULL) column would flip
+                // uninitialized buffer contents back to valid.
+                throw DuckyError("ducky: mask for '" + name +
+                                 "' has no matching entry in `columns`");
+            }
             AnyArray m = nb::cast<AnyArray>(val);
-            if (m.ndim() != 1 || (m.dtype().code != nb::dtype<bool>().code &&
-                                  m.dtype().code != nb::dtype<uint8_t>().code)) {
+            nb::dlpack::dtype mdt = m.dtype();
+            // Check bits too: wider unsigned dtypes share the uint8 type code
+            // and would be misread bytewise.
+            if (m.ndim() != 1 || mdt.bits != 8 ||
+                (mdt.code != nb::dtype<bool>().code && mdt.code != nb::dtype<uint8_t>().code)) {
                 throw DuckyError("ducky: mask for '" + name + "' must be 1-D bool/uint8");
             }
             if ((int64_t)m.shape(0) != n_rows) {

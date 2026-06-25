@@ -204,6 +204,21 @@ Legend: ✅ shipped · 🟡 partially shipped · ⬜ not started.
 
 ## QOL improvements
 
+- ✅ **`Connection.executemany` + `Result.rows_changed`.** PEP 249 companions:
+  `executemany(query, seq)` prepares once (through the per-connection statement
+  cache) and runs the statement per parameter set — the batched
+  INSERT/UPDATE/DELETE fast path without an explicit `prepare()`.
+  `rows_changed` (also on `Connection`, delegating to the current result)
+  exposes `duckdb_rows_changed`; 0 for statements that don't report changed
+  rows (SELECT, DDL) and for streaming results.
+
+- ✅ **Temporal row appends.** `Appender.append_row` accepts `datetime.date` /
+  `time` / `datetime` (aware → UTC) / `timedelta` for DATE / TIME /
+  TIMESTAMP[_TZ] / INTERVAL columns, mirroring what `execute("... (?)")` binds;
+  previously these raised "not yet supported". Table-function output columns
+  gained the same temporal support (objects or raw storage ints), and their
+  declared types are validated at registration.
+
 - ✅ **`Result.fetchitem()` / `Connection.fetchitem()`.** A scalar-fetch
   helper that returns the single value of the single result row, raising a
   clear `ducky.Error` if the result isn't exactly 1 row × 1 column. Named after
@@ -254,14 +269,15 @@ Legend: ✅ shipped · 🟡 partially shipped · ⬜ not started.
   (queries/UDFs/`Appender`/`register_arrow`, one connection per thread) under a
   3.13t interpreter.
 
-  Still open: (1) `PreparedStatement.execute` (mutable `stmt_`) isn't guarded
-  yet; (2) no CI job exercises a free-threaded build, so nothing guards against
-  regressions; (3) no ThreadSanitizer run (ASAN catches use-after-free, not
-  races); (4) the `to_torch`/`to_jax`/`to_mlx` and pyarrow conversion paths are
-  unverified under FT (those wheels may lack 3.13t builds); (5) streaming
+  Still open: (1) no CI job exercises a free-threaded build, so nothing guards
+  against regressions; (2) no ThreadSanitizer run (ASAN catches use-after-free,
+  not races); (3) the `to_torch`/`to_jax`/`to_mlx` and pyarrow conversion paths
+  are unverified under FT (those wheels may lack 3.13t builds); (4) streaming
   consumption isn't fully serialized against a concurrent query on the same
   connection — that remains the documented one-thread-per-connection contract,
-  not something `lock_self` can enforce per-call.
+  not something `lock_self` can enforce per-call. (`PreparedStatement`'s
+  methods, including `execute`, carry `nb::lock_self()` like the other mutable
+  surfaces.)
 
 ## Unbound C API: candidates
 
