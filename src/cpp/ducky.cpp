@@ -246,6 +246,11 @@ NB_MODULE(_core, m) {
              "Useful for ``COUNT(*)``-style queries."
              "Raises :class:`Error` if the result is not exactly one row and one column.",
              nb::lock_self())
+        .def_prop_ro("rows_changed", &Result::rows_changed,
+                     "Rows affected by an INSERT / UPDATE / DELETE.\n\n"
+                     "0 for statements that don't report changed rows (SELECT, DDL) "
+                     "and for streaming results.",
+                     nb::lock_self())
         .def("fetch_chunk", &Result::fetch_chunk, nb::sig("def fetch_chunk(self) -> Chunk | None"),
              "Pull the next :class:`Chunk`, or None at end of stream.", nb::lock_self())
         .def("fetch_numpy_chunk", &Result::fetch_numpy_chunk,
@@ -447,6 +452,15 @@ NB_MODULE(_core, m) {
              "--------\n"
              ">>> rows = con.execute(\"SELECT * FROM t WHERE id = ?\", [42]).fetchall()",
              nb::lock_self())
+        .def("executemany", &Connection::executemany, "query"_a, "parameters"_a,
+             nb::sig("def executemany(self, query: str, parameters: "
+                     "collections.abc.Iterable[list | tuple | dict[str, typing.Any]]) -> None"),
+             "Run ``query`` once per parameter set, discarding each result.\n\n"
+             "PEP 249 companion to :meth:`execute`; prepares the statement once "
+             "(through the per-connection statement cache), so loops skip per-row "
+             "parsing and planning. The fast path for batched ``INSERT`` / "
+             "``UPDATE`` / ``DELETE``.",
+             nb::lock_self())
         // The returned Result shares the DuckDBHandle, so no keep_alive needed.
         .def("sql", &Connection::sql, "query"_a, "streaming"_a = false,
              nb::sig("def sql(self, query: str, streaming: bool = False) -> Result"),
@@ -514,6 +528,11 @@ NB_MODULE(_core, m) {
              "Return the lone scalar of a 1-row × 1-column result.\n"
              "Delegates to :meth:`Result.fetchitem`.",
              nb::lock_self())
+        .def_prop_ro(
+            "rows_changed", [](Connection& self) { return self.current_result()->rows_changed(); },
+            "Rows affected by the most recent INSERT / UPDATE / DELETE.\n"
+            "Delegates to :attr:`Result.rows_changed`.",
+            nb::lock_self())
         .def_prop_ro("description", &Connection::description,
                      nb::sig("def description(self) -> list[tuple] | None"),
                      "PEP 249 result description for the most recent query, or None.",

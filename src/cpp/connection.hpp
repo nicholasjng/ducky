@@ -75,6 +75,11 @@ class Connection {
     // Run a query and return its Result directly.
     std::shared_ptr<Result> sql(const std::string& query, bool streaming);
 
+    // PEP 249 executemany: run `query` once per parameter set in `seq`,
+    // discarding each result. Prepares once (through the statement cache), so
+    // loops skip per-row parse + plan.
+    void executemany(const std::string& query, nb::object seq);
+
     // Execute `query` with DuckDB's Arrow result collector and return an
     // `arrow_array_stream` PyCapsule (born-as-Arrow: batches assembled during
     // execution, no chunk->Arrow conversion pass). One batch per

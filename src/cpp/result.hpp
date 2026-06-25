@@ -44,6 +44,11 @@ class Result {
     // does not have exactly one column or does not yield exactly one row.
     nb::object fetchitem();
 
+    // Rows affected by an INSERT / UPDATE / DELETE, per duckdb_rows_changed.
+    // 0 for statements that don't report changed rows (SELECT, DDL) and for
+    // streaming results (the C API can't read the count without materializing).
+    int64_t rows_changed();
+
     // Pulls the next data chunk and returns it as a `Chunk` Python object, or
     // None when the result is exhausted. Each call advances the same underlying
     // cursor as fetch*/arrow_c_stream — don't mix them on one result.

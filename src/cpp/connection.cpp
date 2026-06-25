@@ -333,6 +333,34 @@ void bind_parameters(duckdb_prepared_statement stmt, nb::handle parameters) {
     }
 }
 
+// Shared by PreparedStatement::executemany and Connection::executemany.
+// Skips run_pending's per-row GIL release + signal-check loop: each row's
+// INSERT/UPDATE completes synchronously in microseconds, so the loop's
+// overhead dominates per-row cost. duckdb_execute_prepared blocks until
+// done; we check for signals every PERIOD rows so Ctrl-C is still snappy.
+void executemany_loop(duckdb_prepared_statement stmt, nb::handle seq) {
+    constexpr idx_t SIGNAL_CHECK_PERIOD = 1024;
+    idx_t since_check = 0;
+    for (nb::handle params : seq) {
+        // No duckdb_clear_bindings: bind_parameters writes all positional
+        // params 1..N, overwriting any prior values. Named-dict callers are
+        // expected to use the same key set per row (PEP-249's executemany
+        // contract is row-shape consistency).
+        bind_parameters(stmt, params);
+        duckdb_result result;
+        if (duckdb_execute_prepared(stmt, &result) == DuckDBError) {
+            std::string message = duckdb_result_error(&result);
+            duckdb_destroy_result(&result);
+            throw DuckyError(message);
+        }
+        duckdb_destroy_result(&result);
+        if (++since_check >= SIGNAL_CHECK_PERIOD) {
+            since_check = 0;
+            if (PyErr_CheckSignals() != 0) throw nb::python_error();
+        }
+    }
+}
+
 // Drive duckdb_pending_execute_task in a GIL-releasing loop until READY (or
 // error), then materialize via duckdb_execute_pending. Ticking one task at a
 // time (rather than blocking inside duckdb_execute_prepared) lets us run
@@ -347,6 +375,9 @@ duckdb_result drive_pending(duckdb_connection con, duckdb_pending_result pending
         throw DuckyError(message);
     }
 
+    // Consecutive NO_TASKS probes; persists across GIL round-trips so a long
+    // starved stretch keeps sleeping instead of re-spinning every 10 ms.
+    int no_tasks_streak = 0;
     for (;;) {
         duckdb_pending_state state;
         {
@@ -360,10 +391,22 @@ duckdb_result drive_pending(duckdb_connection con, duckdb_pending_result pending
             for (;;) {
                 state = duckdb_pending_execute_task(pending);
                 if (state == DUCKDB_PENDING_RESULT_READY || state == DUCKDB_PENDING_ERROR) break;
-                // Workers own the remaining tasks. yield() (not sleep) — a 1 ms
-                // sleep here was ~100s overhead across 100k single-row INSERTs.
+                // Workers own the remaining tasks. Spin with yield() first —
+                // an immediate 1 ms sleep here was ~100s overhead across 100k
+                // single-row INSERTs — but once the streak shows genuine
+                // starvation (workers busy or blocked on IO for a while, e.g.
+                // an httpfs scan), back off to a real sleep so this thread
+                // stops burning a core on no-op probes. Short queries never
+                // reach the threshold: 256 yield-probes pass in well under a
+                // millisecond.
                 if (state == DUCKDB_PENDING_NO_TASKS_AVAILABLE) {
-                    std::this_thread::yield();
+                    if (++no_tasks_streak > 256) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                    } else {
+                        std::this_thread::yield();
+                    }
+                } else {
+                    no_tasks_streak = 0;
                 }
                 if (std::chrono::steady_clock::now() >= deadline) break;
             }
@@ -848,6 +891,38 @@ std::shared_ptr<Result> Connection::sql(const std::string& query, bool streaming
     return make_result(run(query, nb::none(), streaming));
 }
 
+void Connection::executemany(const std::string& query, nb::object seq) {
+    ensure_open();
+    duckdb_connection con = handle_->connection;
+
+    // Same cached-statement dance as run(): reuse the parsed+planned statement
+    // for repeated query text, cleared so no bindings leak in.
+    duckdb_prepared_statement stmt = stmt_cache_checkout(query);
+    if (stmt && duckdb_clear_bindings(stmt) == DuckDBError) {
+        duckdb_destroy_prepare(&stmt);
+        stmt = nullptr;
+    }
+    if (!stmt) {
+        if (duckdb_prepare(con, query.c_str(), &stmt) == DuckDBError) {
+            std::string message = duckdb_prepare_error(stmt);
+            duckdb_destroy_prepare(&stmt);
+            throw DuckyError(message);
+        }
+    }
+    try {
+        executemany_loop(stmt, seq);
+    } catch (...) {
+        duckdb_destroy_prepare(&stmt);
+        throw;
+    }
+    if (keeps_stmt_cache(duckdb_prepared_statement_type(stmt))) {
+        stmt_cache_checkin(query, stmt);
+    } else {
+        stmt_cache_clear();
+        duckdb_destroy_prepare(&stmt);
+    }
+}
+
 nb::object Connection::arrow_collected_stream(const std::string& query, nb::object parameters,
                                               uint64_t rows_per_batch) {
     ensure_open();
@@ -1064,30 +1139,7 @@ std::shared_ptr<Result> PreparedStatement::execute(nb::object parameters, bool s
 
 void PreparedStatement::executemany(nb::object seq) {
     ensure_valid();
-    // Skip run_pending's per-row GIL release + signal-check loop: each row's
-    // INSERT/UPDATE completes synchronously in microseconds, so the loop's
-    // overhead dominates per-row cost. duckdb_execute_prepared blocks until
-    // done; we check for signals every PERIOD rows so Ctrl-C is still snappy.
-    constexpr idx_t SIGNAL_CHECK_PERIOD = 1024;
-    idx_t since_check = 0;
-    for (nb::handle params : seq) {
-        // No duckdb_clear_bindings: bind_parameters writes all positional
-        // params 1..N, overwriting any prior values. Named-dict callers are
-        // expected to use the same key set per row (PEP-249's executemany
-        // contract is row-shape consistency).
-        bind_parameters(stmt_, params);
-        duckdb_result result;
-        if (duckdb_execute_prepared(stmt_, &result) == DuckDBError) {
-            std::string message = duckdb_result_error(&result);
-            duckdb_destroy_result(&result);
-            throw DuckyError(message);
-        }
-        duckdb_destroy_result(&result);
-        if (++since_check >= SIGNAL_CHECK_PERIOD) {
-            since_check = 0;
-            if (PyErr_CheckSignals() != 0) throw nb::python_error();
-        }
-    }
+    executemany_loop(stmt_, seq);
 }
 
 int64_t PreparedStatement::num_parameters() const {

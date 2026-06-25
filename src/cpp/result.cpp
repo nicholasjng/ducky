@@ -860,6 +860,13 @@ nb::object Result::fetchitem() {
     return value;
 }
 
+int64_t Result::rows_changed() {
+    // duckdb_rows_changed reinterprets the result as a MaterializedQueryResult
+    // internally; guard the streaming case rather than hand it a stream.
+    if (duckdb_result_is_streaming(result_)) return 0;
+    return (int64_t)duckdb_rows_changed(&result_);
+}
+
 nb::object Result::fetch_chunk() {
     duckdb_data_chunk chunk = duckdb_fetch_chunk(result_);
     if (!chunk) return nb::none();

@@ -98,6 +98,14 @@ class Result:
         Useful for ``COUNT(*)``-style queries.Raises :class:`Error` if the result is not exactly one row and one column.
         """
 
+    @property
+    def rows_changed(self) -> int:
+        """
+        Rows affected by an INSERT / UPDATE / DELETE.
+
+        0 for statements that don't report changed rows (SELECT, DDL) and for streaming results.
+        """
+
     def fetch_chunk(self) -> Chunk | None:
         """Pull the next :class:`Chunk`, or None at end of stream."""
 
@@ -387,6 +395,13 @@ class Connection:
         >>> rows = con.execute("SELECT * FROM t WHERE id = ?", [42]).fetchall()
         """
 
+    def executemany(self, query: str, parameters: Iterable[list | tuple | dict[str, Any]]) -> None:
+        """
+        Run ``query`` once per parameter set, discarding each result.
+
+        PEP 249 companion to :meth:`execute`; prepares the statement once (through the per-connection statement cache), so loops skip per-row parsing and planning. The fast path for batched ``INSERT`` / ``UPDATE`` / ``DELETE``.
+        """
+
     def sql(self, query: str, streaming: bool = False) -> Result:
         """
         Run a query and return its :class:`Result` directly.
@@ -445,6 +460,13 @@ class Connection:
         """
         Return the lone scalar of a 1-row × 1-column result.
         Delegates to :meth:`Result.fetchitem`.
+        """
+
+    @property
+    def rows_changed(self) -> int:
+        """
+        Rows affected by the most recent INSERT / UPDATE / DELETE.
+        Delegates to :attr:`Result.rows_changed`.
         """
 
     @property
