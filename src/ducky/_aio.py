@@ -22,6 +22,7 @@ if TYPE_CHECKING:
 
 async def _drive(pending: PendingResult) -> Result:
     """Step ``pending`` to completion on the event loop, returning its result."""
+    no_tasks_streak = 0
     try:
         while True:
             state = await asyncio.to_thread(pending.execute_task)
@@ -30,11 +31,16 @@ async def _drive(pending: PendingResult) -> Result:
             if state == PendingState.ERROR:
                 raise Error(pending.error())
             if state == PendingState.NO_TASKS:
-                # Workers own the outstanding tasks; yield to the loop rather
-                # than spinning (the sync path sleeps 1 ms here instead).
-                await asyncio.sleep(0)
-            # READY is handled above; NOT_READY means there is more for us to
-            # do — tick again immediately.
+                # Workers own the outstanding tasks. Yield to the loop first —
+                # short queries finish within a tick or two — but once the
+                # streak shows a genuinely long query, back off to a real sleep
+                # so this coroutine doesn't burn a core re-dispatching no-op
+                # ticks through the thread pool.
+                no_tasks_streak += 1
+                await asyncio.sleep(0 if no_tasks_streak < 4 else 0.001)
+            else:
+                # NOT_READY: more for us to do — tick again immediately.
+                no_tasks_streak = 0
     except (asyncio.CancelledError, KeyboardInterrupt):
         pending.drain()
         raise

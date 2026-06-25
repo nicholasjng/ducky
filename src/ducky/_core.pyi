@@ -13,7 +13,7 @@ import polars
 import pyarrow
 import torch
 
-__duckdb_version__: str = "v1.6.3-dev7662"
+__duckdb_version__: str = "v1.5.4"
 
 class Error(Exception):
     pass
