@@ -135,15 +135,9 @@ nanobind_add_module(
   src/cpp/aggregate.cpp
   src/cpp/table.cpp
   src/cpp/arrow_scan.cpp
-  src/cpp/arrow_collector.cpp
   src/cpp/result.cpp)
 
 target_include_directories(_core PRIVATE ${DUCKDB_DIR}/src/include)
-# arrow_collector.cpp includes DuckDB's internal C++ headers (the only TU that
-# does), which transitively pull in bundled fmt. DuckDB exposes its third_party
-# include dirs via global include_directories() that don't propagate to this
-# sibling target, so add the one our internal-header includes need.
-target_include_directories(_core PRIVATE ${DUCKDB_DIR}/third_party/fmt/include)
 # tsl::robin_map is vendored by nanobind under ext/robin_map/include and exposed
 # as an IMPORTED target by nanobind-config.cmake; link it so the headers are
 # visible to our sources (nanobind itself only links it PRIVATE to its own

@@ -5,12 +5,14 @@
 #include <nanobind/stl/vector.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <thread>
 
-#include "arrow_collector.hpp"
 #include "arrow_scan.hpp"
+#include "arrow_util.hpp"
 #include "ducky.hpp"
 #include "prepared.hpp"
 
@@ -335,12 +337,10 @@ void bind_parameters(duckdb_prepared_statement stmt, nb::handle parameters) {
 // error), then materialize via duckdb_execute_pending. Ticking one task at a
 // time (rather than blocking inside duckdb_execute_prepared) lets us run
 // PyErr_CheckSignals between ticks (Ctrl-C interrupts mid-query) and reach the
-// streaming result path. `streaming` selects duckdb_pending_prepared_streaming
-// for the lazy chunk-pull result. The caller still owns `stmt`.
-duckdb_result run_pending(duckdb_connection con, duckdb_prepared_statement stmt, bool streaming) {
-    duckdb_pending_result pending = nullptr;
-    duckdb_state init = streaming ? duckdb_pending_prepared_streaming(stmt, &pending)
-                                  : duckdb_pending_prepared(stmt, &pending);
+// streaming result path. Takes ownership of `pending` (created by one of the
+// duckdb_pending_prepared* variants; `init` is that call's return state).
+duckdb_result drive_pending(duckdb_connection con, duckdb_pending_result pending,
+                            duckdb_state init) {
     if (init == DuckDBError) {
         std::string message = duckdb_pending_error(pending);
         duckdb_destroy_pending(&pending);
@@ -350,12 +350,22 @@ duckdb_result run_pending(duckdb_connection con, duckdb_prepared_statement stmt,
     for (;;) {
         duckdb_pending_state state;
         {
+            // Tick tasks with the GIL released, resurfacing every ~10 ms to
+            // poll for Ctrl-C. Doing several ticks per GIL round-trip matters:
+            // once workers own the remaining tasks, every tick is a cheap
+            // NO_TASKS probe, and paying release/acquire + PyErr_CheckSignals
+            // per probe dominated short-query latency.
             nb::gil_scoped_release release;
-            state = duckdb_pending_execute_task(pending);
-            // Workers own the remaining tasks. yield() (not sleep) — a 1 ms
-            // sleep here was ~100s overhead across 100k single-row INSERTs.
-            if (state == DUCKDB_PENDING_NO_TASKS_AVAILABLE) {
-                std::this_thread::yield();
+            auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(10);
+            for (;;) {
+                state = duckdb_pending_execute_task(pending);
+                if (state == DUCKDB_PENDING_RESULT_READY || state == DUCKDB_PENDING_ERROR) break;
+                // Workers own the remaining tasks. yield() (not sleep) — a 1 ms
+                // sleep here was ~100s overhead across 100k single-row INSERTs.
+                if (state == DUCKDB_PENDING_NO_TASKS_AVAILABLE) {
+                    std::this_thread::yield();
+                }
+                if (std::chrono::steady_clock::now() >= deadline) break;
             }
         }
         if (state == DUCKDB_PENDING_ERROR) {
@@ -385,6 +395,49 @@ duckdb_result run_pending(duckdb_connection con, duckdb_prepared_statement stmt,
         throw DuckyError(message);
     }
     return result;
+}
+
+// `streaming` selects duckdb_pending_prepared_streaming for the lazy
+// chunk-pull result. The caller still owns `stmt`.
+duckdb_result run_pending(duckdb_connection con, duckdb_prepared_statement stmt, bool streaming) {
+    duckdb_pending_result pending = nullptr;
+    duckdb_state init = streaming ? duckdb_pending_prepared_streaming(stmt, &pending)
+                                  : duckdb_pending_prepared(stmt, &pending);
+    return drive_pending(con, pending, init);
+}
+
+void arrow_stream_capsule_destructor(PyObject* capsule) {
+    auto* stream = (ArrowArrayStream*)PyCapsule_GetPointer(capsule, "arrow_array_stream");
+    if (stream) {
+        if (stream->release) stream->release(stream);
+        free(stream);
+    }
+}
+
+// Consume an Arrow-collected `result` (produced by duckdb_pending_prepared_arrow)
+// into an `arrow_array_stream` PyCapsule. Destroys `result` either way: the
+// stream owns the collected batches outright, so it keeps nothing else alive.
+nb::object arrow_stream_capsule_from_result(duckdb_result* result) {
+    auto* stream = (ArrowArrayStream*)calloc(1, sizeof(ArrowArrayStream));
+    if (!stream) {
+        duckdb_destroy_result(result);
+        throw std::bad_alloc();
+    }
+    std::string error;
+    bool failed = drain_arrow_error(duckdb_result_arrow_array_stream(result, stream), error);
+    duckdb_destroy_result(result);
+    if (failed) {
+        free(stream);
+        throw DuckyError("ducky: " + error);
+    }
+    PyObject* capsule =
+        PyCapsule_New(stream, "arrow_array_stream", arrow_stream_capsule_destructor);
+    if (!capsule) {
+        stream->release(stream);
+        free(stream);
+        throw nb::python_error();
+    }
+    return nb::steal(capsule);
 }
 
 }  // namespace
@@ -825,16 +878,13 @@ nb::object Connection::arrow_collected_stream(const std::string& query, nb::obje
 
     nb::object capsule;
     try {
-        // Install the Arrow collector across execution, then run the normal
-        // pending loop so the query stays Ctrl-C interruptible. The collector is
-        // consumed at plan time inside run_pending's duckdb_pending_prepared;
-        // the guard stays alive over the whole loop and restores on scope exit.
-        duckdb_result result;
-        {
-            CollectorGuard guard(con, rows_per_batch);
-            result = run_pending(con, stmt, /*streaming=*/false);
-        }
-        capsule = arrow_stream_from_result(&result);
+        // duckdb_pending_prepared_arrow plans the query with DuckDB's Arrow
+        // result collector, so execution assembles Arrow batches directly; the
+        // normal pending tick loop keeps it Ctrl-C interruptible.
+        duckdb_pending_result pending = nullptr;
+        duckdb_state init = duckdb_pending_prepared_arrow(stmt, rows_per_batch, &pending);
+        duckdb_result result = drive_pending(con, pending, init);
+        capsule = arrow_stream_capsule_from_result(&result);
     } catch (...) {
         duckdb_destroy_prepare(&stmt);
         throw;

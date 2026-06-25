@@ -95,7 +95,10 @@ idx_t Chunk::resolve(nb::object key) const {
 }
 
 nb::object Chunk::column(nb::object key, nb::handle owner) {
-    idx_t i = resolve(key);
+    return column_at(resolve(key), owner);
+}
+
+nb::object Chunk::column_at(idx_t i, nb::handle owner) {
     void* data = duckdb_vector_get_data(vector(i));
     size_t n = (size_t)size_;
     duckdb_type tid = type_id(i);

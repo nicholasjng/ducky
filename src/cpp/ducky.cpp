@@ -248,6 +248,11 @@ NB_MODULE(_core, m) {
              nb::lock_self())
         .def("fetch_chunk", &Result::fetch_chunk, nb::sig("def fetch_chunk(self) -> Chunk | None"),
              "Pull the next :class:`Chunk`, or None at end of stream.", nb::lock_self())
+        .def("fetch_numpy_chunk", &Result::fetch_numpy_chunk,
+             nb::sig("def fetch_numpy_chunk(self) -> dict[str, numpy.ndarray] | None"),
+             "Pull the next chunk as a {name: numpy.ndarray} dict of zero-copy views, "
+             "or None at end of stream. Backs the iter_batches fast path.",
+             nb::lock_self())
         .def("to_numpy", &Result::to_numpy, "columns"_a = nb::none(),
              nb::sig("def to_numpy(self, columns: collections.abc.Iterable[str] "
                      "| None = None) -> dict[str, numpy.ndarray]"),
@@ -543,7 +548,9 @@ NB_MODULE(_core, m) {
                 "dict[str, typing.Any] | None = None) -> pyarrow.Table"),
         "Execute `query` born-as-Arrow (DuckDB's Arrow collector) and return a "
         "pyarrow.Table — the fast whole-result path, equivalent in result to "
-        "execute(query, parameters).arrow(). `parameters` binds like execute().");
+        "execute(query, parameters).arrow(). Since the return value is a whole "
+        "Table, memory is inherently unbounded here; use arrow_reader() for a "
+        "bounded, incrementally-consumed alternative. `parameters` binds like execute().");
     conn_cls.def(
         "arrow_reader",
         [](nb::object self, const std::string& query, nb::object parameters,
@@ -554,10 +561,9 @@ NB_MODULE(_core, m) {
         nb::sig("def arrow_reader(self, query: str, parameters: list | tuple | "
                 "dict[str, typing.Any] | None = None, rows_per_batch: int = 1000000) -> "
                 "pyarrow.RecordBatchReader"),
-        "Execute `query` born-as-Arrow and return a pyarrow.RecordBatchReader. The "
-        "whole result is materialized as Arrow, then streamed in `rows_per_batch`-row "
-        "batches; for bounded-memory streaming use sql(query).arrow_batches() instead. "
-        "`parameters` binds like execute().");
+        "Execute `query` as a lazily-pulled result and return a pyarrow.RecordBatchReader, "
+        "coalescing DuckDB chunks into batches of up to `rows_per_batch` rows. Peak memory "
+        "is bounded by one batch, not the whole result. `parameters` binds like execute().");
     // to_numpy is bound directly (not via def_conversions) so it doesn't
     // detour through the Python conversions module — the C++ method runs the
     // chunk loop without leaving the binding.

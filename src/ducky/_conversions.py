@@ -75,41 +75,91 @@ class _CollectedArrowSource(Protocol):
     ) -> Any: ...
 
 
+class _StreamingQuerySource(Protocol):
+    """A ducky :class:`Connection` that can execute a query as a lazily-pulled Result."""
+
+    def execute(
+        self, query: str, parameters: Any = ..., streaming: bool = ...
+    ) -> _StreamingQuerySource: ...
+
+    @property
+    def current_result(self) -> ArrowSource: ...
+
+
 def arrow_reader(
-    con: _CollectedArrowSource,
+    con: _StreamingQuerySource,
     query: str,
     parameters: Any = None,
     rows_per_batch: int = 1_000_000,
 ) -> pyarrow.RecordBatchReader:
-    """Born-as-Arrow ``RecordBatchReader`` for ``query`` (backs Connection.arrow_reader).
+    """Bounded-memory ``pyarrow.RecordBatchReader`` for ``query`` (backs Connection.arrow_reader).
 
-    Executes ``query`` with DuckDB's Arrow result collector, which assembles
-    Arrow record batches *during* execution (in parallel) — no
-    DuckDB-chunk-to-Arrow conversion pass. Each ``RecordBatch`` holds up to
-    ``rows_per_batch`` rows. ``parameters`` binds like ``execute()``.
+    Executes ``query`` as a lazily-pulled (streaming) result and coalesces
+    consecutive ~2048-row DuckDB chunks into batches of up to ``rows_per_batch``
+    rows before handing them to the caller. Peak memory is bounded by one
+    batch's worth of rows, not the whole result, regardless of how large the
+    query is — unlike DuckDB's Arrow result collector (see :func:`arrow_query`),
+    which must finish the whole query before yielding anything.
+    ``parameters`` binds like ``execute()``.
 
-    Unlike :func:`arrow_batches` (which streams one chunk at a time and is
-    memory-bounded), the collector fully materializes the result as Arrow before
-    the reader yields anything — peak memory is the whole result, not one batch.
-    Use :func:`arrow_batches` when bounded memory matters; use this when you want
-    the whole result as Arrow as fast as possible.
+    Use :func:`arrow_batches` instead if you want the smallest possible
+    per-batch footprint (exactly one DuckDB chunk, ~2048 rows, no coalescing).
     """
     import pyarrow as pa
 
-    return pa.RecordBatchReader._import_from_c_capsule(
-        con._arrow_collected_stream(query, parameters, rows_per_batch)
-    )
+    result = con.execute(query, parameters, streaming=True).current_result
+    chunk_reader = pa.RecordBatchReader._import_from_c_capsule(result._arrow_chunk_stream())
+
+    def coalesced() -> Iterator[pyarrow.RecordBatch]:
+        # Accumulate whole chunks (cheap: no copy) until they'd reach
+        # rows_per_batch. The common case — rows_per_batch at or above one
+        # DuckDB chunk (~2048 rows), e.g. the default — needs no copy at all:
+        # a lone pending batch is sliced directly. combine_chunks only runs
+        # when actually merging multiple physical chunks into one.
+        pending: list[pyarrow.RecordBatch] = []
+        pending_rows = 0
+        for batch in chunk_reader:
+            pending.append(batch)
+            pending_rows += batch.num_rows
+            while pending_rows >= rows_per_batch:
+                if len(pending) == 1:
+                    head = pending[0]
+                    tail = head.slice(rows_per_batch) if head.num_rows > rows_per_batch else None
+                    yield head.slice(0, rows_per_batch) if tail is not None else head
+                else:
+                    merged = pa.Table.from_batches(pending).combine_chunks().to_batches()[0]
+                    yield merged.slice(0, rows_per_batch)
+                    tail = merged.slice(rows_per_batch)
+                    tail = tail if tail.num_rows else None
+                pending = [tail] if tail is not None else []
+                pending_rows = tail.num_rows if tail is not None else 0
+        if pending_rows:
+            yield (
+                pending[0]
+                if len(pending) == 1
+                else (pa.Table.from_batches(pending).combine_chunks().to_batches()[0])
+            )
+
+    return pa.RecordBatchReader.from_batches(chunk_reader.schema, coalesced())
 
 
 def arrow_query(con: _CollectedArrowSource, query: str, parameters: Any = None) -> pyarrow.Table:
     """Born-as-Arrow ``pyarrow.Table`` for ``query`` (backs Connection.arrow(query)).
 
     The fastest path from a query to a whole Arrow table: executes with DuckDB's
-    Arrow result collector and concatenates the collected batches. Equivalent in
-    result to ``con.execute(query, parameters).arrow()`` but skips the
-    chunk->Arrow conversion pass. ``parameters`` binds like ``execute()``.
+    Arrow result collector (batches assembled *during* execution, no
+    chunk->Arrow conversion pass) and concatenates the collected batches.
+    Equivalent in result to ``con.execute(query, parameters).arrow()``, just
+    faster. The return value is a whole Table, so memory is inherently
+    unbounded here regardless of implementation — use :func:`arrow_reader` for
+    a bounded, incrementally-consumed alternative. ``parameters`` binds like
+    ``execute()``.
     """
-    return arrow_reader(con, query, parameters).read_all()
+    import pyarrow as pa
+
+    return pa.RecordBatchReader._import_from_c_capsule(
+        con._arrow_collected_stream(query, parameters, 1_000_000)
+    ).read_all()
 
 
 def df(source: ArrowSource) -> pd.DataFrame:
@@ -179,6 +229,17 @@ def iter_batches(
         When True each value becomes a ``(values, mask)`` tuple.
         ``mask`` is a uint8 ndarray (1 = valid, 0 = NULL) or ``None`` if the chunk's column has no nulls.
     """
+    # Fast path (all columns, no validity): the C++ side assembles the whole
+    # {name: ndarray} dict per chunk, so we cross the binding once per chunk
+    # instead of once per column. `fetch_numpy_chunk` lives on Result; the
+    # _ChunkSource Protocol keeps `source` duck-typed.
+    if columns is None and not with_validity:
+        fetch_numpy_chunk = getattr(source, "fetch_numpy_chunk", None)
+        if fetch_numpy_chunk is not None:
+            while (batch := fetch_numpy_chunk()) is not None:
+                yield batch
+            return
+
     names: list[str] | None = None
     for chunk in chunks(source):
         if names is None:  # column names are constant across a result's chunks

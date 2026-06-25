@@ -101,6 +101,11 @@ class Result:
     def fetch_chunk(self) -> Chunk | None:
         """Pull the next :class:`Chunk`, or None at end of stream."""
 
+    def fetch_numpy_chunk(self) -> dict[str, numpy.ndarray] | None:
+        """
+        Pull the next chunk as a {name: numpy.ndarray} dict of zero-copy views, or None at end of stream. Backs the iter_batches fast path.
+        """
+
     def to_numpy(self, columns: Iterable[str] | None = None) -> dict[str, numpy.ndarray]:
         """
         Drain the result into a {name: numpy.ndarray} dict. Raises on VARCHAR/LIST/STRUCT/MAP — use .arrow() for those.
@@ -468,7 +473,7 @@ class Connection:
         self, query: str, parameters: list | tuple | dict[str, Any] | None = None
     ) -> pyarrow.Table:
         """
-        Execute `query` born-as-Arrow (DuckDB's Arrow collector) and return a pyarrow.Table — the fast whole-result path, equivalent in result to execute(query, parameters).arrow(). `parameters` binds like execute().
+        Execute `query` born-as-Arrow (DuckDB's Arrow collector) and return a pyarrow.Table — the fast whole-result path, equivalent in result to execute(query, parameters).arrow(). Since the return value is a whole Table, memory is inherently unbounded here; use arrow_reader() for a bounded, incrementally-consumed alternative. `parameters` binds like execute().
         """
 
     def arrow_batches(self) -> pyarrow.RecordBatchReader:
@@ -548,7 +553,7 @@ class Connection:
         rows_per_batch: int = 1000000,
     ) -> pyarrow.RecordBatchReader:
         """
-        Execute `query` born-as-Arrow and return a pyarrow.RecordBatchReader. The whole result is materialized as Arrow, then streamed in `rows_per_batch`-row batches; for bounded-memory streaming use sql(query).arrow_batches() instead. `parameters` binds like execute().
+        Execute `query` as a lazily-pulled result and return a pyarrow.RecordBatchReader, coalescing DuckDB chunks into batches of up to `rows_per_batch` rows. Peak memory is bounded by one batch, not the whole result. `parameters` binds like execute().
         """
 
     def to_numpy(self, columns: Iterable[str] | None = None) -> dict[str, numpy.ndarray]:

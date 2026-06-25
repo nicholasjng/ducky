@@ -234,16 +234,18 @@ def test_set_profile_sink_swallows_sink_errors():
     def bad(_sql, _info):
         raise RuntimeError("sink boom")
 
+    # Keep only the exception type: retaining the UnraisableHookArgs would pin
+    # its traceback (and through the frame chain, this test's locals) forever.
     seen = []
     previous_hook = sys.unraisablehook
-    sys.unraisablehook = seen.append
+    sys.unraisablehook = lambda args: seen.append(args.exc_type)
     try:
         con.set_profile_sink(bad)
         # Query still succeeds.
         assert con.execute("SELECT 1").fetchall() == [(1,)]
     finally:
         sys.unraisablehook = previous_hook
-    assert [u.exc_type for u in seen] == [RuntimeError]
+    assert seen == [RuntimeError]
 
 
 def test_jsonl_profile_sink_writes_lines(tmp_path):

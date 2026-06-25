@@ -60,6 +60,11 @@ class Chunk {
     // view over the chunk's buffer. See class comment for supported types.
     nb::object column(nb::object key, nb::handle owner);
 
+    // Same as column(), but takes a pre-resolved column index. Lets a caller
+    // that already holds indices (e.g. Result::fetch_numpy_chunk) skip the
+    // per-call key resolution. `owner` pins the chunk buffer behind the view.
+    nb::object column_at(idx_t i, nb::handle owner);
+
     // Returns the scale (number of decimal digits after the point) for a
     // DECIMAL column. Raises DuckyError if the column is not DECIMAL.
     int decimal_scale(nb::object key);

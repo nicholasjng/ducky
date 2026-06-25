@@ -79,7 +79,8 @@ class Connection {
     // `arrow_array_stream` PyCapsule (born-as-Arrow: batches assembled during
     // execution, no chunk->Arrow conversion pass). One batch per
     // `rows_per_batch`-row collector batch. `parameters` binds like execute().
-    // See arrow_collector.cpp.
+    // Uses duckdb_pending_prepared_arrow/duckdb_result_arrow_array_stream from
+    // the C-API patch stack (patches/, applied to ext/duckdb by picky).
     nb::object arrow_collected_stream(const std::string& query, nb::object parameters,
                                       uint64_t rows_per_batch);
 

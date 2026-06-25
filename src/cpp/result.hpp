@@ -49,6 +49,13 @@ class Result {
     // cursor as fetch*/arrow_c_stream — don't mix them on one result.
     nb::object fetch_chunk();
 
+    // Pulls the next data chunk and returns it as a {name: ndarray} dict (the
+    // zero-copy views Chunk.column produces), or None when exhausted. Builds
+    // the whole dict in one C++ call so streaming consumers (iter_batches) pay
+    // a single Python<->C++ crossing per chunk instead of one per column.
+    // Shares the cursor with fetch_chunk/fetch*; don't mix them on one result.
+    nb::object fetch_numpy_chunk();
+
     // Drain the result into a {name: numpy.ndarray} dict. Loops chunks in C++,
     // pre-allocates one buffer per column, memcpy's each chunk's vector data
     // into the right slice, and wraps the buffer as a numpy ndarray (HUGEINT /

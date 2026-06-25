@@ -123,9 +123,11 @@ def test_profile_sink_exception_reaches_unraisablehook():
     def bad_sink(sql, info):
         raise ValueError("sink boom")
 
+    # Keep only (type, message): retaining the UnraisableHookArgs would pin
+    # its traceback (and through the frame chain, this test's locals) forever.
     seen = []
     previous_hook = sys.unraisablehook
-    sys.unraisablehook = seen.append
+    sys.unraisablehook = lambda args: seen.append((args.exc_type, str(args.exc_value)))
     try:
         con.set_profile_sink(bad_sink)
         rows = con.execute("SELECT 1").fetchall()
@@ -134,9 +136,7 @@ def test_profile_sink_exception_reaches_unraisablehook():
         con.set_profile_sink(None)
 
     assert rows == [(1,)]  # the sink error must not break the query
-    assert len(seen) == 1
-    assert seen[0].exc_type is ValueError
-    assert "sink boom" in str(seen[0].exc_value)
+    assert seen == [(ValueError, "sink boom")]
 
 
 # ---------------------------------------------------------------------------
