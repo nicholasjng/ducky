@@ -129,7 +129,11 @@ def bench_select_to_numpy(state: mew.State, n: int) -> None:
 
 @mew.parametrize(_PARAMS, ids=_IDS, tags=(*_TAGS, "ml"), min_time=0.2)
 def bench_select_iter_batches(state: mew.State, n: int) -> None:
-    """iter_batches: streaming per-chunk dict[str, ndarray] (no concat)."""
+    """iter_batches: streaming per-chunk dict[str, ndarray] (no concat).
+
+    duckdb-python has no numpy-batch streaming API; its to_arrow_reader(2048)
+    is the closest counterpart, so this row compares different products.
+    """
     con = _populate(n)
     for _ in state:
         for _batch in con.execute("SELECT * FROM t").iter_batches():
@@ -138,23 +142,29 @@ def bench_select_iter_batches(state: mew.State, n: int) -> None:
 
 @mew.parametrize(_PARAMS, ids=_IDS, tags=(*_TAGS, "ml"), min_time=0.2)
 def bench_select_arrow_reader(state: mew.State, n: int) -> None:
-    """arrow_batches: per-chunk pyarrow RecordBatchReader (one batch per chunk)."""
-    con = _populate(n)
-    for _ in state:
-        for _batch in con.execute("SELECT * FROM t").arrow_batches():
-            pass
+    """arrow_reader: born-as-Arrow, DuckDB's Arrow collector builds batches
+    during execution.
 
-
-@mew.parametrize(_PARAMS, ids=_IDS, tags=(*_TAGS, "ml"), min_time=0.2)
-def bench_select_arrow_collected(state: mew.State, n: int) -> None:
-    """Born-as-Arrow: DuckDB's Arrow collector builds batches during execution.
-
-    A/B against bench_select_arrow_reader (chunk-by-chunk conversion). Matches
-    duckdb's to_arrow_reader(2048) in bench_duckdb.py — both born-as-Arrow.
+    The like-for-like counterpart of duckdb's to_arrow_reader(2048) in
+    bench_duckdb.py — both born-as-Arrow readers at the same batch size.
     """
     con = _populate(n)
     for _ in state:
         for _batch in con.arrow_reader("SELECT * FROM t", rows_per_batch=2048):
+            pass
+
+
+@mew.parametrize(_PARAMS, ids=_IDS, tags=(*_TAGS, "ml"), min_time=0.2)
+def bench_select_arrow_batches(state: mew.State, n: int) -> None:
+    """arrow_batches: per-chunk pyarrow RecordBatchReader (one batch per chunk).
+
+    ducky-only A/B against bench_select_arrow_reader: same product, but
+    memory-bounded chunk-by-chunk conversion after a materialized execute
+    instead of collecting Arrow during execution.
+    """
+    con = _populate(n)
+    for _ in state:
+        for _batch in con.execute("SELECT * FROM t").arrow_batches():
             pass
 
 

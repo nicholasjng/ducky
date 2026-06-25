@@ -22,4 +22,5 @@
 	sparse = /extension/icu/
 	sparse = /.github/config/extensions/httpfs.cmake
 	sparse = /.github/patches/extensions/httpfs/
+	patches = patches
 	postUpdate = sh \"$PICKY_ROOT/scripts/override-describe.sh\"
