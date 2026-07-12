@@ -44,15 +44,13 @@ struct ArrowScanWindow {
     idx_t count;
 };
 
-// Per-execution state: a fresh stream is opened from the registered source in
-// arrow_scan_init — so re-executing a (cached or prepared) plan re-streams the
-// source — and drained there in full. Draining up front is what makes the scan
-// parallel: every batch is converted (a zero-copy wrap of the Arrow buffers
-// for primitive types) while the GIL is held once in init, and the scan
-// callback then runs GIL-free on any number of worker threads, claiming
-// windows off the atomic cursor. The cost is that a streamed source is
-// buffered per execution — chunk wraps, not data copies, for the common
-// pyarrow.Table case.
+// Per-execution state: arrow_scan_init opens a fresh stream from the
+// registered source (so re-executing a cached/prepared plan re-streams it) and
+// drains it in full. Draining up front is what makes the scan parallel: every
+// batch is converted (a zero-copy wrap for primitive types) while the GIL is
+// held once in init, then the scan callback runs GIL-free on any number of
+// worker threads, claiming windows off the atomic cursor. Cost: a streamed
+// source is buffered per execution (chunk wraps, not copies, for pyarrow.Table).
 struct ArrowScanState {
     std::vector<duckdb_data_chunk> chunks;  // converted batches, owned
     std::vector<ArrowScanWindow> windows;   // emission schedule over `chunks`

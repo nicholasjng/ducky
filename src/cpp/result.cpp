@@ -290,15 +290,12 @@ nb::object convert_value(duckdb_vector vector, duckdb_logical_type logical, idx_
 }
 
 // Byte width of a fixed-width column type whose DuckDB in-memory layout is
-// bit-identical to its Arrow primitive layout, or 0 if the type is not eligible
-// for the combined fast path. Eligible types are the ones whose flat DuckDB
-// buffer concatenates straight into Arrow's data buffer with no conversion: the
-// fixed-width numerics, plus the temporals whose storage matches Arrow's unit 1:1
-// (DATE=date32 days, TIME=time64[us], TIMESTAMP[_S/MS/NS/TZ]=timestamp of the same
-// unit — DuckDB stores and Arrow expects the identical native-unit int), each
-// verified bit-equal to duckdb_data_chunk_to_arrow in test_arrow.py. Excludes
-// BOOLEAN (Arrow packs it 1 bit/value), HUGEINT/DECIMAL/INTERVAL, and all
-// variable-length / nested types — those take the per-chunk fallback below.
+// bit-identical to its Arrow primitive layout, or 0 if ineligible for the
+// combined fast path: the fixed-width numerics, plus temporals whose storage
+// matches Arrow's unit 1:1 (each verified bit-equal to duckdb_data_chunk_to_arrow
+// in test_arrow.py). Excludes BOOLEAN (Arrow packs it 1 bit/value),
+// HUGEINT/DECIMAL/INTERVAL, and variable-length/nested types — those take the
+// per-chunk fallback below.
 size_t fast_arrow_width(duckdb_type t) {
     switch (t) {
         case DUCKDB_TYPE_TINYINT:
@@ -327,13 +324,12 @@ size_t fast_arrow_width(duckdb_type t) {
     }
 }
 
-// ArrowArrayStream backing for a duckdb_result. The schema always comes from the
-// C API (duckdb_to_arrow_schema). get_next has two modes: when every column is a
-// fast-path-eligible fixed-width numeric, it drains the whole result and
-// hand-builds one combined Arrow record batch (concatenated data buffers +
-// validity bitmaps); otherwise it falls back to one Arrow array per DuckDB chunk
-// via duckdb_data_chunk_to_arrow, which handles every type. `owner` keeps the
-// ducky Result (and its duckdb_result) alive for the stream's lifetime.
+// ArrowArrayStream backing for a duckdb_result. The schema always comes from
+// duckdb_to_arrow_schema. get_next has two modes: when every column is
+// fast-path-eligible, it drains the whole result into one hand-built combined
+// Arrow record batch; otherwise it falls back to one Arrow array per DuckDB
+// chunk via duckdb_data_chunk_to_arrow, which handles every type. `owner`
+// keeps the ducky Result (and its duckdb_result) alive for the stream's life.
 struct ArrowStreamState {
     nb::object owner;              // keeps the Result (and its duckdb_result) alive
     duckdb_result* result;         // borrowed from owner

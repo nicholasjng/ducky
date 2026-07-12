@@ -101,14 +101,12 @@ void bind_check(duckdb_state state, idx_t idx) {
     }
 }
 
-// Bind an int64-fitting Python int at the width the statement expects.
-// DuckDB re-binds *and re-plans* a prepared statement on every execute whose
-// bound value type differs from the planned parameter type
-// (PreparedStatementData::RequireRebind), so always binding BIGINT turns a
-// prepared loop over e.g. an INTEGER column into a per-row replan (~2x
-// slowdown on executemany). Values outside the expected type's range fall
-// back to int64: that execute pays the rebind, and DuckDB's cast (or
-// out-of-range error) behaves exactly as before.
+// Bind an int64-fitting Python int at the width the statement expects. DuckDB
+// re-binds *and re-plans* on every execute whose bound type differs from the
+// planned parameter type (PreparedStatementData::RequireRebind), so always
+// binding BIGINT would turn a prepared loop over e.g. an INTEGER column into a
+// per-row replan (~2x slowdown on executemany). Out-of-range values fall back
+// to int64, paying that rebind, with DuckDB's normal cast/error behavior.
 void bind_int64_as_param_type(duckdb_prepared_statement stmt, idx_t idx, int64_t v) {
     switch (duckdb_param_type(stmt, idx)) {
         case DUCKDB_TYPE_TINYINT:
@@ -363,10 +361,10 @@ void executemany_loop(duckdb_prepared_statement stmt, nb::handle seq) {
 
 // Drive duckdb_pending_execute_task in a GIL-releasing loop until READY (or
 // error), then materialize via duckdb_execute_pending. Ticking one task at a
-// time (rather than blocking inside duckdb_execute_prepared) lets us run
-// PyErr_CheckSignals between ticks (Ctrl-C interrupts mid-query) and reach the
-// streaming result path. Takes ownership of `pending` (created by one of the
-// duckdb_pending_prepared* variants; `init` is that call's return state).
+// time (instead of blocking inside duckdb_execute_prepared) lets
+// PyErr_CheckSignals run between ticks, so Ctrl-C interrupts mid-query. Takes
+// ownership of `pending`; `init` is its originating duckdb_pending_prepared*
+// call's return state.
 duckdb_result drive_pending(duckdb_connection con, duckdb_pending_result pending,
                             duckdb_state init) {
     if (init == DuckDBError) {
@@ -381,24 +379,20 @@ duckdb_result drive_pending(duckdb_connection con, duckdb_pending_result pending
     for (;;) {
         duckdb_pending_state state;
         {
-            // Tick tasks with the GIL released, resurfacing every ~10 ms to
-            // poll for Ctrl-C. Doing several ticks per GIL round-trip matters:
-            // once workers own the remaining tasks, every tick is a cheap
-            // NO_TASKS probe, and paying release/acquire + PyErr_CheckSignals
-            // per probe dominated short-query latency.
+            // Tick with the GIL released, resurfacing every ~10ms for Ctrl-C.
+            // Several ticks per GIL round-trip matters: once workers own the
+            // remaining tasks, paying release/acquire + PyErr_CheckSignals per
+            // NO_TASKS probe dominated short-query latency.
             nb::gil_scoped_release release;
             auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(10);
             for (;;) {
                 state = duckdb_pending_execute_task(pending);
                 if (state == DUCKDB_PENDING_RESULT_READY || state == DUCKDB_PENDING_ERROR) break;
-                // Workers own the remaining tasks. Spin with yield() first —
-                // an immediate 1 ms sleep here was ~100s overhead across 100k
-                // single-row INSERTs — but once the streak shows genuine
-                // starvation (workers busy or blocked on IO for a while, e.g.
-                // an httpfs scan), back off to a real sleep so this thread
-                // stops burning a core on no-op probes. Short queries never
-                // reach the threshold: 256 yield-probes pass in well under a
-                // millisecond.
+                // Workers own the remaining tasks: yield() first (an immediate
+                // 1ms sleep cost ~100s across 100k single-row INSERTs), then
+                // back off to a real sleep once the streak shows genuine
+                // starvation (workers busy/blocked on IO). Short queries never
+                // reach the threshold — 256 yield-probes pass in well under 1ms.
                 if (state == DUCKDB_PENDING_NO_TASKS_AVAILABLE) {
                     if (++no_tasks_streak > 256) {
                         std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -762,13 +756,11 @@ namespace {
 // ballpark as sqlite3's per-connection statement cache).
 constexpr size_t kStmtCacheCapacity = 128;
 
-// Statement types that are safe to keep cached plans across. Anything else —
-// SET/RESET, PRAGMA, LOAD, ATTACH/DETACH, CALL, DDL, ... — flushes the cache:
-// the optimizer constant-folds settings-dependent expressions (e.g.
-// current_setting()) into the plan, and unlike catalog changes, a SET does not
-// trigger DuckDB's RebindPreparedStatement, so a cached plan would return
-// stale values. DDL is already rebind-safe but flushing on it costs nothing
-// in hot loops and drops plans referencing dead objects sooner.
+// Statement types safe to keep cached plans across. Anything else — SET/RESET,
+// PRAGMA, LOAD, ATTACH/DETACH, CALL, DDL, ... — flushes the cache: a SET
+// doesn't trigger DuckDB's RebindPreparedStatement, so a plan that folded in a
+// settings-dependent expression (e.g. current_setting()) would return stale
+// values. DDL is already rebind-safe but flushing on it is cheap insurance.
 bool keeps_stmt_cache(duckdb_statement_type type) {
     switch (type) {
         case DUCKDB_STATEMENT_TYPE_SELECT:

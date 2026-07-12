@@ -163,16 +163,12 @@ class Connection {
     void ensure_open() const;
     duckdb_result run(const std::string& query, nb::object parameters, bool streaming);
 
-    // Prepared-statement cache for run(): an LRU keyed by exact query text so
-    // repeated execute()/sql() calls skip parse + plan (parsing alone costs
-    // tens of µs per query). Entries are *checked out* (removed) while a query
-    // runs — run_pending releases the GIL between executor ticks, so another
-    // thread could otherwise grab the same statement and clear/rebind it
-    // mid-execution — and checked back in on success. Staleness is covered on
-    // two fronts: catalog changes rebind cached plans inside DuckDB
-    // (RebindPreparedStatement), and settings changes — which DuckDB does NOT
-    // rebind on, despite folding e.g. current_setting() into plans — flush the
-    // whole cache via keeps_stmt_cache() in connection.cpp.
+    // Prepared-statement LRU for run(), keyed by exact query text, so repeated
+    // execute()/sql() calls skip parse + plan. Entries are checked out (removed)
+    // while a query runs, since run_pending releases the GIL between ticks and
+    // another thread could otherwise rebind the same statement mid-execution.
+    // Catalog changes rebind cached plans inside DuckDB; settings changes don't,
+    // so keeps_stmt_cache() in connection.cpp flushes the whole cache on those.
     struct CachedStmt {
         std::string query;
         duckdb_prepared_statement stmt;

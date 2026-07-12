@@ -284,11 +284,12 @@ void table_main(duckdb_function_info info, duckdb_data_chunk output) {
     nb::gil_scoped_acquire gil;
     idx_t n_cols = (idx_t)bd->col_type_ids.size();
     idx_t rows = 0;
+    idx_t vec_size = duckdb_vector_size();
 
     bool ok = guard(
         [&] {
             PyObject* gen = id->generator.ptr();
-            while (rows < 2048) {
+            while (rows < vec_size) {
                 // PyIter_Next: returns NULL at exhaustion (no error) or NULL +
                 // error set on failure. Avoids a `builtins.next` attr lookup
                 // and a StopIteration throw per row.
