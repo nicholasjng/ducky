@@ -279,7 +279,7 @@ NB_MODULE(_core, m) {
             "requested_schema"_a = nb::none(),
             nb::sig("def __arrow_c_stream__(self, requested_schema: typing.Any = None) "
                     "-> typing.Any"),
-            "Export the result via the Arrow PyCapsule stream interface.")
+            "Export the result via the Arrow PyCapsule stream interface.", nb::lock_self())
         .def(
             "_arrow_chunk_stream",
             [](nb::object self) {
@@ -370,7 +370,9 @@ NB_MODULE(_core, m) {
              nb::sig("def executemany(self, parameters: collections.abc.Iterable[list | tuple | "
                      "dict[str, typing.Any]]) -> None"),
              "Run the statement once per parameter set, discarding each result.\n\n"
-             "The fast path for batched ``INSERT`` / ``UPDATE`` / ``DELETE``.",
+             "The fast path for batched ``INSERT`` / ``UPDATE`` / ``DELETE``. Holds the "
+             "GIL for the whole batch, so a cross-thread :meth:`Connection.interrupt` "
+             "can't preempt an in-flight call until it returns.",
              nb::lock_self())
         .def_prop_ro("num_parameters", &PreparedStatement::num_parameters,
                      "Number of bind parameters.", nb::lock_self())
@@ -466,7 +468,11 @@ NB_MODULE(_core, m) {
              "PEP 249 companion to :meth:`execute`; prepares the statement once "
              "(through the per-connection statement cache), so loops skip per-row "
              "parsing and planning. The fast path for batched ``INSERT`` / "
-             "``UPDATE`` / ``DELETE``.",
+             "``UPDATE`` / ``DELETE``.\n\n"
+             "Unlike :meth:`execute`, this holds the GIL for the whole batch (each "
+             "row completes in microseconds, so per-row GIL release would cost more "
+             "than it saves) - a cross-thread :meth:`interrupt` can't preempt an "
+             "in-flight call until it returns.",
              nb::lock_self())
         // The returned Result shares the DuckDBHandle, so no keep_alive needed.
         .def("sql", &Connection::sql, "query"_a, "streaming"_a = false,
@@ -683,7 +689,12 @@ NB_MODULE(_core, m) {
             "Register a Python class as a DuckDB aggregate UDF.\n\n"
             "``cls`` must define ``__init__``, ``update(self, *arrays)``, and "
             "``finalize(self) -> scalar``.\n"
-            "An optional ``combine(self, other)`` enables parallel aggregate execution.",
+            "An optional ``combine(self, other)`` merges partial states into ``self``. "
+            "Without it, DuckDB's routine single-state merge (every query goes through "
+            "one, even single-threaded ones) still works via a plain state copy; only a "
+            "genuine parallel/repartitioned merge of two states that *both* accumulated "
+            "real data raises a clear error at query time instead of silently returning "
+            "a wrong aggregate value.",
             nb::lock_self())
         .def(
             "create_table_function",

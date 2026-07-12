@@ -195,6 +195,13 @@ class Connection {
     std::list<CachedStmt> stmt_lru_;
     tsl::robin_map<std::string, std::list<CachedStmt>::iterator> stmt_cache_;
 
+    // Guards handle_ against interrupt()/progress() (which deliberately skip
+    // nb::lock_self() so they can preempt an in-flight execute() from another
+    // thread) racing close() (which resets handle_ under lock_self()).
+    // lock_self() alone doesn't protect this pair since interrupt()/progress()
+    // never take it. Held only around the pointer read/reset, never across the
+    // DuckDB C call itself.
+    mutable nb::ft_mutex handle_mu_;
     std::shared_ptr<DuckDBHandle> handle_;
     std::shared_ptr<Result> last_result_;
     // Declared last so it tears down first: its nb::object refs decref before

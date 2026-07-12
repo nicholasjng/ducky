@@ -522,7 +522,12 @@ Connection::Connection(const std::string& database, nb::object config) {
 }
 
 void Connection::interrupt() {
-    if (handle_ && handle_->connection) duckdb_interrupt(handle_->connection);
+    duckdb_connection con = nullptr;
+    {
+        nb::ft_lock_guard lock(handle_mu_);
+        if (handle_ && handle_->connection) con = handle_->connection;
+    }
+    if (con) duckdb_interrupt(con);
 }
 
 void Connection::load_extension(const std::string& name) {
@@ -559,10 +564,15 @@ void Connection::load_extension(const std::string& name) {
 }
 
 nb::tuple Connection::progress() const {
-    if (!handle_ || !handle_->connection) {
+    duckdb_connection con = nullptr;
+    {
+        nb::ft_lock_guard lock(handle_mu_);
+        if (handle_ && handle_->connection) con = handle_->connection;
+    }
+    if (!con) {
         throw DuckyError("ducky: connection is closed");
     }
-    duckdb_query_progress_type p = duckdb_query_progress(handle_->connection);
+    duckdb_query_progress_type p = duckdb_query_progress(con);
     return nb::make_tuple(p.percentage, p.rows_processed, p.total_rows_to_process);
 }
 
@@ -646,9 +656,10 @@ void Connection::set_profile_sink(nb::object sink, int64_t sample, const std::st
     }
     duckdb_connection con = handle_->connection;
     exec_no_result(con, "SET enable_profiling='no_output'");
-    if (mode == "detailed") {
-        exec_no_result(con, "SET profiling_mode='detailed'");
-    }
+    // Always set explicitly: profiling_mode is a persistent connection setting,
+    // so switching from a prior detailed-mode sink back to "standard" must
+    // actually reset it, not just skip the "detailed" SET.
+    exec_no_result(con, ("SET profiling_mode='" + mode + "'").c_str());
     profile_sink_ = sink;
     profile_sample_ = sample;
     profile_counter_ = 0;
@@ -726,7 +737,10 @@ void Connection::close() {
         arrow_registry_->sources.clear();
     }
     profile_sink_ = nb::none();
-    handle_.reset();
+    {
+        nb::ft_lock_guard lock(handle_mu_);
+        handle_.reset();
+    }
 }
 
 int Connection::gc_traverse(visitproc visit, void* arg) const {
