@@ -67,6 +67,12 @@ class Chunk:
         Flat numeric / temporal types only.
         """
 
+    def mlx(self, key: int | str) -> mlx.core.array:
+        """
+        Return the column as an ``mlx.core.array``, built directly via nanobind's native mlx ndarray dispatch (zero-copy on CPU).
+        Flat numeric / temporal types only.
+        """
+
 class Result:
     """A query result. Iterate or call ``fetch*`` to pull rows."""
 

@@ -223,6 +223,13 @@ NB_MODULE(_core, m) {
             "key"_a, nb::sig("def dlpack(self, key: int | str) -> typing.Any"),
             "Return the column as a DLPack object (``__dlpack__`` / "
             "``__dlpack_device__``), without going through numpy.\n"
+            "Flat numeric / temporal types only.")
+        .def(
+            "mlx",
+            [](nb::object self, nb::object key) { return nb::cast<Chunk&>(self).mlx(key, self); },
+            "key"_a, nb::sig("def mlx(self, key: int | str) -> mlx.core.array"),
+            "Return the column as an ``mlx.core.array``, built directly via "
+            "nanobind's native mlx ndarray dispatch (zero-copy on CPU).\n"
             "Flat numeric / temporal types only.");
 
     nb::class_<Result> result_cls(m, "Result",

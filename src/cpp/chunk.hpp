@@ -75,6 +75,12 @@ class Chunk {
     // structured types (HUGEINT, INTERVAL, DECIMAL, VARCHAR, ...).
     nb::object dlpack(nb::object key, nb::handle owner);
 
+    // Returns the column at `key` as an mlx.core.array, via nanobind's native
+    // mlx ndarray framework (nb::mlx, added in nanobind 2.13). Same
+    // zero-copy-on-CPU path as dlpack() + mx.array() in Python, done in one
+    // C++ call instead of two. Same type restrictions as dlpack().
+    nb::object mlx(nb::object key, nb::handle owner);
+
     // Returns a uint8 ndarray (1 = valid, 0 = null) of length `size`, or None
     // if the column has no validity mask (i.e. no nulls). The mask is unpacked
     // from DuckDB's bitmap on first access and cached.

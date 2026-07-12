@@ -151,6 +151,21 @@ nb::object Chunk::dlpack(nb::object key, nb::handle owner) {
     return nb::cast(nb::ndarray<nb::array_api, nb::ro>(data, 1, shape, owner, nullptr, dtype));
 }
 
+nb::object Chunk::mlx(nb::object key, nb::handle owner) {
+    idx_t i = resolve(key);
+    void* data = duckdb_vector_get_data(vector(i));
+    size_t n = (size_t)size_;
+    duckdb_type tid = type_id(i);
+
+    nb::dlpack::dtype dtype;
+    if (!dtype_for(tid, dtype)) {
+        throw DuckyError(std::string("ducky: column type ") + duckdb_type_name(tid) +
+                         " has no flat DLPack representation; use .column() for structured types");
+    }
+    size_t shape[1] = {n};
+    return nb::cast(nb::ndarray<nb::mlx, nb::ro>(data, 1, shape, owner, nullptr, dtype));
+}
+
 int Chunk::decimal_scale(nb::object key) {
     idx_t i = resolve(key);
     if (type_id(i) != DUCKDB_TYPE_DECIMAL) {

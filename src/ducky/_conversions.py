@@ -292,8 +292,10 @@ def to_torch(
 ) -> dict[str, torch.Tensor]:
     """Eagerly drain all chunks into ``{name: torch.Tensor}``.
 
-    Loops chunks in C++ via :func:`to_numpy`; each tensor wraps the resulting numpy buffer via :func:`torch.from_numpy` (zero-copy on CPU).
-    For memory-bounded streaming use :func:`iter_batches_torch`.
+    Goes through :func:`to_numpy` rather than accumulating :func:`iter_batches_torch`
+    chunks in Python — measured ~15x faster on a multi-chunk result, since
+    per-chunk dispatch overhead adds up fast. ``torch.from_numpy`` is
+    zero-copy on CPU. For memory-bounded streaming use :func:`iter_batches_torch`.
     """
     import torch
 
@@ -330,8 +332,8 @@ def to_jax(
 ) -> dict[str, jax.Array]:
     """Eagerly drain all chunks into ``{name: jax.Array}``.
 
-    Loops chunks in C++ via :func:`to_numpy`; each array wraps the resulting numpy buffer via :func:`jax.numpy.asarray` (zero-copy on CPU).
-    For memory-bounded streaming use :func:`iter_batches_jax`.
+    Goes through :func:`to_numpy` rather than per-chunk accumulation — see
+    :func:`to_torch` for why. For memory-bounded streaming use :func:`iter_batches_jax`.
     """
     import jax.numpy as jnp
 
@@ -345,18 +347,16 @@ def iter_batches_mlx(
 ) -> Iterator[dict[str, mx.array]]:
     """Yield one ``{name: mlx.core.array}`` dict per chunk.
 
-    Each array is built directly from the chunk's buffer via DLPack (zero-copy on the CPU backend).
+    Each array is built directly from the chunk's buffer via nanobind's native mlx ndarray dispatch (zero-copy on the CPU backend) — no separate DLPack + ``mx.array()`` step.
     MLX uses a unified-memory model, so — unlike the JAX and torch variants — there is no per-array ``device`` argument; set the active device globally with ``mlx.core.set_default_device`` if needed.
     MLX has no float64, so ``DOUBLE`` columns arrive as float32.
     Chunks are released as soon as the caller advances the iterator.
     """
-    import mlx.core as mx
-
     names: list[str] | None = None
     for chunk in chunks(source):
         if names is None:
             names = _select(chunk.columns, columns)
-        yield {n: mx.array(chunk.dlpack(n)) for n in names}
+        yield {n: chunk.mlx(n) for n in names}
 
 
 def to_mlx(
@@ -365,9 +365,9 @@ def to_mlx(
 ) -> dict[str, mx.array]:
     """Eagerly drain all chunks into ``{name: mlx.core.array}``.
 
-    Loops chunks in C++ via :func:`to_numpy`; each array wraps the resulting numpy buffer via :func:`mlx.core.array` (zero-copy on the CPU backend).
-    MLX has no float64, so ``DOUBLE`` columns arrive as float32.
-    For memory-bounded streaming use :func:`iter_batches_mlx`.
+    Goes through :func:`to_numpy` rather than per-chunk accumulation — see
+    :func:`to_torch` for why. MLX has no float64, so ``DOUBLE`` columns
+    arrive as float32. For memory-bounded streaming use :func:`iter_batches_mlx`.
     """
     import mlx.core as mx
 
