@@ -863,19 +863,41 @@ int64_t Result::rows_changed() {
     return (int64_t)duckdb_rows_changed(&result_);
 }
 
+duckdb_data_chunk Result::fetch_raw_chunk() {
+    if (duckdb_data_chunk reused = chunk_pool_->take()) {
+        // Refill in place (no allocation) -- the same pattern to_numpy() uses
+        // for its own scratch chunk. `false` means exhausted, matching the
+        // convention every other duckdb_fetch_chunk_into call site in this
+        // file uses (ensure_row(), the to_numpy() loop): no separate
+        // mid-stream error check.
+        if (!duckdb_fetch_chunk_into(result_, reused)) {
+            duckdb_destroy_data_chunk(&reused);
+            return nullptr;
+        }
+        return reused;
+    }
+    return duckdb_fetch_chunk(result_);
+}
+
 nb::object Result::fetch_chunk() {
-    duckdb_data_chunk chunk = duckdb_fetch_chunk(result_);
+    duckdb_data_chunk chunk = fetch_raw_chunk();
     if (!chunk) return nb::none();
-    return nb::cast(new Chunk(chunk, schema_, handle_));
+    // nb::cast()'s default policy is automatic_reference, which for a raw
+    // pointer resolves to a *non-owning* reference (nanobind never calls the
+    // destructor or delete) -- take_ownership must be explicit here, or the
+    // Chunk (and its duckdb_data_chunk) leaks for the process's lifetime.
+    return nb::cast(new Chunk(chunk, schema_, handle_, chunk_pool_), nb::rv_policy::take_ownership);
 }
 
 nb::object Result::fetch_numpy_chunk() {
-    duckdb_data_chunk chunk = duckdb_fetch_chunk(result_);
+    duckdb_data_chunk chunk = fetch_raw_chunk();
     if (!chunk) return nb::none();
-    // The Chunk owns the buffer (frees it in its dtor) and is the keep-alive
-    // owner for every column view; the dict's ndarrays hold it alive, so it is
-    // released once the consumer drops the batch.
-    nb::object chunk_obj = nb::cast(new Chunk(chunk, schema_, handle_));
+    // The Chunk owns the buffer (frees it, or hands it back to chunk_pool_,
+    // in its dtor) and is the keep-alive owner for every column view; the
+    // dict's ndarrays hold it alive, so it is released once the consumer
+    // drops the batch. See fetch_chunk() above re: the explicit policy.
+    nb::object chunk_obj =
+        nb::cast(new Chunk(chunk, schema_, handle_, chunk_pool_), nb::rv_policy::take_ownership);
     Chunk& c = nb::cast<Chunk&>(chunk_obj);
     nb::dict out;
     const std::vector<std::string>& names = schema_->names;

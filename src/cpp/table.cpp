@@ -243,8 +243,15 @@ void table_bind(duckdb_bind_info info) {
             nb::list python_args;
             for (idx_t i = 0; i < n_params; ++i) {
                 duckdb_value val = duckdb_bind_get_parameter(info, i);
-                python_args.append(duckdb_value_to_python(val));
+                nb::object py_val;
+                try {
+                    py_val = duckdb_value_to_python(val);
+                } catch (...) {
+                    duckdb_destroy_value(&val);
+                    throw;
+                }
                 duckdb_destroy_value(&val);
+                python_args.append(py_val);
             }
 
             for (idx_t i = 0; i < (idx_t)ctx->col_names.size(); ++i) {

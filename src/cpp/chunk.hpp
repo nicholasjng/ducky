@@ -22,6 +22,43 @@ struct ChunkSchema {
     tsl::robin_map<std::string, idx_t> name_to_idx;
 };
 
+// Per-Result pool of freed `duckdb_data_chunk` buffers. duckdb_fetch_chunk
+// (the API Result::fetch_chunk/fetch_numpy_chunk use) allocates a brand-new
+// DataChunk on every call; when a Chunk is destroyed it hands its buffer back
+// here instead of destroying it, so the next fetch can refill it in place via
+// duckdb_fetch_chunk_into (no allocation) rather than paying that cost again.
+// Falls back to a fresh allocation whenever the pool is empty (e.g. a caller
+// holding more than one live batch at once) — always correct, just not
+// always fast. No dependency on Result, to avoid a circular header include
+// (result.hpp already includes chunk.hpp).
+struct ChunkPool {
+    nb::ft_mutex mu_;
+    std::vector<duckdb_data_chunk> free_;
+    static constexpr size_t kCapacity = 1;
+
+    ~ChunkPool() {
+        for (duckdb_data_chunk c : free_) duckdb_destroy_data_chunk(&c);
+    }
+
+    // Takes ownership of `chunk` if there's room; returns false (caller keeps
+    // ownership) if the pool is full.
+    bool try_return(duckdb_data_chunk chunk) {
+        nb::ft_lock_guard lock(mu_);
+        if (free_.size() >= kCapacity) return false;
+        free_.push_back(chunk);
+        return true;
+    }
+
+    // Returns a previously-freed buffer, or nullptr if none is available.
+    duckdb_data_chunk take() {
+        nb::ft_lock_guard lock(mu_);
+        if (free_.empty()) return nullptr;
+        duckdb_data_chunk c = free_.back();
+        free_.pop_back();
+        return c;
+    }
+};
+
 // Owns a single `duckdb_data_chunk` and exposes each numeric/temporal column as
 // a zero-copy nb::ndarray (numpy framework, DLPack-compatible).
 //
@@ -44,8 +81,11 @@ struct ChunkSchema {
 // alive for as long as any column view is held.
 class Chunk {
    public:
+    // `pool`, if alive, receives `chunk`'s buffer back on destruction instead
+    // of it being destroyed outright — see ChunkPool. Defaults to empty for
+    // any construction site that doesn't have (or want) a pool.
     Chunk(duckdb_data_chunk chunk, std::shared_ptr<const ChunkSchema> schema,
-          std::shared_ptr<DuckDBHandle> handle);
+          std::shared_ptr<DuckDBHandle> handle, std::weak_ptr<ChunkPool> pool = {});
     ~Chunk();
 
     Chunk(const Chunk&) = delete;
@@ -107,5 +147,6 @@ class Chunk {
     std::vector<duckdb_type> type_ids_;
     std::vector<std::unique_ptr<uint8_t[]>> unpacked_validity_;
     std::shared_ptr<DuckDBHandle> handle_;
+    std::weak_ptr<ChunkPool> pool_;
     idx_t size_;
 };

@@ -87,6 +87,11 @@ class Result {
     // Builds the tuple at the cursor and advances the cursor by one row.
     nb::object build_row();
     void release_chunk();
+    // Backs fetch_chunk()/fetch_numpy_chunk(): returns the next data chunk,
+    // or nullptr when exhausted. Reuses a buffer from chunk_pool_ via
+    // duckdb_fetch_chunk_into when one is available (no allocation);
+    // otherwise falls back to a fresh duckdb_fetch_chunk allocation.
+    duckdb_data_chunk fetch_raw_chunk();
 
     duckdb_result result_;
     std::shared_ptr<DuckDBHandle> handle_;
@@ -113,6 +118,12 @@ class Result {
     duckdb_data_chunk chunk_ = nullptr;
     idx_t chunk_size_ = 0;
     idx_t cursor_ = 0;
+    // Buffer pool for fetch_chunk()/fetch_numpy_chunk() (the Chunk-returning
+    // API) — distinct from chunk_ above, which is ensure_row()'s own scratch
+    // buffer for the row-cursor path (fetchone/fetchmany/fetchall). One pool
+    // per Result, so a reused buffer always already matches this Result's
+    // own column layout.
+    std::shared_ptr<ChunkPool> chunk_pool_ = std::make_shared<ChunkPool>();
     // Rows handed out via fetchone/fetchmany/fetchall so far; lets fetchall
     // pre-size its list from duckdb_row_count on materialized results.
     idx_t rows_returned_ = 0;
