@@ -78,16 +78,14 @@ def test_failed_udf_registration_does_not_crash():
 # ---------------------------------------------------------------------------
 
 
-def test_out_of_range_date_raises_cleanly():
-    con = ducky.connect()
+def test_out_of_range_date_raises_cleanly(con):
     with pytest.raises(ValueError, match="year"):
         con.sql("SELECT (DATE '2000-01-01' + INTERVAL 9000 YEARS)::DATE").fetchone()
     # The connection stays usable.
     assert con.sql("SELECT DATE '2000-01-01'").fetchitem() == datetime.date(2000, 1, 1)
 
 
-def test_out_of_range_timestamp_raises_cleanly():
-    con = ducky.connect()
+def test_out_of_range_timestamp_raises_cleanly(con):
     with pytest.raises(ValueError, match="year"):
         con.sql("SELECT TIMESTAMP '2000-01-01' + INTERVAL 9000 YEARS").fetchone()
 
@@ -98,14 +96,12 @@ def test_out_of_range_timestamp_raises_cleanly():
 # ---------------------------------------------------------------------------
 
 
-def test_interval_large_seconds_decodes_exactly():
-    con = ducky.connect()
+def test_interval_large_seconds_decodes_exactly(con):
     value = con.sql("SELECT INTERVAL '100000000' SECONDS").fetchitem()
     assert value == datetime.timedelta(seconds=100_000_000)
 
 
-def test_interval_months_beyond_timedelta_range_raises():
-    con = ducky.connect()
+def test_interval_months_beyond_timedelta_range_raises(con):
     with pytest.raises(ducky.Error, match="overflows datetime.timedelta"):
         con.sql("SELECT INTERVAL '200000000' MONTHS").fetchone()
 
@@ -117,8 +113,7 @@ def test_interval_months_beyond_timedelta_range_raises():
 # ---------------------------------------------------------------------------
 
 
-def test_profile_sink_exception_reaches_unraisablehook():
-    con = ducky.connect()
+def test_profile_sink_exception_reaches_unraisablehook(con):
 
     def bad_sink(sql, info):
         raise ValueError("sink boom")
@@ -146,8 +141,7 @@ def test_profile_sink_exception_reaches_unraisablehook():
 # ---------------------------------------------------------------------------
 
 
-def test_appender_destructor_swallows_flush_error():
-    con = ducky.connect()
+def test_appender_destructor_swallows_flush_error(con):
     con.execute("CREATE TABLE checked(x INTEGER CHECK (x > 0))")
     app = con.appender("checked")
     app.append_row(-1)
@@ -156,8 +150,7 @@ def test_appender_destructor_swallows_flush_error():
     assert con.sql("SELECT count(*) FROM checked").fetchitem() == 0
 
 
-def test_appender_explicit_close_surfaces_flush_error():
-    con = ducky.connect()
+def test_appender_explicit_close_surfaces_flush_error(con):
     con.execute("CREATE TABLE checked(x INTEGER CHECK (x > 0))")
     app = con.appender("checked")
     app.append_row(-1)
@@ -171,8 +164,7 @@ def test_appender_explicit_close_surfaces_flush_error():
 # ---------------------------------------------------------------------------
 
 
-def test_table_udf_blob_with_embedded_nul():
-    con = ducky.connect()
+def test_table_udf_blob_with_embedded_nul(con):
     payload = b"a\x00b"
 
     def factory():
@@ -190,6 +182,8 @@ def test_table_udf_blob_with_embedded_nul():
 
 
 def test_profile_sink_cycle_is_collectable():
+    # `con` must live only inside make() — a fixture-provided one would stay
+    # reachable for the whole test, and the cycle below would never collect.
     def make():
         con = ducky.connect()
 
@@ -205,6 +199,7 @@ def test_profile_sink_cycle_is_collectable():
 
 
 def test_registered_arrow_source_cycle_is_collectable():
+    # See test_profile_sink_cycle_is_collectable: `con` must stay local to make().
     pa = pytest.importorskip("pyarrow")
 
     class Source:
@@ -233,8 +228,7 @@ def test_registered_arrow_source_cycle_is_collectable():
 # ---------------------------------------------------------------------------
 
 
-def test_close_releases_profile_sink():
-    con = ducky.connect()
+def test_close_releases_profile_sink(con):
 
     def sink(_sql, _info):
         pass
@@ -247,7 +241,7 @@ def test_close_releases_profile_sink():
     assert ref() is None
 
 
-def test_close_releases_registered_arrow_sources():
+def test_close_releases_registered_arrow_sources(con):
     pa = pytest.importorskip("pyarrow")
 
     class Source:
@@ -257,7 +251,6 @@ def test_close_releases_registered_arrow_sources():
         def __arrow_c_stream__(self, requested_schema=None):
             return self.table.__arrow_c_stream__(requested_schema)
 
-    con = ducky.connect()
     src = Source(pa.table({"x": [1]}))
     ref = weakref.ref(src)
     con.register_arrow("t", src)
@@ -274,15 +267,13 @@ def test_close_releases_registered_arrow_sources():
 # ---------------------------------------------------------------------------
 
 
-def test_arrow_udf_invalid_parameter_type_raises():
-    con = ducky.connect()
+def test_arrow_udf_invalid_parameter_type_raises(con):
     with pytest.raises(ducky.Error, match="invalid DuckDB type"):
         con.create_arrow_function("bad", lambda a, b: a, ["INTEGER", "NOT_A_TYPE"], "INTEGER")
     assert con.sql("SELECT 1").fetchitem() == 1
 
 
-def test_table_udf_invalid_column_type_raises():
-    con = ducky.connect()
+def test_table_udf_invalid_column_type_raises(con):
     with pytest.raises(ducky.Error, match="invalid DuckDB type"):
         con.create_table_function("bad", lambda: iter(()), [], {"a": "INTEGER", "b": "NOT_A_TYPE"})
     assert con.sql("SELECT 1").fetchitem() == 1
@@ -294,10 +285,9 @@ def test_table_udf_invalid_column_type_raises():
 # ---------------------------------------------------------------------------
 
 
-def test_appender_columns_multiple_slices_with_masks():
+def test_appender_columns_multiple_slices_with_masks(con):
     np = pytest.importorskip("numpy")
 
-    con = ducky.connect()
     con.execute("CREATE TABLE big(x INTEGER, y DOUBLE)")
     n = 5000  # spans multiple ~2048-row slices
     x = np.arange(n, dtype=np.int32)

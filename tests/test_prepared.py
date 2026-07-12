@@ -7,8 +7,7 @@ import pytest
 import ducky
 
 
-def test_prepare_execute_positional():
-    con = ducky.connect()
+def test_prepare_execute_positional(con):
     stmt = con.prepare("SELECT ? + ? AS s")
     assert stmt.num_parameters == 2
     assert stmt.execute([2, 3]).fetchone() == (5,)
@@ -16,22 +15,19 @@ def test_prepare_execute_positional():
     assert stmt.execute([10, 20]).fetchone() == (30,)
 
 
-def test_prepare_execute_named():
-    con = ducky.connect()
+def test_prepare_execute_named(con):
     stmt = con.prepare("SELECT $x AS x, $y AS y")
     assert stmt.num_parameters == 2
     assert {stmt.parameter_name(1), stmt.parameter_name(2)} == {"x", "y"}
     assert stmt.execute({"x": 1, "y": 2}).fetchone() == (1, 2)
 
 
-def test_parameter_name_out_of_range_is_none():
-    con = ducky.connect()
+def test_parameter_name_out_of_range_is_none(con):
     stmt = con.prepare("SELECT ? AS x")
     assert stmt.parameter_name(99) is None
 
 
-def test_executemany_batched_insert():
-    con = ducky.connect()
+def test_executemany_batched_insert(con):
     con.execute("CREATE TABLE t(id INTEGER, name VARCHAR)")
     ins = con.prepare("INSERT INTO t VALUES (?, ?)")
     ins.executemany([(1, "a"), (2, "b"), (3, "c")])
@@ -43,8 +39,7 @@ def test_executemany_batched_insert():
     ]
 
 
-def test_result_schema_and_statement_type_before_execution():
-    con = ducky.connect()
+def test_result_schema_and_statement_type_before_execution(con):
     con.execute("CREATE TABLE t(id INTEGER, name VARCHAR)")
     sel = con.prepare("SELECT id, name FROM t WHERE id > ?")
     # Schema is known without running the query.
@@ -58,21 +53,18 @@ def test_result_schema_and_statement_type_before_execution():
     assert ins.columns == ["Count"]
 
 
-def test_execute_no_parameters():
-    con = ducky.connect()
+def test_execute_no_parameters(con):
     stmt = con.prepare("SELECT 42")
     assert stmt.num_parameters == 0
     assert stmt.execute().fetchone() == (42,)
 
 
-def test_prepare_invalid_sql_raises():
-    con = ducky.connect()
+def test_prepare_invalid_sql_raises(con):
     with pytest.raises(ducky.Error):
         con.prepare("SELECT * FROM no_such_table")
 
 
-def test_context_manager_closes():
-    con = ducky.connect()
+def test_context_manager_closes(con):
     with con.prepare("SELECT 1") as stmt:
         assert stmt.execute().fetchone() == (1,)
     # After the block the statement is closed.
@@ -80,8 +72,7 @@ def test_context_manager_closes():
         stmt.execute()
 
 
-def test_use_after_close_raises():
-    con = ducky.connect()
+def test_use_after_close_raises(con):
     stmt = con.prepare("SELECT 1")
     stmt.close()
     with pytest.raises(ducky.Error):
@@ -90,18 +81,16 @@ def test_use_after_close_raises():
     stmt.close()
 
 
-def test_result_outlives_connection():
+def test_result_outlives_connection(con):
     # The Result from a prepared statement shares the DuckDBHandle, so it stays
     # usable (incl. Arrow export) after the Connection is dropped.
-    con = ducky.connect()
     con.execute("CREATE TABLE t AS SELECT range AS i FROM range(3)")
     result = con.prepare("SELECT i FROM t ORDER BY i").execute()
     con.close()
     assert result.fetchall() == [(0,), (1,), (2,)]
 
 
-def test_dataframe_path_on_prepared_result():
-    con = ducky.connect()
+def test_dataframe_path_on_prepared_result(con):
     stmt = con.prepare("SELECT ? AS a, ? AS b")
     df = stmt.execute([1, 2]).df()
     assert df.to_dict("list") == {"a": [1], "b": [2]}

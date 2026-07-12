@@ -76,15 +76,13 @@ class ErrorOnUpdate:
 # ── tests ─────────────────────────────────────────────────────────────────────
 
 
-def test_sum_no_group_by():
-    con = ducky.connect()
+def test_sum_no_group_by(con):
     con.create_aggregate_function("my_sum", SumAgg, parameters=["DOUBLE"], return_type="DOUBLE")
     result: float = con.sql("SELECT my_sum(v) FROM (VALUES (1.0), (2.0), (3.0)) t(v)").fetchitem()
     assert abs(result - 6.0) < 1e-9
 
 
-def test_sum_group_by():
-    con = ducky.connect()
+def test_sum_group_by(con):
     con.create_aggregate_function("grp_sum", SumAgg, parameters=["DOUBLE"], return_type="DOUBLE")
     rows = con.sql(
         "SELECT g, grp_sum(v) FROM (VALUES (1, 10.0), (1, 20.0), (2, 5.0), (2, 5.0)) t(g, v) "
@@ -95,8 +93,7 @@ def test_sum_group_by():
     assert abs(rows[1][1] - 10.0) < 1e-9
 
 
-def test_rmse():
-    con = ducky.connect()
+def test_rmse(con):
     con.create_aggregate_function(
         "rmse", RMSEAgg, parameters=["DOUBLE", "DOUBLE"], return_type="DOUBLE"
     )
@@ -108,8 +105,7 @@ def test_rmse():
     assert abs(result - expected) < 1e-9
 
 
-def test_combine_optional():
-    con = ducky.connect()
+def test_combine_optional(con):
     con.create_aggregate_function(
         "no_comb_sum", NoCombineSum, parameters=["DOUBLE"], return_type="DOUBLE"
     )
@@ -117,8 +113,7 @@ def test_combine_optional():
     assert abs(result - 10.0) < 1e-9
 
 
-def test_finalize_returns_none_produces_null():
-    con = ducky.connect()
+def test_finalize_returns_none_produces_null(con):
     con.create_aggregate_function(
         "null_agg", NullFinalize, parameters=["DOUBLE"], return_type="DOUBLE"
     )
@@ -126,8 +121,7 @@ def test_finalize_returns_none_produces_null():
     assert result is None
 
 
-def test_user_exception_propagates():
-    con = ducky.connect()
+def test_user_exception_propagates(con):
     con.create_aggregate_function(
         "err_agg", ErrorOnUpdate, parameters=["DOUBLE"], return_type="DOUBLE"
     )
@@ -135,16 +129,15 @@ def test_user_exception_propagates():
         con.sql("SELECT err_agg(v) FROM (VALUES (1.0)) t(v)").fetchone()
 
 
-def test_multi_chunk_boundary():
+def test_multi_chunk_boundary(con):
     n = 5000
-    con = ducky.connect()
     con.create_aggregate_function("big_sum", SumAgg, parameters=["DOUBLE"], return_type="DOUBLE")
     result: float = con.sql(f"SELECT big_sum(CAST(i AS DOUBLE)) FROM range({n}) t(i)").fetchitem()
     expected = n * (n - 1) / 2.0
     assert abs(result - expected) < 1e-6
 
 
-def test_integer_return_type():
+def test_integer_return_type(con):
     class IntSum:
         def __init__(self):
             self.total = 0
@@ -155,7 +148,6 @@ def test_integer_return_type():
         def finalize(self) -> int:
             return self.total
 
-    con = ducky.connect()
     con.create_aggregate_function("int_sum", IntSum, parameters=["BIGINT"], return_type="BIGINT")
     result: int = con.sql("SELECT int_sum(i) FROM (VALUES (1), (2), (3)) t(i)").fetchitem()
     assert result == 6

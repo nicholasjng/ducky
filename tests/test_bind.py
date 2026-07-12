@@ -68,20 +68,18 @@ def test_bind_hugeint_negative():
     assert got == big
 
 
-def test_bind_hugeint_overflow():
-    con = ducky.connect()
+def test_bind_hugeint_overflow(con):
     with pytest.raises(ducky.Error, match="overflows"):
         con.execute("SELECT ?", [2**200])
 
 
-def test_bind_hugeint_boundary():
+def test_bind_hugeint_boundary(con):
     # -2**127 fits a signed int128 even though bit_length is 128.
     assert roundtrip(-(2**127), cast="HUGEINT") == -(2**127)
     assert roundtrip(2**127 - 1, cast="HUGEINT") == 2**127 - 1
     # 2**128 - 1 fits a UHUGEINT.
     assert roundtrip(2**128 - 1, cast="UHUGEINT") == 2**128 - 1
     # Just past UHUGEINT must trigger our binding-side overflow.
-    con = ducky.connect()
     with pytest.raises(ducky.Error, match="overflows"):
         con.execute("SELECT ?", [2**128])
     # And the negative side, just past INT128_MIN.
@@ -99,8 +97,7 @@ def test_bind_numpy_scalar_float():
     assert roundtrip(np.float64(2.25)) == 2.25
 
 
-def test_bind_named_parameters():
-    con = ducky.connect()
+def test_bind_named_parameters(con):
     got = con.execute(
         "SELECT $a + $b, $a * $b",
         {"a": 3, "b": 4},
@@ -108,14 +105,12 @@ def test_bind_named_parameters():
     assert got == (7, 12)
 
 
-def test_bind_named_unknown_key():
-    con = ducky.connect()
+def test_bind_named_unknown_key(con):
     with pytest.raises(ducky.Error, match="unknown named parameter"):
         con.execute("SELECT $a", {"missing": 1})
 
 
-def test_bind_unsupported_type():
-    con = ducky.connect()
+def test_bind_unsupported_type(con):
     with pytest.raises(ducky.Error, match="unsupported parameter type"):
         con.execute("SELECT ?", [object()])
 
@@ -126,8 +121,7 @@ def test_bind_unsupported_type():
 # statement on every execute.
 
 
-def test_bind_int_widths_roundtrip():
-    con = ducky.connect()
+def test_bind_int_widths_roundtrip(con):
     con.execute(
         "CREATE TABLE widths (t TINYINT, s SMALLINT, i INTEGER, b BIGINT, "
         "ut UTINYINT, us USMALLINT, ui UINTEGER, ub UBIGINT, h HUGEINT)"
@@ -157,22 +151,19 @@ def test_bind_small_int_into_hugeint_param():
     assert roundtrip(5, "HUGEINT") == 5
 
 
-def test_bind_int_overflowing_narrow_column_errors():
-    con = ducky.connect()
+def test_bind_int_overflowing_narrow_column_errors(con):
     con.execute("CREATE TABLE narrow (t TINYINT)")
     with pytest.raises(ducky.Error):
         con.execute("INSERT INTO narrow VALUES (?)", [300])
 
 
-def test_bind_negative_into_unsigned_column_errors():
-    con = ducky.connect()
+def test_bind_negative_into_unsigned_column_errors(con):
     con.execute("CREATE TABLE u (x UINTEGER)")
     with pytest.raises(ducky.Error):
         con.execute("INSERT INTO u VALUES (?)", [-1])
 
 
-def test_executemany_typed_widths_roundtrip():
-    con = ducky.connect()
+def test_executemany_typed_widths_roundtrip(con):
     con.execute("CREATE TABLE typed (a INT, b BIGINT, c DOUBLE, f FLOAT)")
     rows = [(i, i * 2, float(i), float(i)) for i in range(-50, 50)]
     stmt = con.prepare("INSERT INTO typed VALUES (?, ?, ?, ?)")

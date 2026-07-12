@@ -10,8 +10,7 @@ import pytest
 import ducky
 
 
-def test_repeated_execute_returns_fresh_results():
-    con = ducky.connect()
+def test_repeated_execute_returns_fresh_results(con):
     con.execute("CREATE TABLE t (a INT)")
     con.execute("INSERT INTO t VALUES (1), (2)")
     for expected in (2, 3, 4):
@@ -19,16 +18,14 @@ def test_repeated_execute_returns_fresh_results():
         con.execute("INSERT INTO t VALUES (99)")
 
 
-def test_parameters_do_not_leak_between_calls():
-    con = ducky.connect()
+def test_parameters_do_not_leak_between_calls(con):
     assert con.execute("SELECT ?::INT", [1]).fetchone() == (1,)
     # A fresh prepare starts unbound; the cached statement must behave the same.
     with pytest.raises(ducky.Error, match="[Pp]arameter"):
         con.execute("SELECT ?::INT")
 
 
-def test_rebind_after_schema_change():
-    con = ducky.connect()
+def test_rebind_after_schema_change(con):
     con.execute("CREATE TABLE t (a INT)")
     con.execute("INSERT INTO t VALUES (1)")
     assert con.execute("SELECT * FROM t").fetchall() == [(1,)]
@@ -42,10 +39,9 @@ def test_rebind_after_schema_change():
     assert result.fetchall() == [("x", 2)]
 
 
-def test_set_invalidates_settings_dependent_plans():
+def test_set_invalidates_settings_dependent_plans(con):
     # The optimizer folds current_setting() into the plan, and DuckDB does not
     # rebind prepared statements on SET — so SET must flush the cache.
-    con = ducky.connect()
     query = "SELECT current_setting('enable_profiling')"
     assert con.execute(query).fetchitem() is None
     con.execute("SET enable_profiling='no_output'")
@@ -54,8 +50,7 @@ def test_set_invalidates_settings_dependent_plans():
     assert con.execute(query).fetchitem() is None
 
 
-def test_error_after_table_dropped():
-    con = ducky.connect()
+def test_error_after_table_dropped(con):
     con.execute("CREATE TABLE t (a INT)")
     con.execute("SELECT * FROM t")
     con.execute("DROP TABLE t")
@@ -63,8 +58,7 @@ def test_error_after_table_dropped():
         con.execute("SELECT * FROM t")
 
 
-def test_failed_execution_does_not_poison_the_cache():
-    con = ducky.connect()
+def test_failed_execution_does_not_poison_the_cache(con):
     con.execute("CREATE TABLE t (a INT PRIMARY KEY)")
     con.execute("INSERT INTO t VALUES (?)", [1])
     with pytest.raises(ducky.Error, match="[Cc]onstraint"):
@@ -73,8 +67,7 @@ def test_failed_execution_does_not_poison_the_cache():
     assert con.execute("SELECT count(*) FROM t").fetchitem() == 2
 
 
-def test_streaming_and_materialized_share_cached_statement():
-    con = ducky.connect()
+def test_streaming_and_materialized_share_cached_statement(con):
     con.execute("CREATE TABLE t AS SELECT range AS a FROM range(10000)")
     query = "SELECT * FROM t"
     assert len(con.sql(query).fetchall()) == 10000
@@ -83,16 +76,14 @@ def test_streaming_and_materialized_share_cached_statement():
     assert len(con.sql(query).fetchall()) == 10000
 
 
-def test_correct_past_lru_capacity():
-    con = ducky.connect()
+def test_correct_past_lru_capacity(con):
     # More distinct queries than the cache holds; eviction must be invisible.
     for i in range(300):
         assert con.execute(f"SELECT {i}").fetchone() == (i,)
     assert con.execute("SELECT 0").fetchone() == (0,)
 
 
-def test_close_with_populated_cache():
-    con = ducky.connect()
+def test_close_with_populated_cache(con):
     for i in range(10):
         con.execute(f"SELECT {i}")
     con.close()

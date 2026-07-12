@@ -9,20 +9,17 @@ import pytest
 import ducky
 
 
-async def test_aexecute_basic():
-    con = ducky.connect()
+async def test_aexecute_basic(con):
     res = await con.aexecute("SELECT count(*) FROM range(1000)")
     assert res.fetchitem() == 1000
 
 
-async def test_aexecute_with_params():
-    con = ducky.connect()
+async def test_aexecute_with_params(con):
     res = await con.aexecute("SELECT ? + ?", [40, 2])
     assert res.fetchitem() == 42
 
 
-async def test_asql_streaming_spans_chunks():
-    con = ducky.connect()
+async def test_asql_streaming_spans_chunks(con):
     res = await con.asql("SELECT * FROM range(50_000) t(i)", streaming=True)
     seen = chunks = 0
     while (chunk := res.fetch_chunk()) is not None:
@@ -32,8 +29,7 @@ async def test_asql_streaming_spans_chunks():
     assert chunks > 1, "expected the streaming result to span multiple chunks"
 
 
-async def test_aexecute_error_propagates():
-    con = ducky.connect()
+async def test_aexecute_error_propagates(con):
     with pytest.raises(ducky.Error, match="no_such_table"):
         await con.aexecute("SELECT * FROM no_such_table")
 

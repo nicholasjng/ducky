@@ -38,8 +38,7 @@ def test_progress_bar_runs_query_and_finalizes():
     assert rendered.endswith("\n")
 
 
-def test_progress_bar_restores_settings():
-    con = ducky.connect()
+def test_progress_bar_restores_settings(con):
 
     def setting(name: str) -> bool:
         return bool(con.execute(f"SELECT current_setting('{name}')").fetchitem())
@@ -63,8 +62,7 @@ def test_progress_bar_does_not_print_duckdb_native_bar(capfd):
     assert captured.out == ""
 
 
-def test_progress_bar_propagates_query_errors():
-    con = ducky.connect()
+def test_progress_bar_propagates_query_errors(con):
     with pytest.raises(ducky.Error), ducky.progress_bar(con, out=io.StringIO(), use_tqdm=False):
         con.execute("SELECT * FROM no_such_table").fetchall()
     # Settings are still restored even though the body raised.

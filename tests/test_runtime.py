@@ -80,8 +80,7 @@ def test_config_options_returns_known_keys():
         assert known in names, f"expected {known!r} in config_options()"
 
 
-def test_progress_on_idle_connection():
-    con = ducky.connect()
+def test_progress_on_idle_connection(con):
     # No query in flight: DuckDB reports percentage = -1 sentinel.
     pct, rows, total = con.progress()
     assert pct == pytest.approx(-1.0) or pct == 0.0
@@ -176,12 +175,11 @@ def test_keyboard_interrupt_lands_mid_query():
     assert con.execute("SELECT 1").fetchone() == (1,)
 
 
-def test_streaming_result_iterates_all_chunks():
+def test_streaming_result_iterates_all_chunks(con):
     # Smoke test: streaming=True returns a Result whose chunks are pulled
     # lazily via duckdb_fetch_chunk. We can't directly observe peak memory in
     # a unit test, but we can verify the streaming result iterates correctly
     # and yields every row.
-    con = ducky.connect()
     n = 50_000  # several chunks at STANDARD_VECTOR_SIZE=2048
     res = con.execute("SELECT * FROM range(?) t(i)", [n], streaming=True).current_result
     chunks = 0
@@ -198,8 +196,7 @@ def test_streaming_result_iterates_all_chunks():
     assert res.fetch_chunk() is None
 
 
-def test_streaming_via_prepared_statement():
-    con = ducky.connect()
+def test_streaming_via_prepared_statement(con):
     with con.prepare("SELECT * FROM range(?) t(i)") as stmt:
         res = stmt.execute([20_000], streaming=True)
         rows = res.fetchall()
@@ -237,15 +234,13 @@ def test_progress_during_long_query():
         assert total >= 0
 
 
-def test_profiling_info_none_when_disabled():
+def test_profiling_info_none_when_disabled(con):
     # Without `SET enable_profiling=...`, DuckDB returns no profiling tree.
-    con = ducky.connect()
     con.execute("SELECT 1 + 2").fetchall()
     assert con.get_profiling_info() is None
 
 
-def test_profiling_info_walks_tree():
-    con = ducky.connect()
+def test_profiling_info_walks_tree(con):
     con.execute("SET enable_profiling='no_output'")
     con.execute("SELECT i, i * 2 FROM range(1000) t(i) WHERE i % 3 = 0").fetchall()
 
@@ -274,10 +269,9 @@ def test_profiling_info_walks_tree():
     assert timing_seen, "expected at least one node to expose a timing metric"
 
 
-def test_profiling_info_detailed_mode_extra_metrics():
+def test_profiling_info_detailed_mode_extra_metrics(con):
     # detailed mode unlocks additional per-operator counters (cardinality,
     # cpu_time, etc.); verify the dict grows accordingly.
-    con = ducky.connect()
     con.execute("SET enable_profiling='no_output'")
     con.execute("SET profiling_mode='detailed'")
     con.execute("SELECT count(*) FROM range(10_000) t(i)").fetchall()
@@ -297,8 +291,7 @@ def test_profiling_info_detailed_mode_extra_metrics():
     assert "intermediate_rows" in keys
 
 
-def test_profiling_info_after_close_raises():
-    con = ducky.connect()
+def test_profiling_info_after_close_raises(con):
     con.close()
     with pytest.raises(ducky.Error, match="closed"):
         con.get_profiling_info()

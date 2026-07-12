@@ -12,8 +12,6 @@ from __future__ import annotations
 
 import pytest
 
-import ducky
-
 pytest.importorskip("pyarrow")
 
 # Expressions over `range(n) s(i)`, one per fast-path-eligible type. Each must
@@ -43,10 +41,9 @@ _FAST_EXPRS = {
 _N = 20_000
 
 
-def test_arrow_batches_streams_per_chunk():
+def test_arrow_batches_streams_per_chunk(con):
     import pyarrow as pa
 
-    con = ducky.connect()
     con.execute("CREATE TABLE t AS SELECT range AS a, range * 2 AS b FROM range(5000)")
     # Result.arrow_batches() yields a lazy RecordBatchReader, one batch per chunk.
     reader = con.sql("SELECT * FROM t").arrow_batches()
@@ -61,10 +58,9 @@ def test_arrow_batches_streams_per_chunk():
     assert rows == 5000
 
 
-def test_arrow_reader_born_as_arrow():
+def test_arrow_reader_born_as_arrow(con):
     import pyarrow as pa
 
-    con = ducky.connect()
     con.execute("CREATE TABLE t AS SELECT range AS a, range * 2 AS b FROM range(20000)")
     # Connection.arrow_reader(query): DuckDB's collector assembles batches during execution.
     reader = con.arrow_reader("SELECT * FROM t", rows_per_batch=2048)
@@ -79,10 +75,9 @@ def test_arrow_reader_born_as_arrow():
     assert sum(b.num_rows for b in again) == 20000
 
 
-def test_arrow_query_overload_born_as_arrow():
+def test_arrow_query_overload_born_as_arrow(con):
     import pyarrow as pa
 
-    con = ducky.connect()
     con.execute("CREATE TABLE t AS SELECT range AS a, range * 2 AS b FROM range(20000)")
     # arrow(query) collects; arrow() (no arg) converts the current result. Both equal.
     collected = con.arrow("SELECT * FROM t")
@@ -92,8 +87,7 @@ def test_arrow_query_overload_born_as_arrow():
     assert collected.num_rows == 20000
 
 
-def test_arrow_collected_parameter_binding():
-    con = ducky.connect()
+def test_arrow_collected_parameter_binding(con):
     con.execute("CREATE TABLE t AS SELECT range AS a, range * 2 AS b FROM range(20000)")
     # Positional params on both born-as-Arrow entry points.
     table = con.arrow("SELECT * FROM t WHERE a >= ? AND a < ?", [100, 200])
@@ -109,8 +103,7 @@ def test_arrow_collected_parameter_binding():
 
 
 @pytest.mark.parametrize("expr", _FAST_EXPRS.values(), ids=list(_FAST_EXPRS))
-def test_fast_path_equals_fallback(expr: str) -> None:
-    con = ducky.connect()
+def test_fast_path_equals_fallback(expr: str, con) -> None:
     # All-eligible result -> combined fast path (a single chunk).
     fast = con.execute(f"SELECT {expr} AS v FROM range({_N}) s(i)").arrow()
     # A VARCHAR column makes the result ineligible -> per-chunk fallback.
@@ -122,9 +115,8 @@ def test_fast_path_equals_fallback(expr: str) -> None:
     assert fast.column("v").combine_chunks().equals(fallback.column("v").combine_chunks())
 
 
-def test_fast_path_nulls_across_chunks() -> None:
+def test_fast_path_nulls_across_chunks(con) -> None:
     # Nulls scattered across chunk boundaries must land in the right bitmap bits.
-    con = ducky.connect()
     n = 50_000
     q = f"SELECT CASE WHEN i % 11 = 0 THEN NULL ELSE i END::INT AS v FROM range({n}) s(i)"
     tbl = con.execute(q).arrow()
@@ -133,8 +125,7 @@ def test_fast_path_nulls_across_chunks() -> None:
     assert tbl.column("v").to_pylist() == [None if i % 11 == 0 else i for i in range(n)]
 
 
-def test_fast_path_multi_column_combined() -> None:
-    con = ducky.connect()
+def test_fast_path_multi_column_combined(con) -> None:
     tbl = con.execute(
         "SELECT i::INT a, (i * 2)::BIGINT b, (i * 1.5)::DOUBLE c FROM range(10000) s(i)"
     ).arrow()
@@ -143,17 +134,15 @@ def test_fast_path_multi_column_combined() -> None:
     assert tbl.column("c").to_pylist()[:3] == [0.0, 1.5, 3.0]
 
 
-def test_fallback_handles_strings_and_nested() -> None:
+def test_fallback_handles_strings_and_nested(con) -> None:
     # Ineligible types still export correctly via the per-chunk fallback.
-    con = ducky.connect()
     tbl = con.execute("SELECT i::VARCHAR s, [i, i + 1] AS lst FROM range(5000) s(i)").arrow()
     assert tbl.num_rows == 5000
     assert tbl.column("s").to_pylist()[:3] == ["0", "1", "2"]
     assert tbl.column("lst").to_pylist()[0] == [0, 1]
 
 
-def test_empty_result_emits_no_rows() -> None:
-    con = ducky.connect()
+def test_empty_result_emits_no_rows(con) -> None:
     tbl = con.execute("SELECT i::INT v FROM range(10) s(i) WHERE i < 0").arrow()
     assert tbl.num_rows == 0
     assert tbl.column_names == ["v"]

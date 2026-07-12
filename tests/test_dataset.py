@@ -69,6 +69,28 @@ def test_standardize_requires_train_fold(csv_path):
         )
 
 
+def test_standardize_empty_train_fold_rejected(csv_path):
+    # Fold named "train" exists, but the fraction rounds to a deterministically
+    # empty bucket range — must error, not silently standardize against NULL stats.
+    with pytest.raises(ValueError, match="empty"):
+        ducky.dataset(
+            csv_path,
+            columns={"x": ducky.feature("x", standardize=True)},
+            target=ducky.target("y", dtype="i64"),
+            split=ducky.split({"train": 0.0001, "val": 0.9999}),
+        )
+
+
+def test_reserved_bucket_alias_rejected(csv_path):
+    # "_bucket" is ducky's internal bookkeeping column; a same-named field
+    # must be rejected up front, not surface as a confusing internal KeyError.
+    with pytest.raises(ValueError, match="_bucket"):
+        ducky.dataset(
+            csv_path,
+            fields={"_bucket": ducky.vector("x"), "y": ducky.vector("y", dtype="i64")},
+        )
+
+
 def test_split_fractions_validate():
     with pytest.raises(ValueError, match="sum to 1"):
         ducky.split({"train": 0.5, "val": 0.3})

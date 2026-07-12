@@ -4,8 +4,7 @@ import pytest
 import ducky
 
 
-def test_positional_single_arg():
-    con = ducky.connect()
+def test_positional_single_arg(con):
     con.create_function(
         "doublef",
         lambda x: x * 2.0,
@@ -16,8 +15,7 @@ def test_positional_single_arg():
     np.testing.assert_array_equal(arr, [0.0, 2.0, 4.0, 6.0])
 
 
-def test_positional_multi_arg():
-    con = ducky.connect()
+def test_positional_multi_arg(con):
 
     def add3(a, b, c):
         return a.astype(np.int64) + b.astype(np.int64) + c.astype(np.int64)
@@ -35,8 +33,7 @@ def test_positional_multi_arg():
     np.testing.assert_array_equal(rows["v"], [0, 6, 12, 18])
 
 
-def test_dict_style():
-    con = ducky.connect()
+def test_dict_style(con):
 
     def score(args):
         return np.sqrt(args["x"] ** 2 + args["y"] ** 2)
@@ -51,9 +48,8 @@ def test_dict_style():
     assert v == 5.0
 
 
-def test_dtype_round_trip():
+def test_dtype_round_trip(con):
     # FLOAT in, FLOAT out — verify the dtype check is strict.
-    con = ducky.connect()
     con.create_function(
         "neg",
         lambda x: -x,
@@ -64,8 +60,7 @@ def test_dtype_round_trip():
     assert v == pytest.approx(-1.5)
 
 
-def test_wrong_return_dtype_errors():
-    con = ducky.connect()
+def test_wrong_return_dtype_errors(con):
     con.create_function(
         "bad",
         lambda x: x.astype(np.int32),  # declared DOUBLE
@@ -76,8 +71,7 @@ def test_wrong_return_dtype_errors():
         con.sql("SELECT bad(CAST(1.0 AS DOUBLE))").fetchall()
 
 
-def test_wrong_return_shape_errors():
-    con = ducky.connect()
+def test_wrong_return_shape_errors(con):
     con.create_function(
         "shrink",
         lambda x: x[:1],
@@ -88,8 +82,7 @@ def test_wrong_return_shape_errors():
         con.sql("SELECT shrink(CAST(i AS DOUBLE)) FROM range(3) t(i)").fetchall()
 
 
-def test_user_exception_propagates():
-    con = ducky.connect()
+def test_user_exception_propagates(con):
 
     def boom(x):
         raise ValueError("nope")
@@ -104,20 +97,17 @@ def test_user_exception_propagates():
         con.sql("SELECT boom(CAST(1.0 AS DOUBLE))").fetchall()
 
 
-def test_unknown_type_string():
-    con = ducky.connect()
+def test_unknown_type_string(con):
     with pytest.raises(ducky.Error, match="unknown UDF type"):
         con.create_function("f", lambda x: x, parameters=["WAT"], return_type="DOUBLE")
 
 
-def test_no_parameters_errors():
-    con = ducky.connect()
+def test_no_parameters_errors(con):
     with pytest.raises(ducky.Error, match="at least one parameter"):
         con.create_function("f", lambda: None, parameters=[], return_type="DOUBLE")
 
 
-def test_nullable_output_uint8_mask():
-    con = ducky.connect()
+def test_nullable_output_uint8_mask(con):
 
     def half(x):
         values = x // 2
@@ -134,8 +124,7 @@ def test_nullable_output_uint8_mask():
     assert rows == [(0, 0), (1, None), (2, 1), (3, None), (4, 2)]
 
 
-def test_nullable_output_bool_mask():
-    con = ducky.connect()
+def test_nullable_output_bool_mask(con):
     con.create_function(
         "maybe",
         lambda x: (x, (x > 0).astype(np.bool_)),
@@ -146,8 +135,7 @@ def test_nullable_output_bool_mask():
     assert rows == [(None,), (None,), (1,)]
 
 
-def test_bad_mask_shape_errors():
-    con = ducky.connect()
+def test_bad_mask_shape_errors(con):
     con.create_function(
         "bad",
         lambda x: (x, np.ones(1, dtype=np.uint8)),
@@ -158,8 +146,7 @@ def test_bad_mask_shape_errors():
         con.sql("SELECT bad(i) FROM range(5) t(i)").fetchall()
 
 
-def test_bad_mask_dtype_errors():
-    con = ducky.connect()
+def test_bad_mask_dtype_errors(con):
     con.create_function(
         "bad",
         lambda x: (x, x.astype(np.int32)),
@@ -170,8 +157,7 @@ def test_bad_mask_dtype_errors():
         con.sql("SELECT bad(i) FROM range(3) t(i)").fetchall()
 
 
-def test_bad_tuple_length_errors():
-    con = ducky.connect()
+def test_bad_tuple_length_errors(con):
     con.create_function(
         "bad",
         lambda x: (x, x, x),
@@ -182,8 +168,7 @@ def test_bad_tuple_length_errors():
         con.sql("SELECT bad(i) FROM range(3) t(i)").fetchall()
 
 
-def test_infer_types_from_annotations():
-    con = ducky.connect()
+def test_infer_types_from_annotations(con):
 
     def add(x: int, y: float) -> float:
         return x + y
@@ -193,8 +178,7 @@ def test_infer_types_from_annotations():
     assert v == pytest.approx(3.5)
 
 
-def test_infer_only_return_type():
-    con = ducky.connect()
+def test_infer_only_return_type(con):
 
     def neg(x: float) -> float:
         return -x
@@ -205,8 +189,7 @@ def test_infer_only_return_type():
     assert v == -2.0
 
 
-def test_infer_only_parameters():
-    con = ducky.connect()
+def test_infer_only_parameters(con):
 
     def neg(x: float) -> float:
         return -x
@@ -217,8 +200,7 @@ def test_infer_only_parameters():
     assert v == -2.0
 
 
-def test_infer_bool():
-    con = ducky.connect()
+def test_infer_bool(con):
 
     def isodd(x: int) -> bool:
         return (x % 2 == 1).astype(np.bool_)  # ty: ignore[unresolved-attribute]
@@ -228,8 +210,7 @@ def test_infer_bool():
     assert rows == [(False,), (True,), (False,), (True,)]
 
 
-def test_missing_annotation_errors():
-    con = ducky.connect()
+def test_missing_annotation_errors(con):
 
     def f(x, y: float) -> float:
         return y
@@ -238,8 +219,7 @@ def test_missing_annotation_errors():
         con.create_function("f", f)
 
 
-def test_missing_return_annotation_errors():
-    con = ducky.connect()
+def test_missing_return_annotation_errors(con):
 
     def f(x: float):
         return x
@@ -248,8 +228,7 @@ def test_missing_return_annotation_errors():
         con.create_function("f", f)
 
 
-def test_unsupported_annotation_errors():
-    con = ducky.connect()
+def test_unsupported_annotation_errors(con):
 
     def f(x: str) -> float:
         return 0.0
@@ -258,8 +237,7 @@ def test_unsupported_annotation_errors():
         con.create_function("f", f)
 
 
-def test_varargs_basic():
-    con = ducky.connect()
+def test_varargs_basic(con):
 
     def add_all(*cols):
         return sum(c.astype(np.int64) for c in cols)
@@ -273,8 +251,7 @@ def test_varargs_basic():
     assert (v2, v4) == (3, 10)
 
 
-def test_varargs_zero_args():
-    con = ducky.connect()
+def test_varargs_zero_args(con):
     con.create_function(
         "vempty", lambda *xs: np.zeros(1, dtype=np.int64), varargs="BIGINT", return_type="BIGINT"
     )
@@ -282,8 +259,7 @@ def test_varargs_zero_args():
     assert v == 0
 
 
-def test_varargs_conflicts_with_parameters():
-    con = ducky.connect()
+def test_varargs_conflicts_with_parameters(con):
     with pytest.raises(ducky.Error, match="cannot set both"):
         con.create_function(
             "bad",
@@ -294,10 +270,9 @@ def test_varargs_conflicts_with_parameters():
         )
 
 
-def test_works_across_chunk_boundaries():
+def test_works_across_chunk_boundaries(con):
     # > STANDARD_VECTOR_SIZE rows forces multiple chunks.
     n = 5000
-    con = ducky.connect()
     con.create_function(
         "sq",
         lambda x: x * x,
@@ -311,9 +286,8 @@ def test_works_across_chunk_boundaries():
 # ── volatile / special_handling / init=state ─────────────────────────────────
 
 
-def test_volatile_function_runs():
+def test_volatile_function_runs(con):
     # Smoke test: volatile=True registers and a query against the function runs.
-    con = ducky.connect()
     con.create_function(
         "vmul",
         lambda x: x * 2.0,
@@ -325,11 +299,10 @@ def test_volatile_function_runs():
     assert v == 6.0
 
 
-def test_volatile_not_constant_folded():
+def test_volatile_not_constant_folded(con):
     # Two calls with the same literal argument should both invoke the UDF when
     # marked volatile — without volatile the optimizer is free to evaluate it
     # once and reuse the result (common subexpression elimination).
-    con = ducky.connect()
     calls = [0]
 
     def stamp(x):
@@ -349,10 +322,9 @@ def test_volatile_not_constant_folded():
     assert a != b  # would be equal if the optimizer had folded the two calls
 
 
-def test_special_handling_observes_null_input():
+def test_special_handling_observes_null_input(con):
     # With special_handling=True, the UDF sees the input mask and can produce
     # a non-NULL output even where the input is NULL — here, coalesce to 0.
-    con = ducky.connect()
     con.execute("CREATE TABLE t (x BIGINT)")
     con.execute("INSERT INTO t VALUES (1), (NULL), (3)")
 
@@ -378,9 +350,8 @@ def test_special_handling_observes_null_input():
     assert any((m == 0).any() for m in seen_masks)
 
 
-def test_special_handling_all_valid_mask():
+def test_special_handling_all_valid_mask(con):
     # With no NULL inputs, the mask passed in must be all-1.
-    con = ducky.connect()
     seen = []
 
     def echo(x):
@@ -399,10 +370,9 @@ def test_special_handling_all_valid_mask():
     assert seen and (seen[0] == 1).all()
 
 
-def test_special_handling_dict_style():
+def test_special_handling_dict_style(con):
     # Dict-style input under special_handling: each value in the kwargs dict is
     # a (values, mask) tuple keyed by the parameter name.
-    con = ducky.connect()
     con.execute("CREATE TABLE t (a BIGINT, b BIGINT)")
     con.execute("INSERT INTO t VALUES (1, 10), (NULL, 20), (3, NULL)")
 
@@ -423,10 +393,9 @@ def test_special_handling_dict_style():
     assert rows == [(11,), (3,), (20,)]
 
 
-def test_init_state_threads_through_call():
+def test_init_state_threads_through_call(con):
     # The init= callable runs once per worker thread; its return value is
     # passed as the first positional arg of the UDF on every chunk.
-    con = ducky.connect()
 
     def factory():
         return {"calls": 0}
@@ -474,9 +443,8 @@ def test_init_state_persists_across_chunks():
     assert arr.max() > 1
 
 
-def test_init_state_dict_style():
+def test_init_state_dict_style(con):
     # init= + dict-style parameters: fn is called as fn(state, kwargs).
-    con = ducky.connect()
 
     def factory():
         return {"mult": 10}
@@ -495,9 +463,8 @@ def test_init_state_dict_style():
     assert rows == [(0,), (10,), (20,)]
 
 
-def test_init_state_with_varargs():
+def test_init_state_with_varargs(con):
     # init= + varargs: fn(state, *cols).
-    con = ducky.connect()
 
     def factory():
         return 100
@@ -516,9 +483,8 @@ def test_init_state_with_varargs():
     assert v == 103
 
 
-def test_init_error_propagates():
+def test_init_error_propagates(con):
     # A failure in init= must surface as a query error, not a silent crash.
-    con = ducky.connect()
 
     def bad_factory():
         raise RuntimeError("init failure")
@@ -537,8 +503,7 @@ def test_init_error_propagates():
         con.sql("SELECT use_state(i) FROM range(3) t(i)").fetchall()
 
 
-def test_init_not_callable_rejected():
-    con = ducky.connect()
+def test_init_not_callable_rejected(con):
     with pytest.raises(ducky.Error, match="init= must be a callable"):
         con.create_function(
             "f",
@@ -549,9 +514,8 @@ def test_init_not_callable_rejected():
         )
 
 
-def test_special_handling_state_and_mask_combine():
+def test_special_handling_state_and_mask_combine(con):
     # All three features together: a stateful UDF that observes NULL inputs.
-    con = ducky.connect()
     con.execute("CREATE TABLE t (x BIGINT)")
     con.execute("INSERT INTO t VALUES (1), (NULL), (3), (NULL), (5)")
 

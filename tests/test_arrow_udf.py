@@ -12,15 +12,13 @@ import ducky
 # ── Default calling convention: positional pa.Array args ──────────────────
 
 
-def test_varchar_in_out():
-    con = ducky.connect()
+def test_varchar_in_out(con):
     con.create_arrow_function("up", pc.utf8_upper, parameters=["VARCHAR"], return_type="VARCHAR")
     rows = con.sql("SELECT up(x) FROM (VALUES ('hi'), ('there'), (NULL)) t(x)").fetchall()
     assert rows == [("HI",), ("THERE",), (None,)]
 
 
-def test_multi_arg_positional():
-    con = ducky.connect()
+def test_multi_arg_positional(con):
 
     def concat(a, b):
         return pc.binary_join_element_wise(a, b, "-")
@@ -32,8 +30,7 @@ def test_multi_arg_positional():
     assert v == "foo-bar"
 
 
-def test_list_output():
-    con = ducky.connect()
+def test_list_output(con):
 
     def to_pair(x):
         return pa.ListArray.from_arrays(
@@ -49,8 +46,7 @@ def test_list_output():
     assert rows == [([0, 1],), ([1, 2],), ([2, 3],)]
 
 
-def test_struct_output():
-    con = ducky.connect()
+def test_struct_output(con):
 
     def split(x):
         lo = pc.bit_wise_and(x, pa.scalar(0xFFFF, type=pa.int64()))
@@ -64,8 +60,7 @@ def test_struct_output():
     assert v == {"lo": 70000 & 0xFFFF, "hi": 70000 >> 16}
 
 
-def test_decimal_round_trip():
-    con = ducky.connect()
+def test_decimal_round_trip(con):
 
     def add_tax(x):
         return pc.multiply(x, pa.scalar(Decimal("1.10"), type=pa.decimal128(5, 2)))
@@ -77,9 +72,8 @@ def test_decimal_round_trip():
     assert v == Decimal("11.0000")
 
 
-def test_chunk_boundary():
+def test_chunk_boundary(con):
     n = 5000
-    con = ducky.connect()
     con.create_arrow_function(
         "len_py", pc.utf8_length, parameters=["VARCHAR"], return_type="INTEGER"
     )
@@ -91,8 +85,7 @@ def test_chunk_boundary():
 # ── Dict-style calling convention ─────────────────────────────────────────
 
 
-def test_dict_named_params():
-    con = ducky.connect()
+def test_dict_named_params(con):
 
     def concat(cols):
         assert list(cols.keys()) == ["a", "b"]
@@ -108,8 +101,7 @@ def test_dict_named_params():
 # ── record_batch=True calling convention ──────────────────────────────────
 
 
-def test_record_batch_mode():
-    con = ducky.connect()
+def test_record_batch_mode(con):
 
     def upper(rb):
         assert isinstance(rb, pa.RecordBatch)
@@ -122,8 +114,7 @@ def test_record_batch_mode():
     assert rows == [("HI",), (None,)]
 
 
-def test_record_batch_schema_names_with_dict_params():
-    con = ducky.connect()
+def test_record_batch_schema_names_with_dict_params(con):
 
     def concat(rb):
         assert rb.schema.names == ["a", "b"]
@@ -143,22 +134,19 @@ def test_record_batch_schema_names_with_dict_params():
 # ── Error cases ────────────────────────────────────────────────────────────
 
 
-def test_empty_parameters_errors():
-    con = ducky.connect()
+def test_empty_parameters_errors(con):
     with pytest.raises(ducky.Error, match="at least one parameter"):
         con.create_arrow_function("f", lambda x: x, parameters=[], return_type="VARCHAR")
 
 
-def test_invalid_type_errors():
-    con = ducky.connect()
+def test_invalid_type_errors(con):
     with pytest.raises(ducky.Error, match="invalid"):
         con.create_arrow_function(
             "f", lambda x: x, parameters=["NOT_A_TYPE"], return_type="VARCHAR"
         )
 
 
-def test_user_exception_propagates():
-    con = ducky.connect()
+def test_user_exception_propagates(con):
 
     def boom(x):
         raise ValueError("nope")
@@ -168,8 +156,7 @@ def test_user_exception_propagates():
         con.sql("SELECT boom('hi')").fetchall()
 
 
-def test_wrong_row_count_errors():
-    con = ducky.connect()
+def test_wrong_row_count_errors(con):
 
     def shrink(x):
         return x.slice(0, 1)

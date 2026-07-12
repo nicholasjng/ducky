@@ -11,8 +11,7 @@ import pytest
 import ducky
 
 
-def test_profile_snapshots_info_on_exit():
-    con = ducky.connect()
+def test_profile_snapshots_info_on_exit(con):
     with ducky.profile(con) as p:
         con.execute("SELECT count(*) FROM range(1000)").fetchall()
     # Snapshot was taken before settings reset, so .info survives the with-block.
@@ -20,8 +19,7 @@ def test_profile_snapshots_info_on_exit():
     assert "metrics" in p.info and "children" in p.info
 
 
-def test_profile_restores_settings_after_block():
-    con = ducky.connect()
+def test_profile_restores_settings_after_block(con):
     # Capture defaults.
     assert con.execute("SELECT current_setting('enable_profiling')").fetchitem() is None
     assert con.execute("SELECT current_setting('profiling_mode')").fetchitem() is None
@@ -34,10 +32,9 @@ def test_profile_restores_settings_after_block():
     assert con.execute("SELECT current_setting('profiling_mode')").fetchitem() is None
 
 
-def test_profile_preserves_prior_user_setting():
+def test_profile_preserves_prior_user_setting(con):
     # If the user already had enable_profiling set, exiting profile() restores
     # it (rather than blindly unsetting it).
-    con = ducky.connect()
     con.execute("SET enable_profiling='query_tree'")
     with ducky.profile(con):
         # Inside the block, the helper has overridden it.
@@ -48,8 +45,7 @@ def test_profile_preserves_prior_user_setting():
     con.execute("RESET enable_profiling")
 
 
-def test_profile_detailed_mode_unlocks_extra_metrics():
-    con = ducky.connect()
+def test_profile_detailed_mode_unlocks_extra_metrics(con):
     with ducky.profile(con, mode="detailed") as p:
         con.execute("SELECT count(*) FROM range(10_000)").fetchall()
 
@@ -66,18 +62,16 @@ def test_profile_detailed_mode_unlocks_extra_metrics():
     assert "intermediate_rows" in keys
 
 
-def test_profile_restores_on_exception():
-    con = ducky.connect()
+def test_profile_restores_on_exception(con):
     with pytest.raises(RuntimeError, match="boom"), ducky.profile(con):
         raise RuntimeError("boom")
     assert con.execute("SELECT current_setting('enable_profiling')").fetchitem() is None
 
 
-def test_profile_result_does_not_pin_connection():
+def test_profile_result_does_not_pin_connection(con):
     # A long-lived ProfileResult must not keep a transient connection open —
     # _con is dropped on context exit. Connection is a nanobind type without
     # weakref support, so verify via the refcount delta instead.
-    con = ducky.connect()
     before = sys.getrefcount(con)
     with ducky.profile(con) as p:
         con.execute("SELECT 1").fetchall()
@@ -89,16 +83,14 @@ def test_profile_result_does_not_pin_connection():
     assert after == before, f"profile leaked a reference (before={before}, after={after})"
 
 
-def test_profile_result_refresh_after_exit_raises():
-    con = ducky.connect()
+def test_profile_result_refresh_after_exit_raises(con):
     with ducky.profile(con) as p:
         con.execute("SELECT 1").fetchall()
     with pytest.raises(RuntimeError, match="inside the"):
         p.refresh()
 
 
-def test_profile_refresh_inside_block_overwrites_info():
-    con = ducky.connect()
+def test_profile_refresh_inside_block_overwrites_info(con):
     with ducky.profile(con) as p:
         con.execute("SELECT 1").fetchall()
         first = p.refresh()
@@ -119,8 +111,7 @@ def test_format_profiling_info_none_message():
     assert "ducky.profile(con)" in out
 
 
-def test_format_profiling_info_renders_operator_tree():
-    con = ducky.connect()
+def test_format_profiling_info_renders_operator_tree(con):
     with ducky.profile(con) as p:
         con.execute("SELECT count(*) FROM range(1000) t(i) WHERE i % 3 = 0").fetchall()
 
@@ -134,8 +125,7 @@ def test_format_profiling_info_renders_operator_tree():
     assert "SCAN" in rendered or "TABLE_FUNCTION" in rendered or "GENERATE" in rendered
 
 
-def test_format_profiling_info_str_equals_function():
-    con = ducky.connect()
+def test_format_profiling_info_str_equals_function(con):
     with ducky.profile(con) as p:
         con.execute("SELECT 42").fetchall()
     assert str(p) == ducky.format_profiling_info(p.info)
@@ -144,8 +134,7 @@ def test_format_profiling_info_str_equals_function():
 # ── always-on sink ───────────────────────────────────────────────────────────
 
 
-def test_set_profile_sink_fires_per_query():
-    con = ducky.connect()
+def test_set_profile_sink_fires_per_query(con):
     captured: list[tuple[str, dict]] = []
     con.set_profile_sink(lambda sql, info: captured.append((sql, info)))
     con.execute("SELECT 1").fetchall()
@@ -158,8 +147,7 @@ def test_set_profile_sink_fires_per_query():
         assert "metrics" in info and "children" in info
 
 
-def test_set_profile_sink_sample_n():
-    con = ducky.connect()
+def test_set_profile_sink_sample_n(con):
     sqls: list[str] = []
     con.set_profile_sink(lambda sql, _info: sqls.append(sql), sample=3)
     for k in range(7):
@@ -168,8 +156,7 @@ def test_set_profile_sink_sample_n():
     assert sqls == ["SELECT 0", "SELECT 3", "SELECT 6"]
 
 
-def test_set_profile_sink_none_disables():
-    con = ducky.connect()
+def test_set_profile_sink_none_disables(con):
     sqls: list[str] = []
     con.set_profile_sink(lambda sql, _info: sqls.append(sql))
     con.execute("SELECT 1").fetchall()
@@ -179,8 +166,7 @@ def test_set_profile_sink_none_disables():
     assert sqls == ["SELECT 1"]
 
 
-def test_set_profile_sink_detailed_mode():
-    con = ducky.connect()
+def test_set_profile_sink_detailed_mode(con):
     captured: list[dict] = []
     con.set_profile_sink(lambda _sql, info: captured.append(info), mode="detailed")
     con.execute("SELECT count(*) FROM range(1000) t(i)").fetchall()
@@ -197,24 +183,21 @@ def test_set_profile_sink_detailed_mode():
     assert "intermediate_rows" in keys
 
 
-def test_set_profile_sink_rejects_non_callable():
-    con = ducky.connect()
+def test_set_profile_sink_rejects_non_callable(con):
     with pytest.raises(ducky.Error, match="callable or None"):
         con.set_profile_sink(42)  # ty: ignore[invalid-argument-type]
 
 
-def test_set_profile_sink_rejects_bad_mode():
-    con = ducky.connect()
+def test_set_profile_sink_rejects_bad_mode(con):
     with pytest.raises(ducky.Error, match="standard.*detailed"):
         con.set_profile_sink(lambda _s, _i: None, mode="bogus")
 
 
-def test_set_profile_sink_skips_streaming():
+def test_set_profile_sink_skips_streaming(con):
     # Streaming results profile the *previous* materialized query (the chunks
     # for the streaming one haven't been pulled yet), so we deliberately skip
     # emission. Verify by interleaving and checking the sink doesn't see the
     # streaming query.
-    con = ducky.connect()
     sqls: list[str] = []
     con.set_profile_sink(lambda sql, _info: sqls.append(sql))
     con.execute("SELECT 1").fetchall()
@@ -224,12 +207,10 @@ def test_set_profile_sink_skips_streaming():
     assert "SELECT 2 FROM range(10) t(i)" not in sqls
 
 
-def test_set_profile_sink_swallows_sink_errors():
+def test_set_profile_sink_swallows_sink_errors(con):
     # A buggy sink must not break the query; the exception is forwarded to
     # sys.unraisablehook instead of propagating.
     import sys
-
-    con = ducky.connect()
 
     def bad(_sql, _info):
         raise RuntimeError("sink boom")
@@ -248,11 +229,10 @@ def test_set_profile_sink_swallows_sink_errors():
     assert seen == [RuntimeError]
 
 
-def test_jsonl_profile_sink_writes_lines(tmp_path):
+def test_jsonl_profile_sink_writes_lines(tmp_path, con):
     import json
 
     path = tmp_path / "p.jsonl"
-    con = ducky.connect()
     con.set_profile_sink(ducky.jsonl_profile_sink(path))
     con.execute("SELECT count(*) FROM range(50) t(i)").fetchall()
     con.execute("SELECT 7").fetchall()
@@ -264,11 +244,10 @@ def test_jsonl_profile_sink_writes_lines(tmp_path):
     assert "metrics" in rec["info"]
 
 
-def test_jsonl_profile_sink_with_info_false(tmp_path):
+def test_jsonl_profile_sink_with_info_false(tmp_path, con):
     import json
 
     path = tmp_path / "p.jsonl"
-    con = ducky.connect()
     con.set_profile_sink(ducky.jsonl_profile_sink(path, with_info=False))
     con.execute("SELECT 1").fetchall()
     rec = json.loads(path.read_text().splitlines()[0])
@@ -318,6 +297,8 @@ def test_connect_installs_env_sink(tmp_path, monkeypatch):
 
     _profile._env_sink_cache.clear()
 
+    # Must connect() after setenv above — the sink installs at connect time,
+    # so the `con` fixture (connects before the test body runs) would miss it.
     con = ducky.connect()
     for k in range(5):
         con.execute(f"SELECT {k}").fetchall()
@@ -340,6 +321,7 @@ def test_connect_env_sink_compact(tmp_path, monkeypatch):
 
     _profile._env_sink_cache.clear()
 
+    # See test_connect_installs_env_sink: must connect() after setenv.
     con = ducky.connect()
     con.execute("SELECT 1").fetchall()
     line = (tmp_path / f"profile-{os.getpid()}.jsonl").read_text().splitlines()[0]
