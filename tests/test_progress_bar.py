@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import io
+import re
+import threading
 
 import pytest
 
@@ -36,6 +38,41 @@ def test_progress_bar_runs_query_and_finalizes():
     # The fallback bar always finalizes to 100% with a trailing newline.
     assert "100.0%" in rendered
     assert rendered.endswith("\n")
+
+
+def test_progress_bar_renders_live_progress():
+    # The bar must reflect actual *intermediate* progress while the query
+    # runs, not just close()'s unconditional 100% finalize -- a broken poll
+    # loop, or a dead con.progress() binding, would still pass a test that
+    # only checks the final render (see test_progress_bar_runs_query_and_finalizes).
+    # A real table scan (not range(), which doesn't report progress) with
+    # threads=1 gives deterministic, monotonically increasing percentages.
+    con = ducky.connect(threads=1)
+    con.execute("CREATE TABLE t AS SELECT i FROM range(30_000_000) t(i)")
+    out = io.StringIO()
+    with ducky.progress_bar(con, desc="t", out=out, use_tqdm=False, interval=0.01):
+        con.execute("SELECT count(*) FROM t WHERE i % 13 = 0").fetchitem()
+    rendered = out.getvalue()
+    percentages = [float(p) for p in re.findall(r"(\d+\.\d)%", rendered)]
+    assert any(0.0 < p < 100.0 for p in percentages), (
+        f"expected at least one intermediate progress render, got {percentages}"
+    )
+
+
+def test_progress_bar_stops_thread_on_success():
+    con = ducky.connect(threads=2)
+    with ducky.progress_bar(con, out=io.StringIO(), use_tqdm=False, interval=0.01):
+        con.execute("SELECT count(*) FROM range(1_000_000) t(i)").fetchitem()
+    assert not any(t.name == "ducky-progress" for t in threading.enumerate())
+
+
+def test_progress_bar_stops_thread_on_exception(con):
+    with (
+        pytest.raises(ducky.Error),
+        ducky.progress_bar(con, out=io.StringIO(), use_tqdm=False, interval=0.01),
+    ):
+        con.execute("SELECT * FROM no_such_table").fetchall()
+    assert not any(t.name == "ducky-progress" for t in threading.enumerate())
 
 
 def test_progress_bar_restores_settings(con):

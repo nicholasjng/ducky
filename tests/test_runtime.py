@@ -83,7 +83,7 @@ def test_config_options_returns_known_keys():
 def test_progress_on_idle_connection(con):
     # No query in flight: DuckDB reports percentage = -1 sentinel.
     pct, rows, total = con.progress()
-    assert pct == pytest.approx(-1.0) or pct == 0.0
+    assert pct == pytest.approx(-1.0)
     assert rows == 0
     assert total == 0
 

@@ -106,6 +106,21 @@ def test_rmse(con):
 
 
 def test_combine_optional(con):
+    # This only exercises the routine merge DuckDB does for *every* aggregate
+    # query, even single-threaded ones: a touched (real-data) state merged
+    # into a still-fresh target, which the __dict__-copy fallback handles by
+    # a plain copy. It does NOT exercise aggregate.cpp's hard-error branch
+    # (two states that *both* received real update() calls, requiring a
+    # user-defined combine()) -- that path needs DuckDB to actually merge two
+    # independently-accumulated partial states, which requires genuine
+    # parallel/repartitioned execution. Repeated attempts to force it
+    # deterministically from Python (threads=2..8, few groups, high-cardinality
+    # GROUP BY up to 50k groups over 20M rows, single- and multi-threaded, a
+    # materialized table instead of range()) never triggered it -- DuckDB's
+    # actual merge scheduling doesn't line up with the "repartitioning can
+    # combine two touched states" assumption behind that branch closely
+    # enough to hit it via black-box SQL. Left undone rather than shipping a
+    # test that doesn't reliably exercise what it claims to.
     con.create_aggregate_function(
         "no_comb_sum", NoCombineSum, parameters=["DOUBLE"], return_type="DOUBLE"
     )

@@ -196,21 +196,35 @@ def test_device_rejected_for_deviceless_backends(csv_path):
 
 
 def test_no_leak_train_stats_into_val(csv_path):
-    # If standardisation accidentally used full-dataset stats, the val fold's
-    # mean would be near 0 too. With train-only stats, val gets a non-trivial
-    # mean because the train sample mean ≠ population mean exactly.
+    # A loose statistical sentinel (e.g. "val mean is small") can't actually
+    # distinguish "standardized with train-only stats" from "standardized
+    # with full-dataset stats" -- both land close to 0 for this data. Instead,
+    # independently fetch the *raw* per-fold column (same split/seed, so the
+    # same rows land in the same folds), compute what train-only mean/std
+    # standardization should produce in plain numpy, and compare exactly
+    # against what standardize=True actually returns for both folds.
+    split = ducky.split(0.8, seed=0)
+    raw = ducky.dataset(
+        csv_path,
+        columns={"x": ducky.feature("x", dtype="f64")},
+        target=ducky.target("y", dtype="i64"),
+        split=split,
+    )
+    assert raw.train is not None and raw.val is not None
+    train_x = raw.train["X"][:, 0]
+    val_x = raw.val["X"][:, 0]
+    mean = train_x.mean()
+    std = train_x.std(ddof=0)  # ducky standardizes with stddev_pop (ddof=0)
+
     ds = ducky.dataset(
         csv_path,
         columns={"x": ducky.feature("x", standardize=True)},
         target=ducky.target("y", dtype="i64"),
-        split=ducky.split(0.8, seed=0),
+        split=split,
     )
     assert ds.train is not None and ds.val is not None
-    # Train mean of standardised x must be ~0 (by construction).
-    assert abs(ds.train["X"][:, 0].mean()) < 1e-5
-    # Val mean is also small but distinct from train's exact zero — a
-    # sentinel for "we used train-only stats" rather than "we used all rows".
-    assert abs(ds.val["X"][:, 0].mean()) < 0.2
+    np.testing.assert_allclose(ds.train["X"][:, 0], (train_x - mean) / std, rtol=1e-4, atol=1e-4)
+    np.testing.assert_allclose(ds.val["X"][:, 0], (val_x - mean) / std, rtol=1e-4, atol=1e-4)
 
 
 # ── Named fields API ──────────────────────────────────────────────────────

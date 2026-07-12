@@ -22,6 +22,47 @@ def test_fetch_chunk_end_of_stream(con):
     assert res.fetch_chunk() is None
 
 
+def test_multi_chunk_scan_reuses_pool_without_corrupting_data(con):
+    # Regression test for fetch_chunk()'s buffer pool: each chunk is dropped
+    # before the next is fetched (the common streaming pattern), so the pool
+    # reuses the same underlying duckdb_data_chunk buffer across calls. Every
+    # chunk's values must still be independently correct -- a reuse bug would
+    # show up as stale/aliased data from a previous chunk bleeding into the
+    # next.
+    n = 5000  # > 2 * STANDARD_VECTOR_SIZE (2048), so several chunks get pooled and reused
+    res = con.sql(f"SELECT i FROM range({n}) t(i)")
+    seen = []
+    while (chunk := res.fetch_chunk()) is not None:
+        seen.extend(int(v) for v in chunk.column("i"))
+    assert seen == list(range(n))
+
+
+def test_two_live_chunks_fall_back_without_pool_and_stay_independent(con):
+    # If the pool is empty (a caller holding more than one live batch at
+    # once), fetch_chunk() must fall back to a fresh allocation rather than
+    # reuse a buffer that's still referenced -- otherwise chunk_a's values
+    # would get silently overwritten once chunk_b is fetched.
+    n = 3 * 2048  # three full STANDARD_VECTOR_SIZE chunks
+    res = con.sql(f"SELECT i FROM range({n}) t(i)")
+    chunk_a = res.fetch_chunk()
+    chunk_b = res.fetch_chunk()  # pool is empty (chunk_a still live) -> fresh allocation
+    assert chunk_a is not None and chunk_b is not None
+    a_values = chunk_a.column("i").copy()
+    b_values = chunk_b.column("i").copy()
+    np.testing.assert_array_equal(a_values, np.arange(0, 2048, dtype=np.int64))
+    np.testing.assert_array_equal(b_values, np.arange(2048, 4096, dtype=np.int64))
+    # chunk_a's buffer must not have been mutated by fetching chunk_b.
+    np.testing.assert_array_equal(chunk_a.column("i"), a_values)
+
+    # Drop both, so their buffers return to the pool; fetching the third
+    # chunk should still be correct whether or not it reused one of them.
+    del chunk_a, chunk_b
+    chunk_c = res.fetch_chunk()
+    assert chunk_c is not None
+    np.testing.assert_array_equal(chunk_c.column("i"), np.arange(4096, 6144, dtype=np.int64))
+    assert res.fetch_chunk() is None
+
+
 def test_column_dtypes(con):
     chunk = con.sql(
         "SELECT CAST(1 AS TINYINT) ti, CAST(1 AS SMALLINT) si, "
@@ -113,11 +154,12 @@ def test_interval_column(con):
 
 
 def test_decimal_column_small(con):
-    chunk = con.sql("SELECT CAST(1.5 AS DECIMAL(5,2)) d").fetch_chunk()
+    chunk = con.sql("SELECT CAST(1.5 AS DECIMAL(4,2)) d").fetch_chunk()
     assert chunk is not None
     col = chunk.column("d")
-    # DECIMAL(5,2) fits in int16 — raw integer value should be 150 (1.5 * 10^2)
-    assert col.dtype in (np.dtype("int16"), np.dtype("int32"), np.dtype("int64"))
+    # DECIMAL(width<=4) is DuckDB's smallest internal storage class, INT16 —
+    # raw integer value should be 150 (1.5 * 10^2).
+    assert col.dtype == np.dtype("int16")
     assert col[0] == 150
 
 
@@ -138,12 +180,14 @@ def test_decimal_scale_non_decimal_raises(con):
 # ── DLPack export ──────────────────────────────────────────────────────────
 
 
-def test_dlpack_has_protocol(con):
+def test_dlpack_protocol_returns_valid_capsule(con):
     chunk = con.sql("SELECT i FROM range(3) t(i)").fetch_chunk()
     assert chunk is not None
     obj = chunk.dlpack("i")
-    assert hasattr(obj, "__dlpack__")
-    assert hasattr(obj, "__dlpack_device__")
+    device_type, device_id = obj.__dlpack_device__()
+    assert (device_type, device_id) == (1, 0)  # kDLCPU, device 0
+    capsule = obj.__dlpack__()
+    assert type(capsule).__name__ == "PyCapsule"
 
 
 def test_dlpack_torch(con):

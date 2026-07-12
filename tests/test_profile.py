@@ -185,7 +185,7 @@ def test_set_profile_sink_detailed_mode(con):
 
 def test_set_profile_sink_rejects_non_callable(con):
     with pytest.raises(ducky.Error, match="callable or None"):
-        con.set_profile_sink(42)  # ty: ignore[invalid-argument-type]
+        con.set_profile_sink(42)
 
 
 def test_set_profile_sink_rejects_bad_mode(con):
@@ -255,6 +255,46 @@ def test_jsonl_profile_sink_with_info_false(tmp_path, con):
     assert "summary" in rec
     # Summary block carries top-line numbers as strings.
     assert "total_time" in rec["summary"]
+
+
+def test_jsonl_profile_sink_thread_safe_under_concurrent_writers(tmp_path):
+    # jsonl_profile_sink documents its writes as lock-serialized across
+    # threads; every prior test only exercises it from one thread. Hammer one
+    # shared sink from several threads/connections at once and check every
+    # line is intact, valid JSON with the right total count -- a broken (or
+    # removed) lock would show up as interleaved/corrupted lines, dropped
+    # writes, or a json.loads failure.
+    import json
+    import threading
+
+    path = tmp_path / "p.jsonl"
+    sink = ducky.jsonl_profile_sink(path, with_info=False)
+
+    n_threads = 8
+    queries_per_thread = 25
+    errors: list[BaseException] = []
+
+    def worker(n: int) -> None:
+        try:
+            con = ducky.connect()
+            con.set_profile_sink(sink)
+            for i in range(queries_per_thread):
+                con.execute(f"SELECT {n * queries_per_thread + i}").fetchall()
+        except BaseException as exc:  # noqa: BLE001 -- surfaced via `errors`, not swallowed
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker, args=(n,)) for n in range(n_threads)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors
+    lines = path.read_text().splitlines()
+    assert len(lines) == n_threads * queries_per_thread
+    for line in lines:
+        record = json.loads(line)  # raises if a write interleaved/corrupted this line
+        assert "summary" in record
 
 
 def test_profile_config_from_env_off_without_dir(monkeypatch):

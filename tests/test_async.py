@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 
 import pytest
 
@@ -36,20 +37,32 @@ async def test_aexecute_error_propagates(con):
 
 async def test_aexecute_loop_stays_responsive():
     # A long query must not park the event loop: a concurrent heartbeat keeps
-    # ticking while the query runs off-thread.
+    # ticking at roughly its own cadence while the query runs off-thread.
     con = ducky.connect(threads=2)
     ticks = 0
+    interval = 0.01
 
     async def heartbeat():
         nonlocal ticks
         while True:
-            await asyncio.sleep(0.01)
+            await asyncio.sleep(interval)
             ticks += 1
 
     hb = asyncio.create_task(heartbeat())
+    start = time.monotonic()
     await con.aexecute("SELECT count(*) FROM range(40_000_000) t(i) WHERE i % 7 = 0")
+    elapsed = time.monotonic() - start
     hb.cancel()
-    assert ticks > 0, "event loop was blocked during the async query"
+    # Self-normalized against the query's own measured duration (not an
+    # absolute machine-speed guess): a loop blocked for most of that time
+    # would tick once or twice regardless of how long the query actually
+    # took, so requiring ticks roughly proportional to elapsed/interval (50%
+    # tolerance for scheduling jitter) catches that "ticks > 0" cannot.
+    expected_min = max(1, int(elapsed / interval * 0.5))
+    assert ticks >= expected_min, (
+        f"event loop was blocked during the async query: {ticks} ticks over {elapsed:.3f}s "
+        f"(expected >= {expected_min})"
+    )
 
 
 async def test_aexecute_cancellation_interrupts_and_survives():

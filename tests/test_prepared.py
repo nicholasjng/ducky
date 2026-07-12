@@ -68,14 +68,14 @@ def test_context_manager_closes(con):
     with con.prepare("SELECT 1") as stmt:
         assert stmt.execute().fetchone() == (1,)
     # After the block the statement is closed.
-    with pytest.raises(ducky.Error):
+    with pytest.raises(ducky.Error, match="closed"):
         stmt.execute()
 
 
 def test_use_after_close_raises(con):
     stmt = con.prepare("SELECT 1")
     stmt.close()
-    with pytest.raises(ducky.Error):
+    with pytest.raises(ducky.Error, match="closed"):
         stmt.execute()
     # close() is idempotent.
     stmt.close()

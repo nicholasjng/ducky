@@ -394,8 +394,13 @@ def test_special_handling_dict_style(con):
 
 
 def test_init_state_threads_through_call(con):
-    # The init= callable runs once per worker thread; its return value is
-    # passed as the first positional arg of the UDF on every chunk.
+    # init='s return value is passed as the first positional arg of the UDF
+    # on every call. This only exercises a single chunk/thread; see
+    # test_init_state_persists_across_chunks for state persisting across
+    # multiple chunks on one thread. Genuine multi-worker-thread init=
+    # isolation isn't independently covered here -- forcing DuckDB to
+    # actually parallelize a specific query isn't something a unit test can
+    # do deterministically.
 
     def factory():
         return {"calls": 0}
@@ -510,7 +515,7 @@ def test_init_not_callable_rejected(con):
             lambda x: x,
             parameters=["BIGINT"],
             return_type="BIGINT",
-            init=42,  # ty: ignore[invalid-argument-type]
+            init=42,
         )
 
 

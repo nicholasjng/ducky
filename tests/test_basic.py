@@ -230,14 +230,6 @@ def test_nested_null_decoding(con):
     assert row == ([1, None, 3], {"a": None})
 
 
-def test_large_result_spans_chunks(con):
-    # More than one STANDARD_VECTOR_SIZE (2048) chunk.
-    rows = con.execute("SELECT * FROM range(5000) t(i)").fetchall()
-    assert len(rows) == 5000
-    assert rows[0] == (0,)
-    assert rows[-1] == (4999,)
-
-
 def test_connection_executemany(con):
     con.execute("CREATE TABLE t (a INTEGER, b VARCHAR)")
     con.executemany("INSERT INTO t VALUES (?, ?)", [(1, "x"), (2, "y"), (3, None)])
