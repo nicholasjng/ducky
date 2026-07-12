@@ -174,9 +174,27 @@ void agg_finalize(duckdb_function_info info, duckdb_aggregate_state* source, duc
                     *slot = v ? 1 : 0;
                 } else if (want.code == (uint8_t)nb::dlpack::dtype_code::Int) {
                     int64_t v = nb::cast<int64_t>(val);
+                    // elem_size < 8 (TINYINT/SMALLINT/INTEGER/DATE): range-check
+                    // before truncating, matching table.cpp's checked_signed.
+                    if (elem_size < 8) {
+                        int64_t bits = (int64_t)elem_size * 8;
+                        int64_t lo = -(INT64_C(1) << (bits - 1));
+                        int64_t hi = (INT64_C(1) << (bits - 1)) - 1;
+                        if (v < lo || v > hi) {
+                            throw DuckyError("ducky: finalize() value " + std::to_string(v) +
+                                             " out of range for " + ctx->return_type->name);
+                        }
+                    }
                     std::memcpy(slot, &v, elem_size);
                 } else if (want.code == (uint8_t)nb::dlpack::dtype_code::UInt) {
                     uint64_t v = nb::cast<uint64_t>(val);
+                    if (elem_size < 8) {
+                        uint64_t hi = (UINT64_C(1) << (elem_size * 8)) - 1;
+                        if (v > hi) {
+                            throw DuckyError("ducky: finalize() value " + std::to_string(v) +
+                                             " out of range for " + ctx->return_type->name);
+                        }
+                    }
                     std::memcpy(slot, &v, elem_size);
                 } else {
                     // Float / Double
