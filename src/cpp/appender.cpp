@@ -369,17 +369,27 @@ void Appender::append_row(nb::args values) {
         throw DuckyError("ducky: append_row expected " + std::to_string(n_cols) + " values, got " +
                          std::to_string(values.size()));
     }
-    for (idx_t i = 0; i < n_cols; ++i) {
-        if (nb::isinstance<DefaultSentinel>(values[i])) {
-            if (i < has_default_.size() && !has_default_[i]) {
-                throw DuckyError("ducky: column '" + names_[i] +
-                                 "' has no DEFAULT value; pass an explicit value");
+    // A conversion failure partway through a row leaves DuckDB's internal
+    // appender column cursor stuck mid-row (nothing else resets it), silently
+    // misaligning every column write on the next append_row call. Reset via
+    // duckdb_appender_clear before propagating; this also drops any prior rows
+    // buffered since the last flush(), which is the price of recovering.
+    try {
+        for (idx_t i = 0; i < n_cols; ++i) {
+            if (nb::isinstance<DefaultSentinel>(values[i])) {
+                if (i < has_default_.size() && !has_default_[i]) {
+                    throw DuckyError("ducky: column '" + names_[i] +
+                                     "' has no DEFAULT value; pass an explicit value");
+                }
+                check_state(duckdb_append_default(handle_),
+                            ("append_default failed at column " + std::to_string(i)).c_str());
+                continue;
             }
-            check_state(duckdb_append_default(handle_),
-                        ("append_default failed at column " + std::to_string(i)).c_str());
-            continue;
+            append_one(handle_, type_ids_[i], values[i], i);
         }
-        append_one(handle_, type_ids_[i], values[i], i);
+    } catch (...) {
+        duckdb_appender_clear(handle_);
+        throw;
     }
     check_state(duckdb_appender_end_row(handle_), "end_row failed");
 }
