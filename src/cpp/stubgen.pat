@@ -38,3 +38,31 @@ pl:
     def iter_batches(self, columns: Iterable[str] | None = None, *, with_validity: Literal[True]) -> Iterator[dict[str, tuple[numpy.ndarray, numpy.ndarray | None]]]: ...
     def iter_batches(self, columns: Iterable[str] | None = None, with_validity: bool = False) -> Iterator[dict[str, numpy.ndarray] | dict[str, tuple[numpy.ndarray, numpy.ndarray | None]]]:
         \doc
+
+# Chunk.mlx: the default sig emits `mlx.core.array`, which collides with the
+# `mlx` method itself -- same class of bug as __exit__ above (at class scope,
+# the bare name `mlx` resolves to the method, not the imported module).
+# Import mlx.core under its conventional alias so the annotation never needs
+# the bare `mlx` token.
+\.mlx$:
+    \import mlx.core as mx  # ty: ignore[unresolved-import]
+    def mlx(self, key: int | str) -> mx.array:
+        \doc
+
+# iter_batches_mlx / to_mlx: mlx ships a `py.typed` marker but `mlx.core`
+# itself (a compiled extension) has no accompanying .pyi anywhere in the
+# package, so `import mlx.core` is permanently unresolvable to a type
+# checker regardless of spelling -- torch/jax don't have this gap, only mlx.
+# Route through the same aliased-and-ignored import as Chunk.mlx above so
+# every mlx reference in this generated file uses one consistent, already-
+# suppressed import instead of leaving a second, differently-spelled
+# unresolved-import for the same underlying issue.
+\.iter_batches_mlx$:
+    \import mlx.core as mx  # ty: ignore[unresolved-import]
+    def iter_batches_mlx(self, columns: Iterable[str] | None = None) -> Iterator[dict[str, mx.array]]:
+        \doc
+
+\.to_mlx$:
+    \import mlx.core as mx  # ty: ignore[unresolved-import]
+    def to_mlx(self, columns: Iterable[str] | None = None) -> dict[str, mx.array]:
+        \doc

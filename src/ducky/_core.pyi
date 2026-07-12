@@ -6,7 +6,7 @@ from types import TracebackType
 from typing import Any, Literal, overload
 
 import jax
-import mlx.core
+import mlx.core as mx  # ty: ignore[unresolved-import]
 import numpy
 import pandas
 import polars
@@ -67,7 +67,7 @@ class Chunk:
         Flat numeric / temporal types only.
         """
 
-    def mlx(self, key: int | str) -> mlx.core.array:
+    def mlx(self, key: int | str) -> mx.array:
         """
         Return the column as an ``mlx.core.array``, built directly via nanobind's native mlx ndarray dispatch (zero-copy on CPU).
         Flat numeric / temporal types only.
@@ -183,7 +183,7 @@ class Result:
 
     def iter_batches_mlx(
         self, columns: Iterable[str] | None = None
-    ) -> Iterator[dict[str, mlx.core.array]]:
+    ) -> Iterator[dict[str, mx.array]]:
         """
         Yield one dict per chunk: {name: mlx.core.array}. Zero-copy on CPU via DLPack.
         """
@@ -198,7 +198,7 @@ class Result:
     ) -> dict[str, jax.Array]:
         """Eagerly concatenate all chunks into {name: jax.Array}."""
 
-    def to_mlx(self, columns: Iterable[str] | None = None) -> dict[str, mlx.core.array]:
+    def to_mlx(self, columns: Iterable[str] | None = None) -> dict[str, mx.array]:
         """Eagerly concatenate all chunks into {name: mlx.core.array}."""
 
     def __iter__(self) -> Iterator[tuple]: ...
@@ -285,7 +285,7 @@ class PreparedStatement:
         """
         Run the statement once per parameter set, discarding each result.
 
-        The fast path for batched ``INSERT`` / ``UPDATE`` / ``DELETE``.
+        The fast path for batched ``INSERT`` / ``UPDATE`` / ``DELETE``. Holds the GIL for the whole batch, so a cross-thread :meth:`Connection.interrupt` can't preempt an in-flight call until it returns.
         """
 
     @property
@@ -406,6 +406,8 @@ class Connection:
         Run ``query`` once per parameter set, discarding each result.
 
         PEP 249 companion to :meth:`execute`; prepares the statement once (through the per-connection statement cache), so loops skip per-row parsing and planning. The fast path for batched ``INSERT`` / ``UPDATE`` / ``DELETE``.
+
+        Unlike :meth:`execute`, this holds the GIL for the whole batch (each row completes in microseconds, so per-row GIL release would cost more than it saves) - a cross-thread :meth:`interrupt` can't preempt an in-flight call until it returns.
         """
 
     def sql(self, query: str, streaming: bool = False) -> Result:
@@ -556,7 +558,7 @@ class Connection:
 
     def iter_batches_mlx(
         self, columns: Iterable[str] | None = None
-    ) -> Iterator[dict[str, mlx.core.array]]:
+    ) -> Iterator[dict[str, mx.array]]:
         """
         Yield one dict per chunk: {name: mlx.core.array}. Zero-copy on CPU via DLPack.
         """
@@ -571,7 +573,7 @@ class Connection:
     ) -> dict[str, jax.Array]:
         """Eagerly concatenate all chunks into {name: jax.Array}."""
 
-    def to_mlx(self, columns: Iterable[str] | None = None) -> dict[str, mlx.core.array]:
+    def to_mlx(self, columns: Iterable[str] | None = None) -> dict[str, mx.array]:
         """Eagerly concatenate all chunks into {name: mlx.core.array}."""
 
     def arrow_reader(
@@ -652,7 +654,7 @@ class Connection:
         Register a Python class as a DuckDB aggregate UDF.
 
         ``cls`` must define ``__init__``, ``update(self, *arrays)``, and ``finalize(self) -> scalar``.
-        An optional ``combine(self, other)`` enables parallel aggregate execution.
+        An optional ``combine(self, other)`` merges partial states into ``self``. Without it, DuckDB's routine single-state merge (every query goes through one, even single-threaded ones) still works via a plain state copy; only a genuine parallel/repartitioned merge of two states that *both* accumulated real data raises a clear error at query time instead of silently returning a wrong aggregate value.
         """
 
     def create_table_function(

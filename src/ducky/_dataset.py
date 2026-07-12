@@ -9,13 +9,13 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Generic, Literal, Protocol, TypeVar, cast, overload
+from typing import TYPE_CHECKING, Any, Generic, Literal, Protocol, TypeVar, overload
 
 from ._core import Connection, Result, connect
 
 if TYPE_CHECKING:
     import jax
-    import mlx.core as mx
+    import mlx.core as mx  # ty: ignore[unresolved-import]
     import numpy as np
     import torch
 
@@ -194,20 +194,44 @@ def _materialize(result: Result, backend: Backend, device: Any) -> dict[str, Any
 
     if backend == "numpy":
         return conv.to_numpy(result)
+    if backend == "mlx":
+        return conv.to_mlx(result)
+
+    # jax/torch: to_jax()/to_torch() always honor `device` for every column
+    # they're given, so `_bucket` (the fold-index column _compile_sql always
+    # adds, only ever indexed host-side via np.nonzero) is popped out *before*
+    # handing the rest to them, rather than teaching those general-purpose
+    # conversion functions a column-exclusion knob for this one caller's
+    # sake. Reattached below, still a plain numpy array.
+    arrays = conv.to_numpy(result)
+    bucket = arrays.pop("_bucket")
+    out: dict[str, Any]
     if backend == "jax":
-        return conv.to_jax(result, device=device)
-    if backend == "torch":
-        return conv.to_torch(result, device=device)
-    return conv.to_mlx(result)
+        import jax.numpy as jnp
+
+        out = {name: jnp.asarray(arr, device=device) for name, arr in arrays.items()}
+    else:
+        import torch
+
+        out = (
+            {name: torch.from_numpy(arr) for name, arr in arrays.items()}
+            if device is None
+            else {name: torch.from_numpy(arr).to(device) for name, arr in arrays.items()}
+        )
+    out["_bucket"] = bucket
+    return out
 
 
-def _bucket_to_host(arr: Any, backend: Backend) -> Any:
-    """Return the (small) bucket column as a numpy array for index maths."""
+def _bucket_to_host(arr: Any) -> Any:
+    """Return the (small) bucket column as a numpy array for index maths.
+
+    `_materialize` always hands this a plain numpy array now (popped before
+    any device conversion); `np.asarray` is a no-op in that case and also
+    handles the `mx.array` an mlx-backend caller could still pass here.
+    """
     import numpy as np
 
-    if backend == "torch":
-        return arr.detach().cpu().numpy()
-    return np.asarray(arr)  # numpy is a no-op; jax/mlx transfer to host
+    return np.asarray(arr)
 
 
 def _gather(arr: Any, idx: Any, backend: Backend) -> Any:
@@ -217,7 +241,7 @@ def _gather(arr: Any, idx: Any, backend: Backend) -> Any:
 
         return arr[torch.as_tensor(idx, device=arr.device)]
     if backend == "mlx":
-        import mlx.core as mx
+        import mlx.core as mx  # ty: ignore[unresolved-import]
 
         return arr[mx.array(idx)]
     return arr[idx]  # numpy and jax both index with a host ndarray
@@ -234,7 +258,7 @@ def _stack(cols: list[Any], backend: Backend) -> Any:
 
         return torch.stack(cols, dim=1)
     if backend == "mlx":
-        import mlx.core as mx
+        import mlx.core as mx  # ty: ignore[unresolved-import]
 
         return mx.stack(cols, axis=1)
     import numpy as np
@@ -680,7 +704,6 @@ def dataset(
     """
     if backend not in _BACKENDS:
         raise ValueError(f"unknown backend {backend!r}; supported backends: {list(_BACKENDS)}")
-    backend = cast(Backend, backend)  # validated above
     if device is not None and backend in _NO_DEVICE:
         raise ValueError(f"backend {backend!r} does not take a device argument")
 
@@ -707,7 +730,7 @@ def dataset(
     # Assemble each field once, before splitting — gathering per fold from
     # the few assembled fields is cheaper than gathering every raw column per
     # fold and stacking afterward.
-    bucket = _bucket_to_host(columns_data.pop("_bucket"), backend)
+    bucket = _bucket_to_host(columns_data.pop("_bucket"))
     assembled = {
         field_name: _assemble_field(field_name, spec, columns_data, backend)
         for field_name, spec in field_specs.items()

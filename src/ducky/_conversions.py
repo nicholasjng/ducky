@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 if TYPE_CHECKING:
     import jax
-    import mlx.core as mx
+    import mlx.core as mx  # ty: ignore[unresolved-import]
     import numpy as np
     import pandas as pd
     import polars
@@ -369,7 +369,7 @@ def to_mlx(
     :func:`to_torch` for why. MLX has no float64, so ``DOUBLE`` columns
     arrive as float32. For memory-bounded streaming use :func:`iter_batches_mlx`.
     """
-    import mlx.core as mx
+    import mlx.core as mx  # ty: ignore[unresolved-import]
 
     arrays = source.to_numpy(columns)
     return {name: mx.array(arr) for name, arr in arrays.items()}
