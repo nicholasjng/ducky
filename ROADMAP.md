@@ -32,7 +32,17 @@ Legend: ✅ shipped · 🟡 partially shipped · ⬜ not started.
   takes a class with `__init__` / `update(*arrays)` / `finalize()` and an
   optional `combine(other)` for parallel execution; state is a live Python
   instance stored as a `PyObject*` in DuckDB's aggregate state slot. Without
-  `combine`, a `__dict__`-copy fallback keeps serial queries correct.
+  `combine`, a `__dict__`-copy fallback merges partial states, tracked via a
+  per-instance "touched" marker (`_ducky_agg_touched`, set the first time
+  `update()` actually runs on that state) so the fallback can tell "this side
+  is still fresh from `__init__`" from "this side holds real accumulated
+  data": DuckDB's routine single-state merge (every query goes through one,
+  even single-threaded ones, merging a touched state into an untouched one)
+  stays correct via a plain copy, while merging two *touched* states -- a
+  genuine parallel/repartitioned merge, reachable even in a nominally serial
+  query under a large `GROUP BY` -- raises a clear error instead of silently
+  discarding one side's data, since there's no generic, safe way to merge
+  arbitrary accumulator state without a user-defined `combine`.
   `Connection.create_table_function` wraps a Python generator factory: DuckDB
   calls bind / init / produce; the produce loop drives `next()` up to 2048
   rows per chunk and writes values into DuckDB vectors via typed dispatch.
@@ -53,6 +63,29 @@ Legend: ✅ shipped · 🟡 partially shipped · ⬜ not started.
   nanobind's `array_api` framework, which requires no external library).
   `iter_batches_torch` / `iter_batches_jax` use this path, so numpy is no
   longer in the tensor/array hot path.
+- ✅ **Chunk buffer pool for `fetch_chunk` / `fetch_numpy_chunk`.**
+  `duckdb_fetch_chunk` (backing `Chunk` iteration, `iter_batches()`'s fast
+  path, and `chunks()`) allocates a brand-new `DataChunk` on every call,
+  unlike `to_numpy()`'s single reused scratch chunk
+  (`duckdb_fetch_chunk_into`). `Result` now pools a `duckdb_data_chunk`
+  buffer per outstanding `Chunk`: when a `Chunk` is destroyed it hands its
+  buffer back instead of destroying it, and the next fetch refills it in
+  place via `duckdb_fetch_chunk_into` instead of paying a fresh allocation.
+  Falls back to a fresh allocation whenever the pool is empty (e.g. a caller
+  holding more than one live batch at once) — always correct, just not
+  always fast.
+
+  Landing this surfaced a real, unconditional, pre-existing leak in
+  `fetch_chunk`/`fetch_numpy_chunk`: `nb::cast(new Chunk(...))` was missing
+  an explicit `nb::rv_policy::take_ownership`, so nanobind never destructed a
+  single `Chunk` for the life of the process (the free-function `nb::cast()`
+  defaults to `rv_policy::automatic_reference`, not `automatic` — the two
+  resolve to different ownership for a raw pointer). Full writeup, minimal
+  standalone repro, and before/after numbers in
+  [`NB_CAST_OWNERSHIP_LEAK.md`](NB_CAST_OWNERSHIP_LEAK.md). With both fixed,
+  `iter_batches()` at 1M rows goes from ~1.4-2.8x slower than duckdb-python's
+  `to_arrow_reader` (and highly variable, ±49-64% stddev) to consistently
+  ~1.2x *faster*, no variance flag.
 
 ## v2: round-trip data path
 
@@ -79,9 +112,10 @@ Legend: ✅ shipped · 🟡 partially shipped · ⬜ not started.
   into a custom `ducky_arrow_scan(name)` table function — no `CREATE TABLE`
   materialization. bind opens the source's `__arrow_c_stream__`, derives the
   result schema from the first batch (names from the Arrow schema, types from a
-  `duckdb_data_chunk_from_arrow` of that batch); the scan runs single-threaded
-  (`duckdb_init_set_max_threads(1)`) and emits each converted batch in
-  vector-size slices via `duckdb_create_selection_vector` + `duckdb_vector_copy_sel`
+  `duckdb_data_chunk_from_arrow` of that batch); the scan claims one emission
+  window per `duckdb_init_set_max_threads` worker off an atomic cursor (falling
+  back to a single window when there's exactly one), and emits each converted
+  batch in vector-size slices via `duckdb_create_selection_vector` + `duckdb_vector_copy_sel`
   (which handles every column type, nested included). The source is re-streamed
   per query, so it must support being streamed more than once (pyarrow Table /
   polars / pandas-3 all do; a single-pass ducky `Result` works once). The
@@ -264,8 +298,11 @@ Legend: ✅ shipped · 🟡 partially shipped · ⬜ not started.
   `register_arrow`/`appender`/`close`) and `Appender` methods now carry
   `nb::lock_self()`, wrapping each call in a `PyCriticalSection` on the object on
   FT builds (a no-op under the GIL). `interrupt`/`progress` are deliberately
-  left unguarded — they're thread-safe DuckDB calls meant to run *while* a query
-  holds the connection's section. Verified with 8-thread stress runs
+  left unguarded by `lock_self()` — they're thread-safe DuckDB calls meant to run
+  *while* a query holds the connection's section — but they still need the
+  `Connection` handle itself to stay valid while `close()` runs concurrently on
+  another thread; a dedicated `handle_mu_` (independent of `lock_self()`) guards
+  just that pointer read/reset. Verified with 8-thread stress runs
   (queries/UDFs/`Appender`/`register_arrow`, one connection per thread) under a
   3.13t interpreter.
 

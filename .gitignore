@@ -8,6 +8,7 @@
 /.cache/clangd
 /.pytest_cache
 /.ruff_cache
+/examples/.cache/
 
 # scikit-build-core / CMake
 compile_commands.json
