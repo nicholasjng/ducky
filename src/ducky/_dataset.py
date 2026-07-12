@@ -1,7 +1,7 @@
 """Higher-level dataset / feature API for ML pipelines on top of DuckDB.
 
 A dataset is described by named **fields**, each either a :class:`Matrix` (several columns stacked into ``(n, d)``) or a :class:`Vector` (one column, ``(n,)``).
-The source is scanned once, streamed into the chosen backend via DLPack (zero host copy for jax / torch / mlx), then each fold is split out with an on-device integer gather.
+The source is scanned once, eagerly materialized via ``Result.to_numpy`` (deliberately, not the per-chunk DLPack ``iter_batches_*`` path — see :func:`_materialize`), then each fold is split out with one gather per assembled field.
 See :func:`dataset` for the entry point.
 """
 
@@ -185,10 +185,10 @@ ArrayT = TypeVar("ArrayT", bound=AbstractArray)
 
 
 def _materialize(result: Result, backend: Backend, device: Any) -> dict[str, Any]:
-    """Stream `result` into ``{column: array}`` in `backend`.
+    """Eagerly drain `result` into ``{column: array}`` in `backend`.
 
-    Native backends wrap DuckDB's chunk buffers via DLPack with no host copy
-    (numpy goes through a single concatenate); see ``ducky._conversions``.
+    Every backend goes through ``Result.to_numpy`` first, not the per-chunk
+    DLPack ``iter_batches_*`` path — see ``ducky._conversions.to_jax`` for why.
     """
     from . import _conversions as conv
 
@@ -436,14 +436,16 @@ def _compile_sql(
     fields: dict[str, Field],
     drop_nulls: list[str] | None,
     split_spec: Split | None,
-) -> tuple[str, list[tuple[str, int, int]]]:
+) -> tuple[str, list[tuple[str, int, int]], str | None]:
     """Compile a dataset spec into one SQL query.
 
-    Returns ``(sql, fold_ranges)``. The query emits one row per source row,
-    with one column per (matrix-column / vector) field-qualified alias, plus
-    ``_bucket`` (in ``[0, _N_BUCKETS)``). Standardisation, when requested,
-    references a ``stats`` CTE computed against the ``"train"`` fold only —
-    never the full dataset.
+    Returns ``(sql, fold_ranges, train_check_sql)``. The query emits one row
+    per source row, with one column per (matrix-column / vector)
+    field-qualified alias, plus ``_bucket`` (in ``[0, _N_BUCKETS)``).
+    Standardisation, when requested, references a ``stats`` CTE computed
+    against the ``"train"`` fold only — never the full dataset.
+    ``train_check_sql`` is ``None`` unless standardisation is requested, in
+    which case the caller should run it first to fail fast on an empty train fold.
     """
     if not fields:
         raise ValueError("at least one field is required")
@@ -456,6 +458,11 @@ def _compile_sql(
     if len(set(aliases)) != len(aliases):
         dupes = sorted({a for a in aliases if aliases.count(a) > 1})
         raise ValueError(f"duplicate field/column aliases: {dupes}")
+    if "_bucket" in aliases:
+        raise ValueError(
+            "field/column alias '_bucket' is reserved for ducky's internal fold "
+            "bookkeeping; rename this field or matrix column"
+        )
 
     from_clause = _quote_literal(source)
 
@@ -472,6 +479,7 @@ def _compile_sql(
     raw_sql = f"SELECT *, {bucket_expr} AS _bucket FROM {from_clause}{null_filter}"
 
     needs_stats = any(spec.standardize for _, _, spec in columns)
+    train_check_sql: str | None = None
     if needs_stats:
         train_range = next((r for r in ranges if r[0] == "train"), None)
         if train_range is None:
@@ -489,6 +497,10 @@ def _compile_sql(
         stats_sql = f"SELECT {', '.join(stats_cols)} FROM raw WHERE {is_train}"
         ctes = f"WITH raw AS ({raw_sql}), stats AS ({stats_sql})"
         from_outer = "raw, stats"
+        # avg()/stddev_pop() over zero rows return NULL, which coalesce(nullif(std, 0), 1)
+        # below would treat as a constant column instead of an empty fold — silently
+        # NULL-ing every standardized value. Catch it explicitly instead.
+        train_check_sql = f"WITH raw AS ({raw_sql}) SELECT count(*) FROM raw WHERE {is_train}"
     else:
         ctes = f"WITH raw AS ({raw_sql})"
         from_outer = "raw"
@@ -511,7 +523,7 @@ def _compile_sql(
     select_items.append("CAST(_bucket AS BIGINT) AS _bucket")
 
     sql = f"{ctes} SELECT {', '.join(select_items)} FROM {from_outer}"
-    return sql, ranges
+    return sql, ranges, train_check_sql
 
 
 def _assemble_field(name: str, spec: Field, columns_data: dict[str, Any], backend: Backend) -> Any:
@@ -621,7 +633,7 @@ def dataset(
 ) -> Dataset[Any]:
     """Load a remote / local table as a feature-engineered dataset.
 
-    Scans the source once, streams it into the chosen ``backend`` via DLPack (zero host copy for jax / torch / mlx), then splits each fold out with an on-device integer gather.
+    Scans the source once, eagerly materializes it to host memory, and hands each field to the chosen ``backend`` (zero-copy buffer adoption for jax / torch, a copy for mlx) before splitting each fold out with one gather per field.
 
     Parameters
     ----------
@@ -674,11 +686,17 @@ def dataset(
 
     field_specs = _normalize_fields(fields, columns, target)
 
-    sql, ranges = _compile_sql(source, field_specs, drop_nulls, split)
+    sql, ranges, train_check_sql = _compile_sql(source, field_specs, drop_nulls, split)
     own_connection = con is None
     if own_connection:
         con = connect()
     try:
+        if train_check_sql is not None and con.sql(train_check_sql).fetchitem() == 0:
+            raise ValueError(
+                "standardize=True requires at least one row in the 'train' fold "
+                "after filtering/splitting, but it's empty; widen the split, check "
+                "drop_nulls, or drop standardize=True"
+            )
         columns_data = _materialize(con.sql(sql), backend, device)
     finally:
         if own_connection:
@@ -686,16 +704,17 @@ def dataset(
 
     import numpy as np
 
-    # The bucket column is metadata; pull it to the host to compute each fold's
-    # row indices, then gather the feature/target columns on the backend device.
+    # Assemble each field once, before splitting — gathering per fold from
+    # the few assembled fields is cheaper than gathering every raw column per
+    # fold and stacking afterward.
     bucket = _bucket_to_host(columns_data.pop("_bucket"), backend)
+    assembled = {
+        field_name: _assemble_field(field_name, spec, columns_data, backend)
+        for field_name, spec in field_specs.items()
+    }
     folds: dict[str, Fold[Any]] = {}
     for name, lo, hi in ranges:
         idx = np.nonzero((bucket >= lo) & (bucket < hi))[0]
-        gathered = {k: _gather(v, idx, backend) for k, v in columns_data.items()}
-        assembled = {
-            field_name: _assemble_field(field_name, spec, gathered, backend)
-            for field_name, spec in field_specs.items()
-        }
-        folds[name] = Fold(backend=backend, _fields=assembled)
+        gathered = {field_name: _gather(arr, idx, backend) for field_name, arr in assembled.items()}
+        folds[name] = Fold(backend=backend, _fields=gathered)
     return Dataset(folds=folds, field_specs=field_specs)
