@@ -23,9 +23,23 @@ void agg_extra_info_destroy(void* ptr) {
 
 idx_t agg_state_size(duckdb_function_info /*info*/) { return sizeof(PyObject*); }
 
+// Marks `inst` as having received a real update() call, so agg_combine_copy
+// can tell "this state holds real partial data" from "still fresh from
+// __init__". Deliberately a Python-visible attribute (not C++-side
+// bookkeeping) so it rides along for free when __dict__ is copied wholesale.
+constexpr const char* kTouchedAttr = "_ducky_agg_touched";
+
+void mark_touched(nb::object& inst) { inst.attr(kTouchedAttr) = true; }
+
+bool is_touched(const nb::object& inst) { return nb::hasattr(inst, kTouchedAttr); }
+
 void agg_init(duckdb_function_info info, duckdb_aggregate_state state) {
     auto* ctx = (AggregateUDFContext*)duckdb_aggregate_function_get_extra_info(info);
     nb::gil_scoped_acquire gil;
+    // State memory isn't zero-initialized by DuckDB, so a throwing cls()
+    // constructor must not leave internal_ptr holding garbage: agg_destroy
+    // unconditionally Py_XDECREFs it later.
+    state->internal_ptr = nullptr;
     guard(
         [&] {
             nb::object inst = ctx->cls();
@@ -77,6 +91,7 @@ void agg_update(duckdb_function_info info, duckdb_data_chunk input,
                 }
                 nb::object inst = nb::borrow((PyObject*)first_state->internal_ptr);
                 inst.attr("update")(*nb::tuple(args));
+                mark_touched(inst);
                 return;
             }
 
@@ -109,14 +124,21 @@ void agg_update(duckdb_function_info info, duckdb_data_chunk input,
                 }
                 nb::object inst = nb::borrow((PyObject*)state->internal_ptr);
                 inst.attr("update")(*nb::tuple(args));
+                mark_touched(inst);
             }
         },
         [&](const char* what) { duckdb_aggregate_function_set_error(info, what); });
 }
 
-// Fallback for aggregates without a Python combine(): copies source's __dict__
-// into target so DuckDB's finalize sees the accumulated state.  Correct for
-// serial execution; may produce wrong results under parallel GROUP BY merges.
+// Fallback for aggregates without a Python combine(). DuckDB calls this
+// whenever it needs to merge two partial states -- including the routine
+// "merge this thread's local state into the group's final state" step every
+// query goes through, even single-threaded ones, where `target` is still
+// fresh from __init__ and a __dict__ copy is exactly correct. It's only
+// unsafe when *both* sides already hold real accumulated data (true
+// parallel/repartitioned merges) -- there a __dict__ copy would silently
+// discard target's prior state, so that specific case is a hard error
+// instead of a wrong answer.
 void agg_combine_copy(duckdb_function_info info, duckdb_aggregate_state* source,
                       duckdb_aggregate_state* target, idx_t count) {
     nb::gil_scoped_acquire gil;
@@ -125,7 +147,22 @@ void agg_combine_copy(duckdb_function_info info, duckdb_aggregate_state* source,
             for (idx_t i = 0; i < count; ++i) {
                 nb::object src_inst = nb::borrow((PyObject*)source[i]->internal_ptr);
                 nb::object tgt_inst = nb::borrow((PyObject*)target[i]->internal_ptr);
-                tgt_inst.attr("__dict__").attr("update")(src_inst.attr("__dict__"));
+                bool src_touched = is_touched(src_inst);
+                bool tgt_touched = is_touched(tgt_inst);
+                if (src_touched && tgt_touched) {
+                    throw DuckyError(
+                        "ducky: this aggregate function must define a combine(self, other) "
+                        "method -- DuckDB is merging two partial states that both received "
+                        "real update() calls (parallel execution or hash-table repartitioning "
+                        "under a large GROUP BY), and there is no safe generic way to merge "
+                        "arbitrary accumulator state without it");
+                }
+                if (src_touched) {
+                    // target is still untouched: a plain copy is exactly correct.
+                    tgt_inst.attr("__dict__").attr("update")(src_inst.attr("__dict__"));
+                }
+                // else: source never received real data (e.g. an empty partition) --
+                // leave target as-is, touched or not.
             }
         },
         [&](const char* what) { duckdb_aggregate_function_set_error(info, what); });
