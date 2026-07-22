@@ -864,6 +864,17 @@ int64_t Result::rows_changed() {
 }
 
 duckdb_data_chunk Result::fetch_raw_chunk() {
+    duckdb_data_chunk chunk = pull_raw_chunk();
+    // Count the rows here too, not just in the fetch*/row-cursor path:
+    // rows_returned_ == 0 is what to_numpy() and arrow_c_stream() use to decide
+    // the result is untouched and duckdb_row_count() is their exact remaining
+    // count. Without this, a fetch_chunk() followed by either raised a bogus
+    // "row count changed during the scan" instead of taking the general path.
+    if (chunk) rows_returned_ += duckdb_data_chunk_get_size(chunk);
+    return chunk;
+}
+
+duckdb_data_chunk Result::pull_raw_chunk() {
     if (duckdb_data_chunk reused = chunk_pool_->take()) {
         // Refill in place (no allocation) -- the same pattern to_numpy() uses
         // for its own scratch chunk. `false` means exhausted, matching the

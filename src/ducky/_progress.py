@@ -144,7 +144,7 @@ def progress_bar(
         while not stop.is_set():
             try:
                 pct, _rows, _total = con.progress()
-            except Exception:
+            except Exception:  # noqa: BLE001
                 break
             bar.update_to(pct)
             stop.wait(interval)

@@ -17,6 +17,14 @@ namespace {
 
 const char* const SCAN_FUNCTION = "ducky_arrow_scan";
 
+// The registry reference DuckDB holds in its extra-info slots. Heap-allocated so
+// the C void*/destroy-callback pair can carry a strong reference.
+using RegistryRef = std::shared_ptr<ArrowRegistry>;
+
+void registry_ref_destroy(void* ptr) { delete (RegistryRef*)ptr; }
+
+ArrowRegistry* registry_of(void* extra_info) { return ((RegistryRef*)extra_info)->get(); }
+
 // Plan-time state, immutable after bind. Plans outlive single executions —
 // Connection.run()'s statement cache and explicit PreparedStatements re-execute
 // the same plan — so nothing consumable (the stream, its cursor) may live here;
@@ -126,7 +134,7 @@ duckdb_data_chunk convert_next_batch(ArrowArrayStream* stream, duckdb_connection
 }
 
 void arrow_scan_bind(duckdb_bind_info info) {
-    auto* reg = (ArrowRegistry*)duckdb_bind_get_extra_info(info);
+    auto* reg = registry_of(duckdb_bind_get_extra_info(info));
     nb::gil_scoped_acquire gil;
     guard(
         [&] {
@@ -268,7 +276,7 @@ void arrow_scan_function(duckdb_function_info info, duckdb_data_chunk output) {
 // if that name is in the registry. Runs during planning; only touches the map
 // structure (no nb::object), so no GIL needed here.
 void arrow_replacement_scan(duckdb_replacement_scan_info info, const char* table_name, void* data) {
-    auto* reg = (ArrowRegistry*)data;
+    auto* reg = registry_of(data);
     {
         std::lock_guard<std::mutex> lock(reg->mu);
         if (reg->sources.find(table_name) == reg->sources.end()) return;
@@ -281,8 +289,8 @@ void arrow_replacement_scan(duckdb_replacement_scan_info info, const char* table
 
 }  // namespace
 
-std::unique_ptr<ArrowRegistry> install_arrow_scan(Connection& con) {
-    auto reg = std::make_unique<ArrowRegistry>();
+std::shared_ptr<ArrowRegistry> install_arrow_scan(Connection& con) {
+    auto reg = std::make_shared<ArrowRegistry>();
     reg->con = con.raw_connection();
 
     duckdb_table_function f = duckdb_create_table_function();
@@ -290,9 +298,9 @@ std::unique_ptr<ArrowRegistry> install_arrow_scan(Connection& con) {
     duckdb_logical_type varchar = duckdb_create_logical_type(DUCKDB_TYPE_VARCHAR);
     duckdb_table_function_add_parameter(f, varchar);
     duckdb_destroy_logical_type(&varchar);
-    // The registry outlives the function (the Connection owns it), so the
-    // extra-info destroy is a no-op (nullptr) — we must not free it here.
-    duckdb_table_function_set_extra_info(f, reg.get(), nullptr);
+    // Strong reference: the function is catalogued on the database and can be
+    // re-bound (a cached plan, a PreparedStatement) after the Connection is gone.
+    duckdb_table_function_set_extra_info(f, new RegistryRef(reg), &registry_ref_destroy);
     duckdb_table_function_set_bind(f, &arrow_scan_bind);
     duckdb_table_function_set_init(f, &arrow_scan_init);
     duckdb_table_function_set_local_init(f, &arrow_scan_local_init);
@@ -304,7 +312,7 @@ std::unique_ptr<ArrowRegistry> install_arrow_scan(Connection& con) {
         throw DuckyError("ducky: failed to register the Arrow scan table function");
     }
 
-    duckdb_add_replacement_scan(con.handle()->database, &arrow_replacement_scan, reg.get(),
-                                nullptr);
+    duckdb_add_replacement_scan(con.handle()->database, &arrow_replacement_scan,
+                                new RegistryRef(reg), &registry_ref_destroy);
     return reg;
 }

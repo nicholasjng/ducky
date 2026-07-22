@@ -257,7 +257,11 @@ void udf_trampoline(duckdb_function_info info, duckdb_data_chunk input, duckdb_v
             }
 
             // Validate + memcpy the returned ndarray into the output vector.
-            auto arr = nb::cast<nb::ndarray<nb::numpy>>(values_obj);
+            // nb::c_contig is load-bearing: the memcpy below reads `n` elements
+            // straight off arr.data(), so a strided return (a slice such as
+            // `big[::2]`) would otherwise be copied out wrong. nanobind
+            // materializes a contiguous copy for us when needed.
+            auto arr = nb::cast<nb::ndarray<nb::numpy, nb::c_contig>>(values_obj);
             if (arr.ndim() != 1 || arr.shape(0) != n) {
                 throw DuckyError("ducky: UDF returned an array of shape != (" + std::to_string(n) +
                                  ",)");
@@ -272,7 +276,7 @@ void udf_trampoline(duckdb_function_info info, duckdb_data_chunk input, duckdb_v
             std::memcpy(out_data, arr.data(), n * ctx->return_type->size);
 
             if (mask_obj) {
-                auto mask = nb::cast<nb::ndarray<nb::numpy>>(mask_obj);
+                auto mask = nb::cast<nb::ndarray<nb::numpy, nb::c_contig>>(mask_obj);
                 if (mask.ndim() != 1 || mask.shape(0) != n) {
                     throw DuckyError("ducky: UDF mask shape != (" + std::to_string(n) + ",)");
                 }
@@ -470,7 +474,7 @@ duckdb_logical_type parse_logical_type(duckdb_connection con, const std::string&
     std::string q = "SELECT CAST(NULL AS " + type_str + ")";
     duckdb_result r;
     if (duckdb_query(con, q.c_str(), &r) == DuckDBError) {
-        std::string err = duckdb_result_error(&r);
+        std::string err = duckdb_message(duckdb_result_error(&r));
         duckdb_destroy_result(&r);
         throw DuckyError("ducky: invalid DuckDB type '" + type_str + "': " + err);
     }

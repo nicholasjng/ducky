@@ -206,8 +206,8 @@ class Connection {
     std::shared_ptr<Result> last_result_;
     // Declared last so it tears down first: its nb::object refs decref before
     // the database handle closes. ~Connection is out-of-line so ArrowRegistry
-    // can be incomplete here.
-    std::unique_ptr<ArrowRegistry> arrow_registry_;
+    // can be incomplete here. Shared, not owned: see install_arrow_scan.
+    std::shared_ptr<ArrowRegistry> arrow_registry_;
     // nb::none() when no sink is installed.
     nb::object profile_sink_;
     int64_t profile_sample_ = 1;

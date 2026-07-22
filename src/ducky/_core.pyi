@@ -1,9 +1,9 @@
 """ducky: tiny nanobind bindings for the DuckDB C API"""
 
-import enum
 from collections.abc import Callable, Coroutine, Iterable, Iterator
+import enum
 from types import TracebackType
-from typing import Any, Literal, overload
+from typing import Any, Literal, Self, overload
 
 import jax
 import mlx.core as mx  # ty: ignore[unresolved-import]
@@ -250,7 +250,7 @@ class Appender:
     def close(self) -> None:
         """Flush and tear down the appender."""
 
-    def __enter__(self) -> Appender: ...
+    def __enter__(self) -> Self: ...
     def __exit__(
         self,
         exc_type: type[BaseException] | None,
@@ -314,7 +314,7 @@ class PreparedStatement:
     def close(self) -> None:
         """Destroy the prepared statement."""
 
-    def __enter__(self) -> PreparedStatement: ...
+    def __enter__(self) -> Self: ...
     def __exit__(
         self,
         exc_type: type[BaseException] | None,
@@ -750,7 +750,7 @@ class Connection:
     def close(self) -> None:
         """Close the connection."""
 
-    def __enter__(self) -> Connection: ...
+    def __enter__(self) -> Self: ...
     def __exit__(
         self,
         exc_type: type[BaseException] | None,

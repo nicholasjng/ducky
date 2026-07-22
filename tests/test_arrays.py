@@ -44,7 +44,7 @@ def test_iter_batches_with_validity(con):
     res = con.sql("SELECT * FROM (VALUES (1, 10), (2, NULL), (3, 30)) AS t(a, b)")
     [batch] = list(res.iter_batches(with_validity=True))
     a_vals, a_mask = batch["a"]
-    b_vals, b_mask = batch["b"]
+    _, b_mask = batch["b"]
     assert a_mask is None
     np.testing.assert_array_equal(a_vals, [1, 2, 3])
     np.testing.assert_array_equal(b_mask, [1, 0, 1])

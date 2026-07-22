@@ -347,7 +347,7 @@ void executemany_loop(duckdb_prepared_statement stmt, nb::handle seq) {
         bind_parameters(stmt, params);
         duckdb_result result;
         if (duckdb_execute_prepared(stmt, &result) == DuckDBError) {
-            std::string message = duckdb_result_error(&result);
+            std::string message = duckdb_message(duckdb_result_error(&result));
             duckdb_destroy_result(&result);
             throw DuckyError(message);
         }
@@ -368,7 +368,7 @@ void executemany_loop(duckdb_prepared_statement stmt, nb::handle seq) {
 duckdb_result drive_pending(duckdb_connection con, duckdb_pending_result pending,
                             duckdb_state init) {
     if (init == DuckDBError) {
-        std::string message = duckdb_pending_error(pending);
+        std::string message = duckdb_message(duckdb_pending_error(pending));
         duckdb_destroy_pending(&pending);
         throw DuckyError(message);
     }
@@ -406,7 +406,7 @@ duckdb_result drive_pending(duckdb_connection con, duckdb_pending_result pending
             }
         }
         if (state == DUCKDB_PENDING_ERROR) {
-            std::string message = duckdb_pending_error(pending);
+            std::string message = duckdb_message(duckdb_pending_error(pending));
             duckdb_destroy_pending(&pending);
             throw DuckyError(message);
         }
@@ -427,7 +427,7 @@ duckdb_result drive_pending(duckdb_connection con, duckdb_pending_result pending
     duckdb_state final_state = duckdb_execute_pending(pending, &result);
     duckdb_destroy_pending(&pending);
     if (final_state == DuckDBError) {
-        std::string message = duckdb_result_error(&result);
+        std::string message = duckdb_message(duckdb_result_error(&result));
         duckdb_destroy_result(&result);
         throw DuckyError(message);
     }
@@ -629,7 +629,7 @@ namespace {
 void exec_no_result(duckdb_connection con, const char* sql) {
     duckdb_result r;
     if (duckdb_query(con, sql, &r) == DuckDBError) {
-        std::string message = duckdb_result_error(&r);
+        std::string message = duckdb_message(duckdb_result_error(&r));
         duckdb_destroy_result(&r);
         throw DuckyError("ducky: " + std::string(sql) + " failed: " + message);
     }
@@ -730,8 +730,9 @@ void Connection::close() {
     last_result_.reset();
     // Drop the Python objects a closed connection can no longer use, so
     // registered Arrow sources / the profile sink don't stay pinned until the
-    // wrapper is garbage-collected. The registry itself stays alive: the
-    // replacement-scan callback registered on the database still points at it.
+    // wrapper is garbage-collected. The registry itself stays alive — the
+    // database-side registrations co-own it — and simply reports "no source
+    // registered" to anything that re-binds afterwards.
     if (arrow_registry_) {
         std::lock_guard<std::mutex> lock(arrow_registry_->mu);
         arrow_registry_->sources.clear();
@@ -848,7 +849,7 @@ duckdb_result Connection::run(const std::string& query, nb::object parameters, b
     }
     if (!stmt) {
         if (duckdb_prepare(con, query.c_str(), &stmt) == DuckDBError) {
-            std::string message = duckdb_prepare_error(stmt);
+            std::string message = duckdb_message(duckdb_prepare_error(stmt));
             duckdb_destroy_prepare(&stmt);
             throw DuckyError(message);
         }
@@ -910,7 +911,7 @@ void Connection::executemany(const std::string& query, nb::object seq) {
     }
     if (!stmt) {
         if (duckdb_prepare(con, query.c_str(), &stmt) == DuckDBError) {
-            std::string message = duckdb_prepare_error(stmt);
+            std::string message = duckdb_message(duckdb_prepare_error(stmt));
             duckdb_destroy_prepare(&stmt);
             throw DuckyError(message);
         }
@@ -943,7 +944,7 @@ nb::object Connection::arrow_collected_stream(const std::string& query, nb::obje
     }
     if (!stmt) {
         if (duckdb_prepare(con, query.c_str(), &stmt) == DuckDBError) {
-            std::string message = duckdb_prepare_error(stmt);
+            std::string message = duckdb_message(duckdb_prepare_error(stmt));
             duckdb_destroy_prepare(&stmt);
             throw DuckyError(message);
         }
@@ -1017,7 +1018,7 @@ duckdb_pending_state PendingResult::execute_task() {
 
 std::string PendingResult::error() {
     std::lock_guard<std::mutex> lock(mu_);
-    return pending_ ? duckdb_pending_error(pending_) : std::string();
+    return pending_ ? duckdb_message(duckdb_pending_error(pending_)) : std::string();
 }
 
 std::shared_ptr<Result> PendingResult::materialize() {
@@ -1031,7 +1032,7 @@ std::shared_ptr<Result> PendingResult::materialize() {
         cleanup_locked();
     }
     if (final_state == DuckDBError) {
-        std::string message = duckdb_result_error(&result);
+        std::string message = duckdb_message(duckdb_result_error(&result));
         duckdb_destroy_result(&result);
         throw DuckyError(message);
     }
@@ -1059,7 +1060,7 @@ PendingResult* Connection::make_pending(const std::string& query, nb::object par
 
     duckdb_prepared_statement stmt = nullptr;
     if (duckdb_prepare(con, query.c_str(), &stmt) == DuckDBError) {
-        std::string message = duckdb_prepare_error(stmt);
+        std::string message = duckdb_message(duckdb_prepare_error(stmt));
         duckdb_destroy_prepare(&stmt);
         throw DuckyError(message);
     }
@@ -1075,7 +1076,7 @@ PendingResult* Connection::make_pending(const std::string& query, nb::object par
     duckdb_state init = streaming ? duckdb_pending_prepared_streaming(stmt, &pending)
                                   : duckdb_pending_prepared(stmt, &pending);
     if (init == DuckDBError) {
-        std::string message = duckdb_pending_error(pending);
+        std::string message = duckdb_message(duckdb_pending_error(pending));
         duckdb_destroy_pending(&pending);
         duckdb_destroy_prepare(&stmt);
         throw DuckyError(message);
@@ -1087,7 +1088,7 @@ PreparedStatement* Connection::prepare(const std::string& query) {
     ensure_open();
     duckdb_prepared_statement stmt = nullptr;
     if (duckdb_prepare(handle_->connection, query.c_str(), &stmt) == DuckDBError) {
-        std::string message = duckdb_prepare_error(stmt);
+        std::string message = duckdb_message(duckdb_prepare_error(stmt));
         duckdb_destroy_prepare(&stmt);
         throw DuckyError(message);
     }

@@ -280,7 +280,7 @@ def test_jsonl_profile_sink_thread_safe_under_concurrent_writers(tmp_path):
             con.set_profile_sink(sink)
             for i in range(queries_per_thread):
                 con.execute(f"SELECT {n * queries_per_thread + i}").fetchall()
-        except BaseException as exc:  # noqa: BLE001 -- surfaced via `errors`, not swallowed
+        except BaseException as exc:
             errors.append(exc)
 
     threads = [threading.Thread(target=worker, args=(n,)) for n in range(n_threads)]
@@ -320,7 +320,7 @@ def test_profile_config_from_env_reads_all_knobs(monkeypatch, tmp_path):
 def test_profile_config_constructor_defaults():
     # The class is general-purpose, not tied to env — defaults match
     # set_profile_sink's defaults.
-    sink = lambda _s, _i: None  # noqa: E731
+    sink = lambda _s, _i: None
     cfg = ducky.ProfileConfig(sink)
     assert cfg.sink is sink
     assert cfg.sample == 1

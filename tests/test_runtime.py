@@ -54,7 +54,7 @@ def test_config_bad_value_still_raises():
     # Coercion forwards an unparseable string unchanged; DuckDB rejects it,
     # surfacing as ducky.Error rather than a Python coercion error.
     with pytest.raises(ducky.Error):
-        ducky.connect(**{"threads": "not_a_number"})  # ty: ignore[invalid-argument-type]
+        ducky.connect(threads="not_a_number")  # ty: ignore[invalid-argument-type]
 
 
 def test_config_typed_dict_unpacked():
@@ -68,7 +68,7 @@ def test_config_bad_key_raises():
     # error verbatim. The kwargs splat deliberately bypasses DuckDBConfig's
     # static key check, which is exactly the runtime scenario we want.
     with pytest.raises(ducky.Error, match="not_a_real_setting"):
-        ducky.connect(**{"not_a_real_setting": "x"})  # ty: ignore[invalid-argument-type]
+        ducky.connect(not_a_real_setting="x")  # ty: ignore[invalid-argument-type]
 
 
 def test_config_options_returns_known_keys():

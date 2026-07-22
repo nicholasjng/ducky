@@ -5,9 +5,19 @@
 
 #include <atomic>
 #include <stdexcept>
+#include <string>
 #include <utility>
 
 namespace nb = nanobind;
+
+// DuckDB's error accessors (duckdb_result_error, duckdb_pending_error,
+// duckdb_prepare_error) return nullptr when the handle carries no error — and
+// duckdb_pending_prepared_arrow reports DuckDBError without ever allocating a
+// pending result, so an error path really can be handed one. std::string(nullptr)
+// is UB, so every message read goes through here.
+inline std::string duckdb_message(const char* msg) {
+    return msg ? std::string(msg) : std::string("unknown DuckDB error");
+}
 
 // Exception thrown across the binding layer. Registered with nanobind in
 // ducky.cpp so it surfaces in Python as `ducky.Error`.

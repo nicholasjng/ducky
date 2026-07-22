@@ -339,7 +339,8 @@ NB_MODULE(_core, m) {
         .def("flush", &Appender::flush, "Flush pending rows to the table.", nb::lock_self())
         .def("close", &Appender::close, "Flush and tear down the appender.", nb::lock_self())
         .def(
-            "__enter__", [](Appender& self) -> Appender& { return self; }, nb::rv_policy::reference)
+            "__enter__", [](Appender& self) -> Appender& { return self; }, nb::rv_policy::reference,
+            nb::sig("def __enter__(self) -> typing.Self"))
         .def(
             "__exit__", [](Appender& self, nb::object, nb::object, nb::object) { self.close(); },
             "exc_type"_a.none(), "exc_value"_a.none(), "traceback"_a.none(), nb::lock_self(),
@@ -394,7 +395,7 @@ NB_MODULE(_core, m) {
         .def("close", &PreparedStatement::close, "Destroy the prepared statement.", nb::lock_self())
         .def(
             "__enter__", [](PreparedStatement& self) -> PreparedStatement& { return self; },
-            nb::rv_policy::reference)
+            nb::rv_policy::reference, nb::sig("def __enter__(self) -> typing.Self"))
         .def(
             "__exit__",
             [](PreparedStatement& self, nb::object, nb::object, nb::object) { self.close(); },
@@ -802,7 +803,7 @@ NB_MODULE(_core, m) {
         .def("close", &Connection::close, "Close the connection.", nb::lock_self())
         .def(
             "__enter__", [](Connection& self) -> Connection& { return self; },
-            nb::rv_policy::reference)
+            nb::rv_policy::reference, nb::sig("def __enter__(self) -> typing.Self"))
         .def(
             "__exit__", [](Connection& self, nb::object, nb::object, nb::object) { self.close(); },
             "exc_type"_a.none(), "exc_value"_a.none(), "traceback"_a.none(),

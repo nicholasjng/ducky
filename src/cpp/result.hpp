@@ -88,10 +88,11 @@ class Result {
     nb::object build_row();
     void release_chunk();
     // Backs fetch_chunk()/fetch_numpy_chunk(): returns the next data chunk,
-    // or nullptr when exhausted. Reuses a buffer from chunk_pool_ via
-    // duckdb_fetch_chunk_into when one is available (no allocation);
-    // otherwise falls back to a fresh duckdb_fetch_chunk allocation.
+    // or nullptr when exhausted, and accounts its rows against rows_returned_.
     duckdb_data_chunk fetch_raw_chunk();
+    // Reuses a buffer from chunk_pool_ via duckdb_fetch_chunk_into when one is
+    // available (no allocation); otherwise a fresh duckdb_fetch_chunk.
+    duckdb_data_chunk pull_raw_chunk();
 
     duckdb_result result_;
     std::shared_ptr<DuckDBHandle> handle_;

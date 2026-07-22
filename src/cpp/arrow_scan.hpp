@@ -30,6 +30,13 @@ struct ArrowRegistry {
 };
 
 // Register the `ducky_arrow_scan` table function and add the replacement scan on
-// `con`'s database, returning the registry (owned by the Connection). Idempotent
-// per connection — call once and keep the result.
-std::unique_ptr<ArrowRegistry> install_arrow_scan(Connection& con);
+// `con`'s database, returning the registry. Call once per connection and keep
+// the result.
+//
+// Shared rather than owned outright: the table function and the replacement scan
+// live on the database, which outlives the Connection whenever a Result,
+// Appender or PreparedStatement still shares its DuckDBHandle. Both DuckDB-side
+// registrations therefore hold their own strong reference; a plan re-bound after
+// the Connection is dropped finds an empty-but-live registry rather than freed
+// memory.
+std::shared_ptr<ArrowRegistry> install_arrow_scan(Connection& con);
