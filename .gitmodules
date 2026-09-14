@@ -3,6 +3,8 @@
 	url = https://github.com/duckdb/duckdb.git
 	shallow = true
 [picky "ext/duckdb"]
+	patches = patches
+	postUpdate = sh \"$PICKY_ROOT/scripts/override-describe.sh\"
 	sparse = /CMakeLists.txt
 	sparse = /DuckDBConfig.cmake.in
 	sparse = /DuckDBConfigVersion.cmake.in
@@ -22,5 +24,4 @@
 	sparse = /extension/icu/
 	sparse = /.github/config/extensions/httpfs.cmake
 	sparse = /.github/patches/extensions/httpfs/
-	patches = patches
-	postUpdate = sh \"$PICKY_ROOT/scripts/override-describe.sh\"
+	sparse = /tools/cpp/
