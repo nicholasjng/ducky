@@ -1,12 +1,6 @@
 #!/usr/bin/env bash
 #
-# Run pytest under AddressSanitizer on macOS.
-#
-# Prerequisites:
-#   - Activate the uv-managed venv (VIRTUAL_ENV set).
-#   - Build the ASAN editable install:
-#         DUCKY_ASAN=1 uv sync --all-groups --reinstall-package=ducky
-#
+# Run the ASAN build's tests on macOS.
 # Usage: scripts/asan-pytest.sh [pytest args]
 
 set -euo pipefail
@@ -21,7 +15,7 @@ if [[ ! -x "$VENV_PY" ]]; then
   exit 1
 fi
 
-# whoami.py, taken from https://jonasdevlieghere.com/post/sanitizing-python-modules/.
+# Resolve the framework interpreter used by dyld.
 DEEP_PY=$("$VENV_PY" - <<'PY'
 import ctypes
 dyld = ctypes.cdll.LoadLibrary('/usr/lib/system/libdyld.dylib')
@@ -32,7 +26,11 @@ print(buf.value.decode())
 PY
 )
 
-DYLD_INSERT_LIBRARIES="$(clang -print-file-name=libclang_rt.asan_osx_dynamic.dylib)" \
+ASAN_LIB="$(clang -print-file-name=libclang_rt.asan_osx_dynamic.dylib)"
+
+# Preserve the preload path for child test processes.
+DYLD_INSERT_LIBRARIES="$ASAN_LIB" \
+DUCKY_ASAN_PRELOAD="$ASAN_LIB" \
 ASAN_OPTIONS="${ASAN_OPTIONS:-detect_leaks=0:halt_on_error=1}" \
 __PYVENV_LAUNCHER__="$VENV_PY" \
   "$DEEP_PY" -m pytest --capture no "$@"

@@ -7,31 +7,24 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-# Export compile_commands.json for clangd / IDE tooling (see CLAUDE.md). The
-# file lands in ${CMAKE_BINARY_DIR}; we also symlink it to the source root so
-# clangd (and IDEs that probe the repo root) pick it up without configuration.
-set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
-add_custom_target(
-  symlink_compile_commands ALL
-  COMMAND ${CMAKE_COMMAND} -E create_symlink
-    ${CMAKE_BINARY_DIR}/compile_commands.json
-    ${CMAKE_CURRENT_SOURCE_DIR}/compile_commands.json
-  BYPRODUCTS ${CMAKE_CURRENT_SOURCE_DIR}/compile_commands.json
-  COMMENT "Symlinking compile_commands.json to source root"
-  VERBATIM)
+# Expose the active compilation database at the repository root.
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON CACHE INTERNAL "")
+if(PROJECT_IS_TOP_LEVEL)
+  add_custom_target(
+    symlink_compile_commands ALL
+    COMMAND ${CMAKE_COMMAND} -E create_symlink
+      ${CMAKE_BINARY_DIR}/compile_commands.json
+      ${CMAKE_CURRENT_SOURCE_DIR}/compile_commands.json
+    BYPRODUCTS ${CMAKE_CURRENT_SOURCE_DIR}/compile_commands.json
+    COMMENT "Symlinking compile_commands.json to source root"
+    VERBATIM)
+endif()
 
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
 endif()
 
-# AddressSanitizer build. Driven by -DDUCKY_ASAN=ON (or DUCKY_ASAN=1 in the env
-# from scikit-build-core). The flag goes onto the _core target's COMPILE_OPTIONS
-# / LINK_OPTIONS (not CMAKE_CXX_FLAGS) so nanobind's stubgen sanitizer-detector
-# (nanobind PR #1000) finds it and preloads libclang_rt.asan via DYLD_INSERT_LIBRARIES
-# when importing _core during stub generation — putting the flag on the global
-# CMAKE_CXX_FLAGS works for the compiler but not for the detector, which walks
-# per-target properties only. add_compile_options also covers duckdb_static so
-# its objects stay ASAN-instrumented.
+# Instrument DuckDB and the extension with AddressSanitizer.
 option(DUCKY_ASAN "Build with AddressSanitizer" OFF)
 if(DEFINED ENV{DUCKY_ASAN} AND NOT DUCKY_ASAN)
   set(DUCKY_ASAN ON)
@@ -41,87 +34,43 @@ if(DUCKY_ASAN)
   add_link_options(-fsanitize=address)
 endif()
 
-# ──────────────────────────────────────────────────────────────────────────────
 # Python + nanobind
-# ──────────────────────────────────────────────────────────────────────────────
 find_package(Python 3.11 REQUIRED COMPONENTS Interpreter Development.Module)
 
-# Locate the installed nanobind package and import its CMake config.
 execute_process(
   COMMAND "${Python_EXECUTABLE}" -m nanobind --cmake_dir
   OUTPUT_STRIP_TRAILING_WHITESPACE
   OUTPUT_VARIABLE nanobind_ROOT)
 find_package(nanobind CONFIG REQUIRED)
 
-# ──────────────────────────────────────────────────────────────────────────────
-# DuckDB, built from the checked-out submodule (ext/duckdb -> duckdb/duckdb). We
-# bind the stable C API only.
-# ──────────────────────────────────────────────────────────────────────────────
+# DuckDB is built from the sparse submodule through its C API.
 set(DUCKDB_DIR "${CMAKE_CURRENT_SOURCE_DIR}/ext/duckdb")
 
 if(NOT EXISTS "${DUCKDB_DIR}/CMakeLists.txt")
   message(FATAL_ERROR
-    "ext/duckdb is empty. Run: git submodule update --init ext/duckdb")
+    "ext/duckdb is empty. Run: picky init ext/duckdb")
 endif()
 
-# Trim DuckDB down to what a Python extension needs. These are plain cache
-# defaults (no FORCE), so they can still be overridden at configure time.
+# Disable DuckDB's standalone tools by default.
 set(BUILD_SHELL OFF CACHE BOOL "")
 set(BUILD_UNITTESTS OFF CACHE BOOL "")
 set(BUILD_BENCHMARKS OFF CACHE BOOL "")
 
-# The ext/duckdb submodule is a shallow clone with no tags, so DuckDB's own
-# `git describe` version detection falls back to "v0.0.1". Pin the version string
-# to the describe of the pinned commit so duckdb_library_version() is accurate.
-# bump-duckdb.sh rewrites this. FORCE so the edit wins over a stale build cache —
-# without it `set(... CACHE)` is a no-op against an existing build dir.
+# picky records a version because the shallow submodule cannot describe itself.
 set(_describe "")
   if(EXISTS "${CMAKE_SOURCE_DIR}/cmake/duckdb-describe.txt")
       file(STRINGS "${CMAKE_SOURCE_DIR}/cmake/duckdb-describe.txt" _describe LIMIT_COUNT 1)
   endif()
   set(OVERRIDE_GIT_DESCRIBE "${_describe}" CACHE STRING "" FORCE)
 
-# DuckDB unconditionally loads its "essential" extensions — core_functions and
-# parquet — in ext/duckdb/extension/extension_config.cmake, and the generated
-# loader references them from the DuckDB constructor. To pull in additional
-# in-tree extensions, list them via BUILD_EXTENSIONS: DuckDB will call
-# duckdb_extension_load() on each, which builds and registers the loader.
-# We must then also link each one (see the link step below). Leave
-# DISABLE_BUILTIN_EXTENSIONS at its default (OFF): turning it on makes the
-# loader reference core_functions without building it, which fails to link.
-#
-# Note: out-of-tree extensions (httpfs, azure, …) live in separate DuckDB-org
-# repos. DuckDB's build system fetches them at configure time when listed in
-# BUILD_EXTENSIONS — it reads .github/config/extensions/<name>.cmake which
-# contains the GIT_URL/GIT_TAG. The sparse-checkout pattern must include the
-# matching .cmake file (and any .github/patches/extensions/<name>/ entry).
-# icu (timezones, collations, ICU date math) matches duckdb-python's shipped
-# static set; httpfs is our extra (duckdb-python autoinstalls it on demand, which
-# we can't on a dev-pinned commit, so we link it).
-#
-# Note: DuckDB's embedded BUILD_EXTENSIONS model force-links every listed
-# extension (each is registered in the generated static loader), so there's no
-# clean way to emit a *loadable-only* extension here for the load_extension
-# integration test. That test instead consumes an externally-built binary via
-# the DUCKY_EXT_BINARY env var (skipped if unset). See tests/test_extensions.py.
+# Build and statically link the extensions required at runtime.
 set(BUILD_EXTENSIONS "httpfs;json;icu" CACHE STRING "" FORCE)
 set(DUCKDB_STATIC_EXTENSIONS core_functions parquet httpfs json icu)
 
 add_subdirectory(${DUCKDB_DIR} duckdb EXCLUDE_FROM_ALL)
 
-# ──────────────────────────────────────────────────────────────────────────────
 # The extension module
-# ──────────────────────────────────────────────────────────────────────────────
-# FREE_THREADED opts the module into no-GIL execution on free-threaded CPython
-# (3.13t+): nanobind emits Py_MOD_GIL_NOT_USED so importing it doesn't re-enable
-# the GIL. It's a no-op on regular (GIL-enabled) interpreters. See the
-# free-threading item in ROADMAP.md for the scaling rationale + audit status.
-# NOMINSIZE: nanobind size-optimizes the module by default (appends -Os, which
-# wins over Release's -O3). That suits thin dispatch glue, but ducky does real
-# CPU work in tight per-row / per-chunk loops (value conversion, validity-bitmap
-# unpacking, memcpy, tuple building). Disable the size override so those loops
-# build at -O3 and the compiler can unroll/vectorize them. The binary-size cost
-# is negligible next to the statically-linked DuckDB.
+# Opt into free-threaded Python and retain Release optimization for conversion loops.
 nanobind_add_module(
   _core
   NB_STATIC
@@ -138,17 +87,9 @@ nanobind_add_module(
   src/cpp/result.cpp)
 
 target_include_directories(_core PRIVATE ${DUCKDB_DIR}/src/include)
-# tsl::robin_map is vendored by nanobind under ext/robin_map/include and exposed
-# as an IMPORTED target by nanobind-config.cmake; link it so the headers are
-# visible to our sources (nanobind itself only links it PRIVATE to its own
-# static lib).
 target_link_libraries(_core PRIVATE duckdb_static tsl::robin_map)
 
-# duckdb_static's DuckDB constructor calls ExtensionHelper::LoadAllExtensions,
-# which is defined in the generated loader rather than in duckdb_static itself.
-# Pull it in WHOLE_ARCHIVE so the linker keeps it despite -dead_strip. Because
-# DuckDB is added EXCLUDE_FROM_ALL, each *_extension target only builds if we
-# link it, so we link exactly the set the loader references.
+# Preserve DuckDB's generated extension loader through dead stripping.
 if(TARGET duckdb_generated_extension_loader)
   target_link_libraries(
     _core PRIVATE
@@ -160,17 +101,10 @@ foreach(ext IN LISTS DUCKDB_STATIC_EXTENSIONS)
   endif()
 endforeach()
 
-# Without this, duckdb.h marks the C API symbols as dllimport on Windows,
-# producing unresolved __imp_* references when linking the static library.
-# No-op on other platforms.
+# Prevent dllimport annotations when statically linking on Windows.
 target_compile_definitions(_core PRIVATE DUCKDB_STATIC_BUILD)
 
-# Repeat -fsanitize=address on the _core target itself: add_compile_options sets
-# the *directory*'s COMPILE_OPTIONS, but nanobind's stubgen sanitizer detector
-# (PR #1000, see nanobind_sanitizer_preload_env in nanobind-config.cmake) only
-# scans per-target COMPILE_OPTIONS / LINK_OPTIONS. Without this, the detector
-# concludes "no sanitizer" and runs stubgen without preloading libclang_rt.asan,
-# which then aborts at `import _core` with "Interceptors are not working".
+# Target flags let stub generation preload the ASAN runtime.
 if(DUCKY_ASAN)
   target_compile_options(_core PRIVATE -fsanitize=address -fno-omit-frame-pointer)
   target_link_options(_core PRIVATE -fsanitize=address)
@@ -178,24 +112,20 @@ endif()
 
 install(TARGETS _core LIBRARY DESTINATION ducky)
 
-# Generate a .pyi stub for the compiled module alongside the Python package
-# source so IDEs and type checkers (Zed/ty/Pyright) pick it up without
-# inspecting the installed wheel — the src/-layout otherwise wins over
-# site-packages when resolving `ducky._core`. The stub is regenerated on every
-# build and committed to version control; scikit-build-core packs it into
-# the wheel automatically via `wheel.packages`.
+# Generate in the build tree; explicit targets update or verify the source stub.
+set(_DUCKY_CORE_STUB "${CMAKE_CURRENT_BINARY_DIR}/_core.pyi")
 nanobind_add_stub(
-    _core_stub
+    ducky_core_stub
     MODULE _core
-    OUTPUT ${CMAKE_CURRENT_SOURCE_DIR}/src/ducky/_core.pyi
+    OUTPUT ${_DUCKY_CORE_STUB}
     PYTHON_PATH $<TARGET_FILE_DIR:_core>
     PATTERN_FILE ${CMAKE_CURRENT_SOURCE_DIR}/src/cpp/stubgen.pat
     DEPENDS _core
 )
 
-# Run `ruff format` on the freshly-generated stub so it matches the rest of
-# the codebase's style. Skipped silently if ruff isn't available (e.g. when
-# building from an sdist without dev extras).
+install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/src/ducky/_core.pyi DESTINATION ducky)
+
+# Format generated stubs when Ruff is available.
 execute_process(
     COMMAND ${Python_EXECUTABLE} -m ruff --version
     RESULT_VARIABLE _ruff_available
@@ -203,12 +133,30 @@ execute_process(
 )
 if(_ruff_available EQUAL 0)
     add_custom_command(
-        TARGET _core_stub POST_BUILD
+        TARGET ducky_core_stub POST_BUILD
         COMMAND ${Python_EXECUTABLE} -m ruff check --fix --exit-zero --quiet
-            ${CMAKE_CURRENT_SOURCE_DIR}/src/ducky/_core.pyi
+            ${_DUCKY_CORE_STUB}
         COMMAND ${Python_EXECUTABLE} -m ruff format --quiet
-            ${CMAKE_CURRENT_SOURCE_DIR}/src/ducky/_core.pyi
+            ${_DUCKY_CORE_STUB}
         COMMENT "ruff fix + format _core.pyi"
         VERBATIM
     )
 endif()
+
+add_custom_target(
+    update_ducky_core_stub
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        ${_DUCKY_CORE_STUB}
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/ducky/_core.pyi
+    DEPENDS ducky_core_stub
+    COMMENT "Updating checked-in src/ducky/_core.pyi"
+    VERBATIM)
+
+add_custom_target(
+    check_ducky_core_stub
+    COMMAND ${CMAKE_COMMAND} -E compare_files
+        ${_DUCKY_CORE_STUB}
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/ducky/_core.pyi
+    DEPENDS ducky_core_stub
+    COMMENT "Checking checked-in src/ducky/_core.pyi"
+    VERBATIM)

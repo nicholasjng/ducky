@@ -1,5 +1,5 @@
 [build-system]
-requires = ["scikit-build-core>=0.10", "nanobind>=2.0"]
+requires = ["scikit-build-core >=1.0,<2", "nanobind >=3.0"]
 build-backend = "scikit_build_core.build"
 
 [project]
@@ -16,9 +16,9 @@ dynamic = ["version"]
 
 [dependency-groups]
 build = [
-    "nanobind>=2.13.0",
-    "ruff>=0.15.12",  # for CMake's post-build stub formatting step.
-    "scikit-build-core >=0.10",
+    "nanobind>=3.0",
+    "ruff>=0.16.7",  # keep stub formatting in sync with the repository hook.
+    "scikit-build-core >=1.0,<2",
 ]
 dev = [
     "jax>=0.10.1",
@@ -37,31 +37,46 @@ typing = [
 ]
 bench = [
     "duckdb>=1.5",
-    "mew",
+    "mew-bench",
     "memray>=1.18",
     "numpy>=2.4.6",
     "pyarrow>=24.0.0",
 ]
 
 [tool.uv.sources]
-mew = { path = "../mew", editable = true }
+mew-bench = { path = "../mew", editable = true }
+
+[tool.uv.extra-build-dependencies]
+# `ducky` builds without isolation so CMake's compile database retains paths to
+# nanobind in the project environment. Tell uv to install these before it asks
+# the editable backend for metadata; a fresh environment cannot import the
+# backend merely because the same packages also belong to the `build` group.
+ducky = ["scikit_build_core", "nanobind"]
 
 [tool.uv]
 # Build ducky against the project .venv so includes from Python packages
 # (nanobind etc.) in compile_commands.json survive across rebuilds.
 no-build-isolation-package = ["ducky"]
 exclude-newer = "1 week"
-exclude-newer-package = { nanobind = false }
+exclude-newer-package = { nanobind = false, ruff = false, ty = false }
 # Require the "build" group by default, due to no build isolation.
 default-groups = ["build"]
 
 [tool.scikit-build]
+minimum-version = "build-system.requires"
 build-dir = "build/{wheel_tag}"
 wheel.packages = ["src/ducky"]
+cmake.version = ">=3.29"
 cmake.build-type = "Release"
 logging.level = "INFO"
-metadata.version.provider = "scikit_build_core.metadata.regex"
-metadata.version.input = "src/ducky/__init__.py"
+
+[[tool.dynamic-metadata]]
+provider = "scikit_build_core.metadata.regex"
+field = "version"
+input = "src/ducky/__init__.py"
+
+[tool.scikit-build.cmake.define]
+CMAKE_EXPORT_COMPILE_COMMANDS = "ON"
 
 [[tool.scikit-build.overrides]]
 if.env.DUCKY_ASAN = "1"

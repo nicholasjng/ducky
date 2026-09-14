@@ -1,12 +1,12 @@
 repos:
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.16.0
+    rev: v0.16.7
     hooks:
       - id: ruff-check
         args: [--fix, --exit-non-zero-on-fix]
       - id: ruff-format
   - repo: https://github.com/pre-commit/mirrors-clang-format
-    rev: v22.1.8
+    rev: v23.1.1
     hooks:
       - id: clang-format
         types_or: [c++, c]
@@ -21,11 +21,11 @@ repos:
       - id: check-yaml
       - id: check-toml
   - repo: https://github.com/astral-sh/uv-pre-commit
-    rev: 0.11.32
+    rev: 0.12.13
     hooks:
       - id: uv-lock
   - repo: https://github.com/woodruffw/zizmor-pre-commit
-    rev: v1.28.0
+    rev: v1.30.1
     hooks:
       - id: zizmor
         args: [--fix, --min-severity=medium]
