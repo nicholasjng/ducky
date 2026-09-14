@@ -9,26 +9,7 @@
 # [tool.uv.sources]
 # ducky = { path = "../", editable = true }
 # ///
-"""End-to-end demo: training a Titanic survival classifier in JAX or MLX.
-
-Run with:
-
-    uv run examples/titanic_jax.py                   # JAX (default; any platform)
-    uv run examples/titanic_jax.py --backend mlx      # MLX (Apple Silicon only)
-
-What this shows:
-  1. Reading a remote CSV directly into DuckDB (httpfs).
-  2. The high-level ``ducky.dataset`` API — column-to-feature mapping, dtype,
-     standardisation (with train-fold-only stats), and split — declared once
-     and identical for both backends.
-  3. ``backend="jax"`` / ``backend="mlx"`` — folds are streamed straight into
-     the array library (zero host copy via DLPack), so ``Fold.tensors()``
-     hands back native arrays directly.
-  4. A tiny logistic-regression training loop, one flavor per backend (JAX's
-     ``jax.grad``/``jax.jit`` and MLX's ``mx.value_and_grad``/``mx.eval``
-     differ enough that forcing one shared loop would obscure more than it'd
-     save — everything *except* the loop, including ``load()``, is shared).
-"""
+"""Train a Titanic classifier from ducky datasets with JAX or MLX."""
 
 import argparse
 from typing import Any

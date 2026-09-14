@@ -1,9 +1,4 @@
-"""Shared real-data prep SQL, MLP regressor, and training loop for the
-NYC Yellow Taxi ducky-vs-duckdb-python comparison (taxi_ducky.py / taxi_duckdb.py).
-
-Engine-agnostic: imports neither ducky nor duckdb, so it's safe to import from
-either process. See run_taxi_vs_duckdb.py for why the two can't share one.
-"""
+"""Shared NYC Yellow Taxi data preparation and training code."""
 
 from __future__ import annotations
 
@@ -20,9 +15,6 @@ import numpy as np
 URL_TEMPLATE = "https://d37ci6vzurychx.cloudfront.net/trip-data/yellow_tripdata_{month}.parquet"
 DEFAULT_MONTHS = ["2023-01"]
 
-# DuckDB's external file cache is in-memory and process-scoped, so it buys
-# nothing across the separate `uv run` invocations in run_taxi_vs_duckdb.py.
-# Cache to disk instead: each month downloads once, ever.
 CACHE_DIR = Path(__file__).parent / ".cache"
 
 
@@ -44,10 +36,7 @@ def _cached_path(month: str) -> Path:
     return dest
 
 
-# Feature name -> SQL expression, evaluated against the table prep_sql() builds.
-# Location IDs and payment_type are left as raw integers, not one-hot — ducky's
-# Feature API has no categorical helper, and ~260 taxi zones would mean
-# hand-writing that many CASE WHEN columns.
+# Feature name to SQL expression.
 FEATURE_EXPRS: dict[str, str] = {
     "distance": "trip_distance",
     "passengers": "passenger_count",
@@ -70,12 +59,7 @@ LR = 0.001
 
 
 def prep_sql(table: str, months: list[str]) -> list[str]:
-    """Build a filtered, feature-ready `table` from one or more months of
-    Yellow Taxi parquet (cached locally via _cached_path).
-
-    Filters out meter-error trips: zero/negative fares, near-zero or absurd
-    distances, multi-hour "trips" — noise a synthetic dataset never has.
-    """
+    """Build a filtered table from locally cached Yellow Taxi data."""
     paths = ", ".join(f"'{_cached_path(m)}'" for m in months)
     return [
         f"""

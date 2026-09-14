@@ -6,19 +6,7 @@
 #     "numpy>=2.4.6",
 # ]
 # ///
-"""Same workload as taxi_ducky.py, built on the official ``duckdb`` Python
-package instead. See that file's docstring, and run_taxi_vs_duckdb.py for why
-the two can't run in one process.
-
-duckdb-python has no ``ducky.dataset()``-style pipeline, so the load step below
-hand-rolls what that one call does: fetch to numpy, compute train-fold mean/std
-for only the features that need it (a boolean mask we build by hand — ducky's
-per-column ``standardize=`` does this declaratively), split by the same
-hash-bucket scheme ducky uses internally, then ``jnp.asarray`` into JAX.
-
-Model, training loop, and batching are in _taxi_common.py, shared verbatim
-with taxi_ducky.py — only the loading code below differs.
-"""
+"""NYC Yellow Taxi loader using duckdb-python and JAX."""
 
 import sys
 import time

@@ -1,11 +1,4 @@
-"""Live progress bar for a long-running DuckDB query.
-
-`ducky.progress_bar(con)` enables DuckDB progress tracking, polls
-`Connection.progress()` from a background thread, and renders a bar — through
-tqdm if it is installed, otherwise a minimal stderr printer. Run with:
-
-    uv run --all-groups python examples/progress_bar.py
-"""
+"""Show query progress with tqdm or the stderr fallback."""
 
 from __future__ import annotations
 

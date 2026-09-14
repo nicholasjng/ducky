@@ -1,28 +1,4 @@
-"""Benchmark Python-UDF parallelism under free-threading.
-
-DuckDB invokes a Python scalar UDF from every worker thread (`threads=N`). Under
-the GIL those calls serialize; on a free-threaded interpreter (3.13t+, with the
-extension built via ducky's `FREE_THREADED` flag) they run in parallel. This
-script runs a deliberately CPU-bound *pure-Python* UDF over a materialized table
-at several thread counts and reports the speedup — so the difference between a
-GIL and a no-GIL build is visible directly.
-
-Run it against an already-built environment (`--no-sync` so uv doesn't rebuild).
-numpy is in the dev group, so it's already present in the default `.venv`; the
-free-threaded `.venv-ft` needs it installed once (see below):
-
-    uv run --no-sync scripts/ft-udf-bench.py                                  # GIL   -> flat
-    UV_PROJECT_ENVIRONMENT=.venv-ft uv run --no-sync scripts/ft-udf-bench.py  # 3.13t -> scales
-
-ducky builds without isolation (see pyproject's no-build-isolation-package), so it
-can't be built into an isolated PEP 723 script env — hence the prebuilt-env route
-above rather than inline script metadata. The free-threaded env is set up with:
-
-    uv venv --python 3.13t .venv-ft
-    UV_PROJECT_ENVIRONMENT=.venv-ft uv sync --no-default-groups --group build \
-        --reinstall-package=ducky --python 3.13t
-    VIRTUAL_ENV=.venv-ft uv pip install numpy
-"""
+"""Benchmark Python UDF scaling across DuckDB thread counts."""
 
 from __future__ import annotations
 

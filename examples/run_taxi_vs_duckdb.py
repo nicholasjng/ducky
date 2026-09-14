@@ -2,21 +2,7 @@
 # requires-python = ">=3.11"
 # dependencies = []
 # ///
-"""Driver for the real-world ducky-vs-duckdb-python comparison — the
-NYC Yellow Taxi counterpart to run_large_scale_vs_duckdb.py's synthetic data.
-
-ducky and the upstream ``duckdb`` package both statically link DuckDB and
-can't share an interpreter, so taxi_ducky.py and taxi_duckdb.py each run in
-their own ``uv run`` subprocess. Both share a disk cache for the Parquet
-files (see _taxi_common._cached_path), so only the first run of any script
-ever hits CloudFront.
-
-Usage:
-    uv run examples/run_taxi_vs_duckdb.py [month ...]
-
-Each argument is a "YYYY-MM" TLC trip-data month (default: 2023-01, ~3M rows
-after filtering); multiple months union into one table, so this is the scale knob.
-"""
+"""Compare ducky and duckdb-python on NYC Yellow Taxi data."""
 
 from __future__ import annotations
 
