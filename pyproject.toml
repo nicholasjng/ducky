@@ -46,20 +46,10 @@ bench = [
 [tool.uv.sources]
 mew-bench = { path = "../mew", editable = true }
 
-[tool.uv.extra-build-dependencies]
-# `ducky` builds without isolation so CMake's compile database retains paths to
-# nanobind in the project environment. Tell uv to install these before it asks
-# the editable backend for metadata; a fresh environment cannot import the
-# backend merely because the same packages also belong to the `build` group.
-ducky = ["scikit_build_core", "nanobind"]
-
 [tool.uv]
-# Build ducky against the project .venv so includes from Python packages
-# (nanobind etc.) in compile_commands.json survive across rebuilds.
-no-build-isolation-package = ["ducky"]
 exclude-newer = "1 week"
 exclude-newer-package = { nanobind = false, ruff = false, ty = false }
-# Require the "build" group by default, due to no build isolation.
+# Keep contributor build tools available for CMake and stub targets.
 default-groups = ["build"]
 
 [tool.scikit-build]

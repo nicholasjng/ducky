@@ -9,11 +9,15 @@ jj git clone --colocate https://github.com/nicholasjunge/ducky
 cd ducky
 picky init ext/duckdb
 uv sync --all-groups --reinstall-package=ducky
+uv run --no-sync python scripts/configure-clangd.py
 uv run --no-sync pytest -q
 ```
 
 Picky keeps DuckDB sparse. Its paths, patches, and update hook are declared in
 `.gitmodules`.
+
+The clangd configuration uses nanobind from `.venv` and copies its compilation
+database to the repository root. Package builds remain isolated.
 
 ## Updating DuckDB
 
@@ -38,7 +42,7 @@ Normal builds generate `_core.pyi` in the build tree. Update or check the
 repository copy explicitly:
 
 ```sh
-build_dir="$(dirname "$(readlink compile_commands.json)")"
+build_dir="build/clangd"
 cmake --build "$build_dir" --target update_ducky_core_stub
 cmake --build "$build_dir" --target check_ducky_core_stub
 ```

@@ -7,16 +7,20 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-# Expose the active compilation database at the repository root.
+# Generate a compilation database for each build tree. Developer builds can
+# copy theirs to the repository root without letting isolated package builds
+# replace it with paths from a temporary environment.
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON CACHE INTERNAL "")
-if(PROJECT_IS_TOP_LEVEL)
+option(DUCKY_SYNC_COMPILE_COMMANDS
+  "Copy compile_commands.json to the source root" OFF)
+if(PROJECT_IS_TOP_LEVEL AND DUCKY_SYNC_COMPILE_COMMANDS)
   add_custom_target(
-    symlink_compile_commands ALL
-    COMMAND ${CMAKE_COMMAND} -E create_symlink
+    sync_compile_commands ALL
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
       ${CMAKE_BINARY_DIR}/compile_commands.json
       ${CMAKE_CURRENT_SOURCE_DIR}/compile_commands.json
     BYPRODUCTS ${CMAKE_CURRENT_SOURCE_DIR}/compile_commands.json
-    COMMENT "Symlinking compile_commands.json to source root"
+    COMMENT "Syncing compile_commands.json to source root"
     VERBATIM)
 endif()
 
