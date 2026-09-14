@@ -16,86 +16,78 @@ this patch edits the generated header directly, an upstream PR must add the
 definitions to src/include/duckdb/main/capi/header_generation/ instead.
 
 diff --git a/src/include/duckdb.h b/src/include/duckdb.h
-index e29f9f1..8a18b4a 100644
+index 435115a..dad9dd0 100644
 --- a/src/include/duckdb.h
 +++ b/src/include/duckdb.h
-@@ -821,6 +821,8 @@ struct ArrowArray;
- 
+@@ -142,6 +142,7 @@ typedef enum duckdb_state { DuckDBSuccess = 0, DuckDBError = 1 } duckdb_state;
+
  struct ArrowSchema;
- 
+ struct ArrowArray;
 +struct ArrowArrayStream;
+
+ typedef uint64_t idx_t;
+
+@@ -2849,6 +2850,19 @@ DUCKDB_C_API duckdb_error_data duckdb_data_chunk_from_arrow(duckdb_connection co
+  * @return void
+  */
+ DUCKDB_C_API void duckdb_destroy_arrow_converted_schema(duckdb_arrow_converted_schema *arrow_converted_schema);
 +
- //! Holds an arrow query result. Must be destroyed with `duckdb_destroy_arrow`.
- typedef struct _duckdb_arrow {
- 	void *internal_ptr;
-@@ -2299,6 +2301,23 @@ Note that after calling `duckdb_pending_prepared`, the pending result should alw
++/*!
++Exposes an Arrow-collected query result (produced by executing a pending result from
++`duckdb_pending_prepared_arrow`) as an Arrow C stream interface `ArrowArrayStream`. Ownership of the collected record
++batches moves into the stream: the stream stays valid after the result is destroyed, and the result yields no further
++data. The caller must release the stream via `out_stream->release(out_stream)` when done.
++
++* @param result The result to consume. Must have been produced by `duckdb_pending_prepared_arrow`.
++* @param out_stream The output stream structure to fill.
++* @return The error data. Must be destroyed with `duckdb_destroy_error_data`.
++*/
++DUCKDB_C_API duckdb_error_data duckdb_result_arrow_array_stream(duckdb_result *result,
++                                                                struct ArrowArrayStream *out_stream);
+ #endif
+
+ #if DUCKDB_API_VERSION_AT_LEAST(0, 2, 8) && (DUCKDB_API_VERSION_BELOW(1, 0, 0) || DUCKDB_API_ALLOW_DEPRECATED)
+@@ -5622,6 +5636,18 @@ DUCKDB_C_API char *duckdb_geometry_type_get_crs(duckdb_logical_type type);
+  */
  DUCKDB_C_API duckdb_state duckdb_pending_prepared(duckdb_prepared_statement prepared_statement,
                                                    duckdb_pending_result *out_result);
- 
-+/*!
-+Executes the prepared statement with the given bound parameters, and returns a pending result whose query executes
-+with DuckDB's Arrow result collector: the engine assembles Arrow record batches directly during execution, instead of
-+materializing DuckDB data chunks that a second pass converts to Arrow. Consume the executed result with
-+`duckdb_result_arrow_array_stream`; the chunk-based result functions (`duckdb_fetch_chunk` etc.) do not work on it.
 +
-+Note that after calling `duckdb_pending_prepared_arrow`, the pending result should always be destroyed using
-+`duckdb_destroy_pending`, even if this function returns DuckDBError.
++/*!
++Executes a prepared statement with DuckDB's Arrow result collector. Consume the executed result with
++`duckdb_result_arrow_array_stream`; chunk-based result functions do not work on it.
 +
 +* @param prepared_statement The prepared statement to execute.
-+* @param rows_per_batch The number of rows per collected Arrow record batch, or 0 for the default (1000000).
++* @param rows_per_batch Rows per Arrow record batch, or 0 for the default.
 +* @param out_result The pending query result.
 +* @return `DuckDBSuccess` on success or `DuckDBError` on failure.
 +*/
 +DUCKDB_C_API duckdb_state duckdb_pending_prepared_arrow(duckdb_prepared_statement prepared_statement,
 +                                                        idx_t rows_per_batch, duckdb_pending_result *out_result);
-+
- #ifndef DUCKDB_API_NO_DEPRECATED
- /*!
- **DEPRECATION NOTICE**: This method is scheduled for removal in a future release.
-@@ -5104,6 +5123,20 @@ Destroys the arrow converted schema and de-allocates all memory allocated for th
- */
- DUCKDB_C_API void duckdb_destroy_arrow_converted_schema(duckdb_arrow_converted_schema *arrow_converted_schema);
- 
-+/*!
-+Exposes an Arrow-collected query result (produced by executing a pending result from
-+`duckdb_pending_prepared_arrow`) as an Arrow C stream interface `ArrowArrayStream`. Ownership of the collected record
-+batches moves into the stream: the stream stays valid after the result is destroyed, and the result yields no further
-+data. The caller must release the stream via `out_stream->release(out_stream)` when done (unconsumed batches are
-+released with it).
-+
-+* @param result The result to consume. Must have been produced by `duckdb_pending_prepared_arrow`.
-+* @param out_stream The output stream structure to fill. Yields one ArrowArray per collected record batch.
-+* @return The error data. Must be destroyed with `duckdb_destroy_error_data`.
-+*/
-+DUCKDB_C_API duckdb_error_data duckdb_result_arrow_array_stream(duckdb_result *result,
-+                                                                struct ArrowArrayStream *out_stream);
-+
- #ifndef DUCKDB_API_NO_DEPRECATED
- /*!
- **DEPRECATION NOTICE**: This method is scheduled for removal in a future release.
-diff --git a/src/main/capi/arrow-c.cpp b/src/main/capi/arrow-c.cpp
-index 9356556..2f6acc0 100644
---- a/src/main/capi/arrow-c.cpp
-+++ b/src/main/capi/arrow-c.cpp
-@@ -1,10 +1,14 @@
+ #endif
+
+ #if DUCKDB_API_VERSION_AT_LEAST(0, 5, 0)
+diff --git a/src/main/capi/v1/arrow-c.cpp b/src/main/capi/v1/arrow-c.cpp
+index aa57f45..85b541d 100644
+--- a/src/main/capi/v1/arrow-c.cpp
++++ b/src/main/capi/v1/arrow-c.cpp
+@@ -1,9 +1,13 @@
  #include "duckdb/common/arrow/arrow.hpp"
  #include "duckdb/common/arrow/arrow_converter.hpp"
 +#include "duckdb/common/arrow/arrow_query_result.hpp"
 +#include "duckdb/common/arrow/arrow_wrapper.hpp"
  #include "duckdb/function/table/arrow.hpp"
  #include "duckdb/main/capi/capi_internal.hpp"
- #include "duckdb/main/prepared_statement_data.hpp"
  #include "fmt/format.h"
- 
+
 +#include <cerrno>
 +
  using duckdb::ArrowConverter;
  using duckdb::ArrowResultWrapper;
  using duckdb::CClientArrowOptionsWrapper;
-@@ -151,6 +155,93 @@ duckdb_error_data duckdb_data_chunk_from_arrow(duckdb_connection connection, str
+@@ -150,6 +154,93 @@ duckdb_error_data duckdb_data_chunk_from_arrow(duckdb_connection connection, str
  	return nullptr;
  }
- 
+
 +namespace {
 +
 +//! Backing state for the stream produced by duckdb_result_arrow_array_stream:
@@ -162,7 +154,7 @@ index 9356556..2f6acc0 100644
 +	}
 +	auto result_data = reinterpret_cast<duckdb::DuckDBResultData *>(result->internal_data);
 +	auto query_result = result_data ? result_data->result.get() : nullptr;
-+	if (!query_result || query_result->type != QueryResultType::ARROW_RESULT) {
++	if (!query_result || query_result->GetResultType() != QueryResultType::ARROW_RESULT) {
 +		return duckdb_create_error_data(DUCKDB_ERROR_INVALID_INPUT,
 +		                                "duckdb_result_arrow_array_stream requires a result produced with "
 +		                                "duckdb_pending_prepared_arrow");
@@ -171,8 +163,8 @@ index 9356556..2f6acc0 100644
 +
 +	auto state = new DuckDBArrowStreamState();
 +	state->arrays = arrow_result.ConsumeArrays();
-+	state->types = arrow_result.types;
-+	state->names = arrow_result.names;
++	state->types = arrow_result.GetTypes();
++	state->names = duckdb::IdentifiersToStrings(arrow_result.GetNames());
 +	state->client_properties = arrow_result.client_properties;
 +
 +	out_stream->get_schema = DuckDBArrowStreamGetSchema;
@@ -186,10 +178,10 @@ index 9356556..2f6acc0 100644
  void duckdb_destroy_arrow_converted_schema(duckdb_arrow_converted_schema *arrow_converted_schema) {
  	if (arrow_converted_schema && *arrow_converted_schema) {
  		auto converted_schema = reinterpret_cast<duckdb::ArrowTableSchema *>(*arrow_converted_schema);
-diff --git a/src/main/capi/pending-c.cpp b/src/main/capi/pending-c.cpp
-index 1d4fa4d..b43255d 100644
---- a/src/main/capi/pending-c.cpp
-+++ b/src/main/capi/pending-c.cpp
+diff --git a/src/main/capi/v1/pending-c.cpp b/src/main/capi/v1/pending-c.cpp
+index 1d4fa4d..b9e953c 100644
+--- a/src/main/capi/v1/pending-c.cpp
++++ b/src/main/capi/v1/pending-c.cpp
 @@ -1,9 +1,12 @@
  #include "duckdb/main/capi/capi_internal.hpp"
  #include "duckdb/main/query_result.hpp"
@@ -200,20 +192,24 @@ index 1d4fa4d..b43255d 100644
  #include "duckdb/common/optional_ptr.hpp"
 +#include "duckdb/main/client_config.hpp"
 +#include "duckdb/main/client_context.hpp"
- 
+
  using duckdb::case_insensitive_map_t;
  using duckdb::make_uniq;
-@@ -43,6 +46,42 @@ duckdb_state duckdb_pending_prepared_streaming(duckdb_prepared_statement prepare
+@@ -43,6 +46,46 @@ duckdb_state duckdb_pending_prepared_streaming(duckdb_prepared_statement prepare
  	return duckdb_pending_prepared_internal(prepared_statement, out_result, true);
  }
- 
+
 +duckdb_state duckdb_pending_prepared_arrow(duckdb_prepared_statement prepared_statement, idx_t rows_per_batch,
 +                                           duckdb_pending_result *out_result) {
 +	if (!prepared_statement || !out_result) {
 +		return DuckDBError;
 +	}
 +	auto wrapper = reinterpret_cast<PreparedStatementWrapper *>(prepared_statement);
-+	if (!wrapper->statement || !wrapper->statement->context) {
++	if (!wrapper->statement) {
++		return DuckDBError;
++	}
++	auto context = wrapper->statement->TryGetContext();
++	if (!context) {
 +		return DuckDBError;
 +	}
 +	auto result = new PendingStatementWrapper();
@@ -223,7 +219,7 @@ index 1d4fa4d..b43255d 100644
 +	// batches directly (no chunk materialization + conversion pass). The hook
 +	// is consumed at plan time inside PendingQuery, so the previous collector
 +	// is restored right after.
-+	auto &config = duckdb::ClientConfig::GetConfig(*wrapper->statement->context);
++	auto &config = duckdb::ClientConfig::GetConfig(*context);
 +	auto previous_collector = config.get_result_collector;
 +	// 0 selects the default batch size (matches the Python client's default).
 +	const idx_t batch_size = rows_per_batch == 0 ? 1000000 : rows_per_batch;

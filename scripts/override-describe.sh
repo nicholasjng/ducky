@@ -1,7 +1,8 @@
 #!/bin/sh
-# picky post-update hook: stamp a static OVERRIDE_GIT_DESCRIBE for DuckDB's
-# build. Uses only HEAD (no tags), so it works in a shallow checkout.
+# picky post-update hook: stamp a valid development version for DuckDB's build.
+# Read the release line from the sparse checkout so pin bumps cannot leave a
+# stale hard-coded version behind. A shallow clone cannot derive DuckDB's full
+# dev iteration, so use zero; the separately embedded commit hash remains exact.
 set -eu
-ver="v1.5.4"                                   # the DuckDB version you track
-printf '%s-0-g%s\n' "$ver" "$(git rev-parse --short HEAD)" \
-    > "$PICKY_ROOT/cmake/duckdb-describe.txt"
+release="$(cat scripts/ci/release_version.txt)"
+printf 'v%s.0-dev0\n' "$release" > "$PICKY_ROOT/cmake/duckdb-describe.txt"

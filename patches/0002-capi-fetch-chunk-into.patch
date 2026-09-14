@@ -16,61 +16,54 @@ this patch edits the generated header directly, an upstream PR must add the
 definition to src/include/duckdb/main/capi/header_generation/ instead.
 
 diff --git a/src/include/duckdb.h b/src/include/duckdb.h
-index 8a18b4a..88e7f2c 100644
+index dad9dd0..24fe0a6 100644
 --- a/src/include/duckdb.h
 +++ b/src/include/duckdb.h
-@@ -5441,6 +5441,26 @@ It is not known beforehand how many chunks will be returned by this result.
- */
+@@ -6699,6 +6699,19 @@ DUCKDB_C_API duckdb_result_type duckdb_result_return_type(duckdb_result result);
+  * @return duckdb_data_chunk
+  */
  DUCKDB_C_API duckdb_data_chunk duckdb_fetch_chunk(duckdb_result result);
- 
++
 +/*!
-+Fetches the next data chunk from a duckdb_result into an existing data chunk, reusing its buffers instead of
-+allocating a fresh chunk per call the way `duckdb_fetch_chunk` does. Call repeatedly until it returns false.
++Fetches the next data chunk into an existing chunk, reusing its buffers. The chunk must match the result's column
++types. Each call overwrites its contents; the caller retains ownership.
 +
-+The chunk must match the result's column types; create it with `duckdb_create_data_chunk` (or use a first chunk
-+returned by `duckdb_fetch_chunk`). Each call overwrites the chunk's previous contents: consumers must copy what they
-+need out of the chunk before fetching into it again. The caller keeps ownership of the chunk and must destroy it with
-+`duckdb_destroy_data_chunk`.
++For materialized results this scans directly into the chunk. Other result types fall back to fetching and referencing
++the returned buffers.
 +
-+For materialized results this scans the underlying collection directly into the chunk (no per-fetch allocation); it
-+shares the scan cursor with `duckdb_fetch_chunk`, so the two can be mixed. For other result types it is equivalent to
-+`duckdb_fetch_chunk` plus referencing the fetched buffers.
-+
-+* @param result The result object to fetch the data chunk from.
-+* @param chunk The data chunk to fetch into.
-+* @return true if a chunk was fetched, false when the result is exhausted (or an error occurred — check
-+`duckdb_result_error`).
++* @param result The result to fetch from.
++* @param chunk The caller-owned destination chunk.
++* @return true if a chunk was fetched, false when exhausted or on error.
 +*/
 +DUCKDB_C_API bool duckdb_fetch_chunk_into(duckdb_result result, duckdb_data_chunk chunk);
-+
- //----------------------------------------------------------------------------------------------------------------------
- // Cast Functions
- //----------------------------------------------------------------------------------------------------------------------
+ #endif
+
+ #if DUCKDB_API_VERSION_AT_LEAST(1, 5, 6)
 diff --git a/src/include/duckdb/main/materialized_query_result.hpp b/src/include/duckdb/main/materialized_query_result.hpp
-index 4adccd1..30a63ff 100644
+index f656a07..6aeacf1 100644
 --- a/src/include/duckdb/main/materialized_query_result.hpp
 +++ b/src/include/duckdb/main/materialized_query_result.hpp
 @@ -52,6 +52,10 @@ public:
  	//! Takes ownership of the collection, 'collection' is null after this operation
  	unique_ptr<ColumnDataCollection> TakeCollection();
- 
+
 +	//! Fetch the next chunk into an existing DataChunk, reusing its buffers instead of allocating a
 +	//! fresh chunk per call. Shares the scan cursor with Fetch. Returns false when the scan is exhausted.
 +	DUCKDB_API bool FetchInto(DataChunk &result);
 +
  protected:
  	DUCKDB_API unique_ptr<DataChunk> FetchInternal() override;
- 
-diff --git a/src/main/capi/stream-c.cpp b/src/main/capi/stream-c.cpp
-index 4dbe58b..fb72ae7 100644
---- a/src/main/capi/stream-c.cpp
-+++ b/src/main/capi/stream-c.cpp
+
+diff --git a/src/main/capi/v1/stream-c.cpp b/src/main/capi/v1/stream-c.cpp
+index 5f3d0e0..3754d72 100644
+--- a/src/main/capi/v1/stream-c.cpp
++++ b/src/main/capi/v1/stream-c.cpp
 @@ -1,6 +1,7 @@
  #include "duckdb/main/capi/capi_internal.hpp"
  #include "duckdb/common/types/timestamp.hpp"
  #include "duckdb/common/allocator.hpp"
 +#include "duckdb/main/materialized_query_result.hpp"
- 
+
  duckdb_data_chunk duckdb_stream_fetch_chunk(duckdb_result result) {
  	if (!result.internal_data) {
 @@ -35,3 +36,41 @@ duckdb_data_chunk duckdb_fetch_chunk(duckdb_result result) {
@@ -90,11 +83,11 @@ index 4dbe58b..fb72ae7 100644
 +	auto &result_instance = (duckdb::QueryResult &)*result_data.result;
 +	auto &dchunk = *(reinterpret_cast<duckdb::DataChunk *>(chunk));
 +	try {
-+		if (dchunk.ColumnCount() != result_instance.types.size()) {
++		if (dchunk.ColumnCount() != result_instance.GetTypes().size()) {
 +			throw duckdb::InvalidInputException(
 +			    "duckdb_fetch_chunk_into: the chunk's column count does not match the result's");
 +		}
-+		if (result_instance.type == duckdb::QueryResultType::MATERIALIZED_RESULT) {
++		if (result_instance.GetResultType() == duckdb::QueryResultType::MATERIALIZED_RESULT) {
 +			// Scan the collection directly into the caller's chunk: no per-fetch
 +			// DataChunk allocation, unlike duckdb_fetch_chunk.
 +			auto &materialized = (duckdb::MaterializedQueryResult &)result_instance;
@@ -116,13 +109,13 @@ index 4dbe58b..fb72ae7 100644
 +	}
 +}
 diff --git a/src/main/materialized_query_result.cpp b/src/main/materialized_query_result.cpp
-index bbdb771..63b072a 100644
+index 110c605..8e3d61f 100644
 --- a/src/main/materialized_query_result.cpp
 +++ b/src/main/materialized_query_result.cpp
-@@ -103,4 +103,17 @@ unique_ptr<DataChunk> MaterializedQueryResult::FetchInternal() {
+@@ -104,4 +104,17 @@ unique_ptr<DataChunk> MaterializedQueryResult::FetchInternal() {
  	return result;
  }
- 
+
 +bool MaterializedQueryResult::FetchInto(DataChunk &result) {
 +	if (HasError()) {
 +		throw InvalidInputException("Attempting to fetch from an unsuccessful query result\nError: %s", GetError());
