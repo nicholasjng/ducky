@@ -1,14 +1,4 @@
-"""Query-profiling helpers.
-
-Three layers on top of :meth:`Connection.get_profiling_info`:
-
-* :func:`profile` — context manager that toggles DuckDB's profiling settings
-  and snapshots the resulting tree.
-* :func:`format_profiling_info` — pretty-printer for the nested dict.
-* :class:`ProfileConfig` + :func:`jsonl_profile_sink` — always-on sinks for
-  training loops / dataset queries the call site doesn't own. Wired up
-  programmatically or via the ``DUCKY_PROFILE_*`` environment variables.
-"""
+"""Query profiling helpers."""
 
 from __future__ import annotations
 
@@ -30,16 +20,7 @@ ProfileSink = Callable[[str, dict[str, Any]], None]
 
 
 class ProfileResult:
-    """Container yielded by :func:`profile`.
-
-    On context-manager exit the most recent profiling tree is snapshotted into ``.info`` (just before settings are restored), and the connection reference is dropped so a stashed result doesn't pin the connection.
-    ``str(p)`` renders via :func:`format_profiling_info`.
-
-    Attributes
-    ----------
-    info : dict | None
-        The profiling tree from the last query in the block, or ``None`` if nothing was captured.
-    """
+    """Profile captured by :func:`profile`; ``info`` holds the latest tree."""
 
     __slots__ = ("_con", "info")
 
@@ -48,11 +29,7 @@ class ProfileResult:
         self.info: dict[str, Any] | None = None
 
     def refresh(self) -> dict[str, Any] | None:
-        """Re-read the profiling tree from the connection.
-
-        Useful inside the ``with`` block to capture snapshots between queries — the connection only retains the *most recent* query's profile.
-        Raises ``RuntimeError`` outside the block.
-        """
+        """Capture the latest query profile while inside the context."""
         if self._con is None:
             raise RuntimeError(
                 "ProfileResult.refresh() can only be called inside the "
@@ -73,8 +50,6 @@ def _current_setting(con: Connection, name: str) -> str | None:
 
 
 def _restore(con: Connection, name: str, prev: str | None) -> None:
-    # DuckDB profiling settings are enum/mode strings with no quotes — safe to
-    # interpolate directly.
     if prev is None:
         con.execute(f"RESET {name}")
     else:
@@ -83,24 +58,7 @@ def _restore(con: Connection, name: str, prev: str | None) -> None:
 
 @contextlib.contextmanager
 def profile(con: Connection, *, mode: ProfilingMode = "standard") -> Iterator[ProfileResult]:
-    """Enable DuckDB query profiling for the duration of the block.
-
-    On exit, the most recent query's profiling tree is snapshotted into the yielded :class:`ProfileResult` and DuckDB's settings are restored.
-    Use ``p.refresh()`` inside the block to capture intermediate snapshots.
-
-    Parameters
-    ----------
-    con : Connection
-        The connection to enable profiling on.
-    mode : {'standard', 'detailed'}, default 'standard'
-        ``'detailed'`` adds extra per-operator counters (``cpu_time``, …).
-
-    Examples
-    --------
-    >>> with ducky.profile(con) as p:
-    ...     con.execute("SELECT count(*) FROM range(1_000_000)").fetchall()
-    >>> print(p)
-    """
+    """Profile queries in the block and restore prior settings on exit."""
     prev_enabled = _current_setting(con, "enable_profiling")
     prev_mode = _current_setting(con, "profiling_mode")
     con.execute("SET enable_profiling='no_output'")
@@ -110,8 +68,6 @@ def profile(con: Connection, *, mode: ProfilingMode = "standard") -> Iterator[Pr
     try:
         yield result
     finally:
-        # Snapshot before restoring settings: the connection's stored profile
-        # is cleared as soon as enable_profiling goes back to its prior value.
         with contextlib.suppress(Exception):
             result.refresh()
         result._con = None
@@ -148,25 +104,12 @@ def format_profiling_info(
     *,
     extra_info_width: int = 80,
 ) -> str:
-    """Render a profiling tree as a multi-line operator-plan view.
-
-    Renders the SQL + total/CPU summary (if present) followed by the operator subtree, one operator per line with aligned ``time=`` / ``rows=`` columns and a continuation line for each operator's ``extra_info``.
-    Phase and optimizer-rule timings are intentionally omitted.
-
-    Parameters
-    ----------
-    info : dict or None
-        The dict returned by :meth:`Connection.get_profiling_info`.
-        ``None`` produces a single hint line instead of raising.
-    extra_info_width : int, default 80
-        Maximum characters of an operator's ``extra_info`` to print before clipping.
-    """
+    """Render a profiling tree as a multi-line operator plan."""
     if info is None:
         return "(profiling not enabled — wrap queries in `with ducky.profile(con): ...`)"
 
     lines: list[str] = []
 
-    # Query summary lives in a sibling node identified by its `sql` metric.
     summary = next((c for c in info["children"] if "sql" in c["metrics"]), None)
     if summary is not None:
         s = summary["metrics"]
@@ -189,13 +132,11 @@ def format_profiling_info(
             lines.append("  ".join(bits))
         lines.append("")
 
-    # Operator subtree: the first (and only) child whose own metrics carry a `type`.
     op_tree = next((c for c in info["children"] if "type" in c["metrics"]), None)
     if op_tree is None:
         lines.append("(no operator subtree in profiling info)")
         return "\n".join(lines)
 
-    # Two-pass render so the timing/rows columns line up.
     rows: list[tuple[str, str | None, str | None, str | None]] = []
 
     def walk(node: dict[str, Any], depth: int) -> None:
@@ -215,8 +156,6 @@ def format_profiling_info(
         ni = _try_int(irows_s)
         parts.append(f"  rows={ni:>10,}" if ni is not None else "")
         lines.append("".join(parts).rstrip())
-        # `extra_info` arrives as a `{Key=value, Key=value, ...}` string with
-        # embedded newlines inside multi-value entries. Collapse and clip.
         if extra and extra not in ("{}", ""):
             collapsed = " ".join(extra.split())
             if collapsed.startswith("{") and collapsed.endswith("}"):
@@ -234,22 +173,7 @@ def jsonl_profile_sink(
     append: bool = True,
     with_info: bool = True,
 ) -> ProfileSink:
-    """Return a profile sink that appends one JSON line per query to ``path``.
-
-    Each record is ``{"ts": <UTC ISO-8601>, "sql": ..., "info": {...}}`` (or ``"summary": {...}`` when ``with_info=False``).
-    The file is line-buffered so writes survive a crash; writes are lock-serialized across threads.
-
-    Parameters
-    ----------
-    path : str or path-like
-        Output file.
-    append : bool, default True
-        Open in append mode; pass ``False`` to truncate.
-    with_info : bool, default True
-        Include the full profiling tree.
-        Set ``False`` to write only the SQL plus a compact ``{total_time, cpu_time, total_intermediate_rows}`` summary.
-    """
-    # Long-lived handle, owned by the sink closure (closed on process exit).
+    """Write one JSON line per query, optionally with the full profile tree."""
     f: IO[str] = Path(path).open("a" if append else "w", buffering=1)  # noqa: SIM115
     lock = threading.Lock()
 
@@ -279,16 +203,7 @@ def jsonl_profile_sink(
 
 
 class ProfileConfig(NamedTuple):
-    """Configuration bundle for an always-on profile sink.
-
-    Holds the sink callable plus the ``sample`` and ``mode`` arguments :meth:`Connection.set_profile_sink` accepts.
-    Pure data — construct directly for a programmatic config or call :meth:`from_env`.
-
-    Examples
-    --------
-    >>> cfg = ducky.ProfileConfig(my_sink, sample=10, mode="detailed")
-    >>> con.set_profile_sink(cfg.sink, sample=cfg.sample, mode=cfg.mode)
-    """
+    """Profile sink, sampling interval, and profiling mode."""
 
     sink: ProfileSink
     sample: int = 1
@@ -296,22 +211,7 @@ class ProfileConfig(NamedTuple):
 
     @classmethod
     def from_env(cls) -> ProfileConfig | None:
-        """Build a config from the ``DUCKY_PROFILE_*`` environment.
-
-        Returns ``None`` when ``DUCKY_PROFILE_DIR`` is unset; otherwise a :class:`ProfileConfig` whose sink writes to ``{DUCKY_PROFILE_DIR}/profile-{pid}.jsonl`` (one file per process, shared across connections; lock-serialized).
-
-        Environment Variables
-        ---------------------
-        ``DUCKY_PROFILE_DIR``
-            Output directory (created if missing); required.
-        ``DUCKY_PROFILE_MODE``
-            ``'standard'`` (default) or ``'detailed'``.
-        ``DUCKY_PROFILE_SAMPLE``
-            Integer N; sink fires every Nth query.
-            Default 1.
-        ``DUCKY_PROFILE_NO_INFO``
-            Any non-empty value writes a compact ``summary`` instead of the full tree.
-        """
+        """Build configuration from the ``DUCKY_PROFILE_*`` environment."""
         directory_env = os.environ.get("DUCKY_PROFILE_DIR")
         if not directory_env:
             return None
@@ -332,6 +232,5 @@ class ProfileConfig(NamedTuple):
         )
 
 
-# Process-wide cache so every connection appends to the same file.
 _env_sink_lock = threading.Lock()
 _env_sink_cache: dict[tuple[Path, bool], ProfileSink] = {}

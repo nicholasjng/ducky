@@ -8,14 +8,7 @@
 
 #include "duckdb.h"
 
-// Conversions between Python datetime objects and DuckDB temporal values.
-//
-// datetime.h's PyDateTimeAPI capsule pointer is *static per translation unit*,
-// so these helpers are deliberately `static` (one copy per TU, each bound to
-// that TU's PyDateTimeAPI) rather than `inline` (which would fold to a single
-// copy bound to one arbitrary TU's pointer). Every including TU must prime its
-// own pointer — `if (!PyDateTimeAPI) PyDateTime_IMPORT;` — at a point that
-// precedes the first call, e.g. registration or construction.
+// Per-translation-unit Python/DuckDB datetime conversions.
 
 namespace pydt {
 
@@ -36,9 +29,7 @@ namespace pydt {
     return duckdb_to_time(s);
 }
 
-// Microseconds since the unix epoch for a datetime.datetime. Aware values are
-// shifted to UTC via utcoffset() (exact — no float round-trip); naive values
-// are taken as-is.
+// Unix microseconds; aware values are normalized to UTC.
 [[maybe_unused]] static int64_t datetime_to_micros(nanobind::handle val) {
     PyObject* raw = val.ptr();
     duckdb_timestamp_struct s{};

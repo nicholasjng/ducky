@@ -91,6 +91,20 @@ def test_reserved_bucket_alias_rejected(csv_path):
         )
 
 
+def test_drop_nulls_quotes_source_column_names(tmp_path):
+    path = tmp_path / "quoted.csv"
+    path.write_text('"odd name","a""b",y\n1,2,3\n,4,5\n6,,7\n')
+    ds = ducky.dataset(
+        str(path),
+        columns={"x": ducky.feature('"odd name"')},
+        target=ducky.target("y"),
+        drop_nulls=["odd name", 'a"b'],
+    )
+    assert ds.train is not None
+    assert ds.train.X.tolist() == [[1.0]]
+    assert ds.train.y.tolist() == [3.0]
+
+
 def test_split_fractions_validate():
     with pytest.raises(ValueError, match="sum to 1"):
         ducky.split({"train": 0.5, "val": 0.3})

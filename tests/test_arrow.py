@@ -1,12 +1,4 @@
-"""Arrow export (`.arrow()` / the Arrow C stream).
-
-The stream has a combined fast path for results whose columns are all
-fixed-width types with a DuckDB layout bit-identical to Arrow's
-(`fast_arrow_width` in result.cpp); everything else falls back to one Arrow
-array per DuckDB data chunk. These tests pin that the fast path is byte-for-byte
-equal to the fallback (DuckDB's own `duckdb_data_chunk_to_arrow`), so extending
-the eligible type set can't silently corrupt data.
-"""
+"""Arrow export and streaming."""
 
 from __future__ import annotations
 
@@ -14,8 +6,7 @@ import pytest
 
 pytest.importorskip("pyarrow")
 
-# Expressions over `range(n) s(i)`, one per fast-path-eligible type. Each must
-# stay byte-equal to the fallback when widened into a combined batch.
+# One expression per combined-batch-compatible type.
 _FAST_EXPRS = {
     "TINYINT": "(i % 100)::TINYINT",
     "SMALLINT": "i::SMALLINT",
@@ -73,6 +64,11 @@ def test_arrow_reader_born_as_arrow(con):
     # A second execution reuses the cached statement and starts clean.
     again = list(con.arrow_reader("SELECT * FROM t", rows_per_batch=2048))
     assert sum(b.num_rows for b in again) == 20000
+
+
+def test_arrow_reader_rejects_nonpositive_batch_size(con):
+    with pytest.raises(ValueError, match="rows_per_batch must be positive"):
+        con.arrow_reader("SELECT 1", rows_per_batch=0)
 
 
 def test_arrow_query_overload_born_as_arrow(con):

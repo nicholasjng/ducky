@@ -1,36 +1,29 @@
 """ducky: tiny nanobind bindings for the DuckDB C API"""
 
-from collections.abc import Callable, Coroutine, Iterable, Iterator
 import enum
+from collections.abc import Callable, Coroutine, Iterable, Iterator
 from types import TracebackType
 from typing import Any, Literal, Self, overload
 
 import jax
-import mlx.core as mx  # ty: ignore[unresolved-import]
 import numpy
 import pandas
 import polars
 import pyarrow
 import torch
+from mlx import core as mx  # ty: ignore[unresolved-import]
 
-__duckdb_version__: str = "v1.5.4"
+__duckdb_version__: str = "v2.1.0-dev0"
 
-class Error(Exception):
-    pass
+class Error(Exception): ...
 
 class Default:
     """Sentinel type for appender DEFAULT values; use ``ducky.DEFAULT``."""
 
-    def __repr__(self) -> str: ...
-
 DEFAULT: Default = ...
 
 class Chunk:
-    """
-    A column-major batch of up to STANDARD_VECTOR_SIZE rows.
-
-    Numeric and temporal columns are exposed as zero-copy ndarrays over DuckDB's internal buffers.
-    """
+    """A column-major DuckDB result batch."""
 
     def __len__(self) -> int:
         """Number of rows."""
@@ -44,14 +37,7 @@ class Chunk:
         """Column type names."""
 
     def column(self, key: int | str) -> numpy.ndarray:
-        """
-        Return the column at `key` as a 1-D ndarray view.
-
-        Parameters
-        ----------
-        key : int or str
-            Column index or name.
-        """
+        """Return a zero-copy 1-D ndarray view by index or name."""
 
     def validity(self, key: int | str) -> numpy.ndarray | None:
         """
@@ -59,19 +45,13 @@ class Chunk:
         """
 
     def decimal_scale(self, key: int | str) -> int:
-        """Return the scale (digits after the decimal point) of a DECIMAL column."""
+        """Return a DECIMAL column's scale."""
 
     def dlpack(self, key: int | str) -> Any:
-        """
-        Return the column as a DLPack object (``__dlpack__`` / ``__dlpack_device__``), without going through numpy.
-        Flat numeric / temporal types only.
-        """
+        """Return a numeric or temporal column as a DLPack object."""
 
     def mlx(self, key: int | str) -> mx.array:
-        """
-        Return the column as an ``mlx.core.array``, built directly via nanobind's native mlx ndarray dispatch (zero-copy on CPU).
-        Flat numeric / temporal types only.
-        """
+        """Return a numeric or temporal column as an MLX array."""
 
 class Result:
     """A query result. Iterate or call ``fetch*`` to pull rows."""
@@ -99,30 +79,22 @@ class Result:
 
     def fetchitem(self) -> Any:
         """
-        Return the lone scalar of a 1-row × 1-column result.
-
-        Useful for ``COUNT(*)``-style queries.Raises :class:`Error` if the result is not exactly one row and one column.
+        Return the lone scalar of a 1x1 result, for ``COUNT(*)``-style queries. Raises :class:`Error` on any other shape.
         """
 
     @property
     def rows_changed(self) -> int:
-        """
-        Rows affected by an INSERT / UPDATE / DELETE.
-
-        0 for statements that don't report changed rows (SELECT, DDL) and for streaming results.
-        """
+        """Rows affected by INSERT, UPDATE, or DELETE; otherwise 0."""
 
     def fetch_chunk(self) -> Chunk | None:
         """Pull the next :class:`Chunk`, or None at end of stream."""
 
     def fetch_numpy_chunk(self) -> dict[str, numpy.ndarray] | None:
-        """
-        Pull the next chunk as a {name: numpy.ndarray} dict of zero-copy views, or None at end of stream. Backs the iter_batches fast path.
-        """
+        """Pull the next chunk as NumPy arrays, or None at end."""
 
     def to_numpy(self, columns: Iterable[str] | None = None) -> dict[str, numpy.ndarray]:
         """
-        Drain the result into a {name: numpy.ndarray} dict. Raises on VARCHAR/LIST/STRUCT/MAP — use .arrow() for those.
+        Drain the result into a {name: numpy.ndarray} dict. Raises on VARCHAR/LIST/STRUCT/MAP; use arrow() for those.
         """
 
     def __arrow_c_stream__(self, requested_schema: Any = None) -> Any:
@@ -132,9 +104,7 @@ class Result:
         """Return the result as a pyarrow.Table."""
 
     def arrow_batches(self) -> pyarrow.RecordBatchReader:
-        """
-        Stream the result as a pyarrow.RecordBatchReader, one RecordBatch per chunk (~2048 rows). The lazy, Arrow-native counterpart of iter_batches.
-        """
+        """Stream one Arrow record batch per DuckDB chunk."""
 
     def df(self) -> pandas.DataFrame:
         """Return the result as a pandas.DataFrame."""
@@ -148,7 +118,7 @@ class Result:
 
     def fetchnumpy(self) -> dict[str, numpy.ndarray]:
         """
-        Return the result as a dict of column name -> numpy array. Numeric / temporal columns only; use arrow() for strings / nested types.
+        Return the result as a dict of column name -> numpy array. Numeric and temporal columns only; use arrow() for strings and nested types.
         """
 
     def chunks(self) -> Iterator[Chunk]:
@@ -172,9 +142,7 @@ class Result:
     def iter_batches_torch(
         self, columns: Iterable[str] | None = None, device: torch.device | str | int | None = None
     ) -> Iterator[dict[str, torch.Tensor]]:
-        """
-        Yield one dict per chunk: {name: torch.Tensor}. Zero-copy on CPU via DLPack.
-        """
+        """Yield Torch tensors per chunk."""
 
     def iter_batches_jax(
         self, columns: Iterable[str] | None = None, device: jax.Device | None = None
@@ -184,32 +152,26 @@ class Result:
     def iter_batches_mlx(
         self, columns: Iterable[str] | None = None
     ) -> Iterator[dict[str, mx.array]]:
-        """
-        Yield one dict per chunk: {name: mlx.core.array}. Zero-copy on CPU via DLPack.
-        """
+        """Yield MLX arrays per chunk."""
 
     def to_torch(
         self, columns: Iterable[str] | None = None, device: torch.device | str | int | None = None
     ) -> dict[str, torch.Tensor]:
-        """Eagerly concatenate all chunks into {name: torch.Tensor}."""
+        """Return selected columns as Torch tensors."""
 
     def to_jax(
         self, columns: Iterable[str] | None = None, device: jax.Device | None = None
     ) -> dict[str, jax.Array]:
-        """Eagerly concatenate all chunks into {name: jax.Array}."""
+        """Return selected columns as JAX arrays."""
 
     def to_mlx(self, columns: Iterable[str] | None = None) -> dict[str, mx.array]:
-        """Eagerly concatenate all chunks into {name: mlx.core.array}."""
+        """Return selected columns as MLX arrays."""
 
     def __iter__(self) -> Iterator[tuple]: ...
     def __next__(self) -> tuple: ...
 
 class Appender:
-    """
-    Bulk-insert handle for a target table.
-
-    Supports row-at-a-time inserts, a columnar fast path for numeric / temporal ndarrays, and an Arrow ingest path that covers VARCHAR / LIST / STRUCT.
-    """
+    """Buffered bulk-insert handle for a table."""
 
     @property
     def columns(self) -> list[str]:
@@ -226,22 +188,12 @@ class Appender:
         self, columns: dict[str, numpy.ndarray], masks: dict[str, numpy.ndarray] | None = None
     ) -> None:
         """
-        Append a batch of named columns; missing columns are filled with NULL.
-
-        Parameters
-        ----------
-        columns : dict[str, numpy.ndarray]
-            Column-name → 1-D ndarray of equal length.
-        masks : dict[str, numpy.ndarray], optional
-            Per-column validity (1-D bool / uint8; True = valid).
+        Append equal-length numeric or temporal arrays with optional validity masks. Missing columns become NULL.
         """
 
     def append_arrow(self, source: Any) -> None:
         """
-        Append from any object exposing the Arrow PyCapsule interface.
-
-        Accepts ``__arrow_c_stream__`` (pyarrow Table / RecordBatchReader / polars / pandas-3 / a ducky :class:`Result`) or ``__arrow_c_array__`` (a pyarrow RecordBatch).
-        Columns must line up positionally with the target table and match its types.
+        Append an Arrow stream or array. Columns must match the table by position and type.
         """
 
     def flush(self) -> None:
@@ -256,37 +208,20 @@ class Appender:
         exc_type: type[BaseException] | None,
         exc_value: BaseException | None,
         traceback: TracebackType | None,
-    ) -> None:
-        pass
+    ) -> None: ...
 
 class PreparedStatement:
-    """
-    A SQL statement compiled once via :meth:`Connection.prepare`.
-
-    Executable repeatedly with different parameters without re-parsing.
-    """
+    """A reusable compiled SQL statement."""
 
     def execute(
         self, parameters: list | tuple | dict[str, Any] | None = None, streaming: bool = False
     ) -> Result:
         """
-        Bind ``parameters`` and run the statement, returning its :class:`Result`.
-
-        Parameters
-        ----------
-        parameters : list | tuple | dict[str, Any], optional
-            Positional sequence or named dict; ``None`` runs without binding.
-        streaming : bool, default False
-            Return a streaming result whose chunks are pulled lazily (peak memory stays bounded to one chunk).
-            Single-pass; consume via ``fetch*`` or ``iter_batches_*``, not both.
+        Bind parameters and return the result. Streaming results are single-pass.
         """
 
     def executemany(self, parameters: Iterable[list | tuple | dict[str, Any]]) -> None:
-        """
-        Run the statement once per parameter set, discarding each result.
-
-        The fast path for batched ``INSERT`` / ``UPDATE`` / ``DELETE``. Holds the GIL for the whole batch, so a cross-thread :meth:`Connection.interrupt` can't preempt an in-flight call until it returns.
-        """
+        """Run once per parameter set and discard the results."""
 
     @property
     def num_parameters(self) -> int:
@@ -309,7 +244,7 @@ class PreparedStatement:
 
     @property
     def statement_type(self) -> str:
-        """Statement kind: ``'SELECT'``, ``'INSERT'``, ``'UPDATE'``, …."""
+        """Statement kind: ``'SELECT'``, ``'INSERT'``, ``'UPDATE'``, ..."""
 
     def close(self) -> None:
         """Destroy the prepared statement."""
@@ -320,8 +255,7 @@ class PreparedStatement:
         exc_type: type[BaseException] | None,
         exc_value: BaseException | None,
         traceback: TracebackType | None,
-    ) -> None:
-        pass
+    ) -> None: ...
 
 class PendingState(enum.Enum):
     """State of an async query's executor after a tick."""
@@ -339,12 +273,7 @@ class PendingState(enum.Enum):
     """Workers own the outstanding tasks; yield, then tick again."""
 
 class PendingResult:
-    """
-    Steppable handle over an in-flight async query.
-
-    Internal: built by :meth:`Connection.make_pending` and driven by the ``ducky._aio`` event-loop helpers.
-    Prefer :meth:`Connection.aexecute` / :meth:`Connection.asql`.
-    """
+    """Steppable in-flight query handle."""
 
     def execute_task(self) -> PendingState:
         """
@@ -363,11 +292,7 @@ class PendingResult:
         """Interrupt the query and drain the executor (cancellation teardown)."""
 
 class Connection:
-    """
-    A connection to a DuckDB database.
-
-    Each :func:`connect` returns one connection that owns its own database handle; two ``connect(":memory:")`` calls are isolated.
-    """
+    """A connection to a DuckDB database."""
 
     def execute(
         self,
@@ -376,47 +301,14 @@ class Connection:
         streaming: bool = False,
     ) -> Connection:
         """
-        Execute a SQL query and stash the result for the ``fetch*`` methods.
-
-        Repeated query text reuses a per-connection cache of prepared statements, skipping re-parsing and re-planning.
-
-        Parameters
-        ----------
-        query : str
-            SQL text.
-            Single statement only.
-        parameters : list | tuple | dict[str, Any], optional
-            Positional sequence or named dict; ``None`` runs without binding.
-        streaming : bool, default False
-            Return a streaming result whose chunks are pulled lazily; useful for ``iter_batches_*`` on large queries.
-            Single-pass; consume via ``fetch*`` or ``iter_batches_*``, not both.
-
-        Returns
-        -------
-        Connection
-            ``self``, so calls can be chained (e.g. ``con.execute(sql).fetchall()``).
-
-        Examples
-        --------
-        >>> rows = con.execute("SELECT * FROM t WHERE id = ?", [42]).fetchall()
+        Execute one statement and retain its result for fetch methods. Streaming results are single-pass. Returns ``self``.
         """
 
     def executemany(self, query: str, parameters: Iterable[list | tuple | dict[str, Any]]) -> None:
-        """
-        Run ``query`` once per parameter set, discarding each result.
-
-        PEP 249 companion to :meth:`execute`; prepares the statement once (through the per-connection statement cache), so loops skip per-row parsing and planning. The fast path for batched ``INSERT`` / ``UPDATE`` / ``DELETE``.
-
-        Unlike :meth:`execute`, this holds the GIL for the whole batch (each row completes in microseconds, so per-row GIL release would cost more than it saves) - a cross-thread :meth:`interrupt` can't preempt an in-flight call until it returns.
-        """
+        """Run once per parameter set and discard the results."""
 
     def sql(self, query: str, streaming: bool = False) -> Result:
-        """
-        Run a query and return its :class:`Result` directly.
-
-        Unlike :meth:`execute`, ``sql`` does not stash the result on the connection.
-        See :meth:`execute` for ``streaming``.
-        """
+        """Run a query and return its result directly."""
 
     def query(self, query: str, streaming: bool = False) -> Result:
         """Alias for :meth:`sql`."""
@@ -428,10 +320,7 @@ class Connection:
         streaming: bool = False,
     ) -> Coroutine[Any, Any, Result]:
         """
-        Async variant of :meth:`execute`.
-
-        Ticks the executor one task at a time off-thread so the event loop stays responsive; cancelling the await interrupts the query.
-        Resolves to the :class:`Result` directly — does not set ``current_result``.
+        Execute asynchronously and return a Result without setting current_result.
         """
 
     def asql(self, query: str, streaming: bool = False) -> Coroutine[Any, Any, Result]:
@@ -443,39 +332,26 @@ class Connection:
         parameters: list | tuple | dict[str, Any] | None = None,
         streaming: bool = False,
     ) -> PendingResult:
-        """
-        Build a steppable :class:`PendingResult` for the ``ducky._aio`` drivers.
-        Low-level; prefer :meth:`aexecute` / :meth:`asql`.
-        """
+        """Build a steppable pending result."""
 
     def prepare(self, query: str) -> PreparedStatement:
-        """
-        Compile ``query`` once into a :class:`PreparedStatement` for repeated execution, avoiding per-call re-parsing and planning.
-        """
+        """Compile a reusable prepared statement."""
 
     def fetchone(self) -> tuple | None:
-        """
-        Fetch one row from the most recent :meth:`execute` result. Delegates to :meth:`Result.fetchone`.
-        """
+        """Fetch one row from the latest execute result."""
 
     def fetchmany(self, size: int = 1) -> list[tuple]:
-        """Fetch up to ``size`` rows. Delegates to :meth:`Result.fetchmany`."""
+        """Fetch up to ``size`` rows from the latest result."""
 
     def fetchall(self) -> list[tuple]:
-        """Fetch all remaining rows. Delegates to :meth:`Result.fetchall`."""
+        """Fetch all remaining rows from the latest result."""
 
     def fetchitem(self) -> Any:
-        """
-        Return the lone scalar of a 1-row × 1-column result.
-        Delegates to :meth:`Result.fetchitem`.
-        """
+        """Return the lone scalar from the latest 1x1 result."""
 
     @property
     def rows_changed(self) -> int:
-        """
-        Rows affected by the most recent INSERT / UPDATE / DELETE.
-        Delegates to :attr:`Result.rows_changed`.
-        """
+        """Rows affected by the latest INSERT, UPDATE, or DELETE."""
 
     @property
     def description(self) -> list[tuple] | None:
@@ -487,12 +363,7 @@ class Connection:
 
     @property
     def current_result(self) -> Result:
-        """
-        The most recent :class:`Result` from :meth:`execute`.
-
-        Raises :class:`Error` if no query has run yet.
-        The conversion accessors (``arrow`` / ``df`` / ``pl`` / …) delegate to this.
-        """
+        """The latest execute result; raises if no query has run."""
 
     @overload
     def arrow(self) -> pyarrow.Table:
@@ -502,14 +373,10 @@ class Connection:
     def arrow(
         self, query: str, parameters: list | tuple | dict[str, Any] | None = None
     ) -> pyarrow.Table:
-        """
-        Execute `query` born-as-Arrow (DuckDB's Arrow collector) and return a pyarrow.Table — the fast whole-result path, equivalent in result to execute(query, parameters).arrow(). Since the return value is a whole Table, memory is inherently unbounded here; use arrow_reader() for a bounded, incrementally-consumed alternative. `parameters` binds like execute().
-        """
+        """Execute a query and return its complete Arrow table."""
 
     def arrow_batches(self) -> pyarrow.RecordBatchReader:
-        """
-        Stream the result as a pyarrow.RecordBatchReader, one RecordBatch per chunk (~2048 rows). The lazy, Arrow-native counterpart of iter_batches.
-        """
+        """Stream one Arrow record batch per DuckDB chunk."""
 
     def df(self) -> pandas.DataFrame:
         """Return the result as a pandas.DataFrame."""
@@ -523,7 +390,7 @@ class Connection:
 
     def fetchnumpy(self) -> dict[str, numpy.ndarray]:
         """
-        Return the result as a dict of column name -> numpy array. Numeric / temporal columns only; use arrow() for strings / nested types.
+        Return the result as a dict of column name -> numpy array. Numeric and temporal columns only; use arrow() for strings and nested types.
         """
 
     def chunks(self) -> Iterator[Chunk]:
@@ -547,9 +414,7 @@ class Connection:
     def iter_batches_torch(
         self, columns: Iterable[str] | None = None, device: torch.device | str | int | None = None
     ) -> Iterator[dict[str, torch.Tensor]]:
-        """
-        Yield one dict per chunk: {name: torch.Tensor}. Zero-copy on CPU via DLPack.
-        """
+        """Yield Torch tensors per chunk."""
 
     def iter_batches_jax(
         self, columns: Iterable[str] | None = None, device: jax.Device | None = None
@@ -559,22 +424,20 @@ class Connection:
     def iter_batches_mlx(
         self, columns: Iterable[str] | None = None
     ) -> Iterator[dict[str, mx.array]]:
-        """
-        Yield one dict per chunk: {name: mlx.core.array}. Zero-copy on CPU via DLPack.
-        """
+        """Yield MLX arrays per chunk."""
 
     def to_torch(
         self, columns: Iterable[str] | None = None, device: torch.device | str | int | None = None
     ) -> dict[str, torch.Tensor]:
-        """Eagerly concatenate all chunks into {name: torch.Tensor}."""
+        """Return selected columns as Torch tensors."""
 
     def to_jax(
         self, columns: Iterable[str] | None = None, device: jax.Device | None = None
     ) -> dict[str, jax.Array]:
-        """Eagerly concatenate all chunks into {name: jax.Array}."""
+        """Return selected columns as JAX arrays."""
 
     def to_mlx(self, columns: Iterable[str] | None = None) -> dict[str, mx.array]:
-        """Eagerly concatenate all chunks into {name: mlx.core.array}."""
+        """Return selected columns as MLX arrays."""
 
     def arrow_reader(
         self,
@@ -582,13 +445,11 @@ class Connection:
         parameters: list | tuple | dict[str, Any] | None = None,
         rows_per_batch: int = 1000000,
     ) -> pyarrow.RecordBatchReader:
-        """
-        Execute `query` as a lazily-pulled result and return a pyarrow.RecordBatchReader, coalescing DuckDB chunks into batches of up to `rows_per_batch` rows. Peak memory is bounded by one batch, not the whole result. `parameters` binds like execute().
-        """
+        """Execute a query and stream batches of up to ``rows_per_batch`` rows."""
 
     def to_numpy(self, columns: Iterable[str] | None = None) -> dict[str, numpy.ndarray]:
         """
-        Drain the latest result into a {name: numpy.ndarray} dict. Raises on VARCHAR/LIST/STRUCT/MAP — use .arrow() for those.
+        Drain the latest result into a {name: numpy.ndarray} dict. Raises on VARCHAR/LIST/STRUCT/MAP; use arrow() for those.
         """
 
     def create_function(
@@ -604,31 +465,7 @@ class Connection:
         special_handling: bool = False,
     ) -> None:
         """
-        Register a Python callable as a DuckDB scalar UDF.
-
-        Inputs arrive as zero-copy 1-D ndarrays; ``fn`` must return one ndarray of matching dtype.
-
-        Parameters
-        ----------
-        name : str
-            Name to register the function under.
-        fn : callable
-            Called as ``fn(*args)`` (positional ``parameters``) or ``fn(kwargs)`` (dict ``parameters``).
-        parameters : list[str] | dict[str, str], optional
-            DuckDB type strings — list for positional, dict for keyword.
-            If omitted, types are inferred from ``fn``'s annotations (``bool``/``int``/``float`` → ``BOOLEAN``/``BIGINT``/``DOUBLE``).
-        return_type : str, optional
-            Inferred from annotations if omitted.
-        varargs : str, optional
-            DuckDB type for a variable-arity function.
-            Mutually exclusive with ``parameters``.
-        init : callable, optional
-            Zero-arg factory for per-worker-thread state.
-            Its return value becomes the first positional arg of ``fn`` on every chunk.
-        volatile : bool, default False
-            Mark non-deterministic (e.g. RNG, clock) so the optimizer won't fold or cache it.
-        special_handling : bool, default False
-            NULL-aware: arguments arrive as ``(values, mask)`` tuples (``mask`` is a 1-D uint8 ndarray, 1 = valid) and the UDF emits NULLs via the same return shape.
+        Register a chunk-wise NumPy scalar UDF. Types may be explicit or inferred. With special_handling, inputs and output use ``(values, validity)`` tuples.
         """
 
     def create_arrow_function(
@@ -640,68 +477,36 @@ class Connection:
         record_batch: bool = False,
     ) -> None:
         """
-        Register a scalar UDF backed by the Arrow C-API path.
-
-        Supports VARCHAR, LIST, STRUCT, DECIMAL, MAP — anything DuckDB can round-trip through Arrow.
-        ``fn`` is called with one ``pyarrow.Array`` per column (positional, or ``{name: Array}`` dict if ``parameters`` is a dict); set ``record_batch=True`` to receive one ``pyarrow.RecordBatch`` instead.
-        Must return a ``pyarrow.Array``.
+        Register an Arrow scalar UDF. The callable receives Arrow arrays, a named array dict, or a RecordBatch, and returns an Arrow array.
         """
 
     def create_aggregate_function(
         self, name: str, cls: type, parameters: list[str] | dict[str, str], return_type: str
     ) -> None:
         """
-        Register a Python class as a DuckDB aggregate UDF.
-
-        ``cls`` must define ``__init__``, ``update(self, *arrays)``, and ``finalize(self) -> scalar``.
-        An optional ``combine(self, other)`` merges partial states into ``self``. Without it, DuckDB's routine single-state merge (every query goes through one, even single-threaded ones) still works via a plain state copy; only a genuine parallel/repartitioned merge of two states that *both* accumulated real data raises a clear error at query time instead of silently returning a wrong aggregate value.
+        Register an aggregate class defining update and finalize. Define combine to support merging populated partial states.
         """
 
     def create_table_function(
         self, name: str, factory: Callable, parameters: list[str], columns: dict[str, str]
     ) -> None:
-        """
-        Register a Python generator as a DuckDB table function.
-
-        ``factory`` is called with the SQL arguments and must return a generator that yields one tuple per row.
-        ``columns`` is an ordered dict ``{column_name: type_string}`` declaring the output schema.
-        """
+        """Register a table function yielding rows matching ``columns``."""
 
     def appender(
         self, table: str, schema: str | None = None, catalog: str | None = None
     ) -> Appender:
-        """
-        Open an :class:`Appender` for bulk inserts into ``table``.
-
-        The appender shares the connection's database handle, so the database stays open until the appender is closed.
-        """
+        """Open a bulk appender for ``table``."""
 
     def interrupt(self) -> None:
-        """
-        Best-effort cancel of any query running on this connection.
-
-        Safe to call from another thread while :meth:`execute` is in flight.
-        """
+        """Request cancellation of a running query; thread-safe."""
 
     def progress(self) -> tuple[float, int, int]:
         """
-        Snapshot of the current query's progress.
-
-        Returns
-        -------
-        tuple[float, int, int]
-            ``(percentage, rows_processed, total_rows_to_process)``.
-            ``percentage`` is ``-1.0`` until DuckDB has an estimate.
+        Return ``(percentage, rows_processed, total_rows)``; percentage is -1 until estimated.
         """
 
     def get_profiling_info(self) -> dict[str, Any] | None:
-        """
-        Programmatic EXPLAIN ANALYZE for the most recent query.
-
-        Returns a nested ``{"metrics": {str: str}, "children": [...]}`` dict, or ``None`` if profiling isn't enabled.
-        For ergonomics use :func:`ducky.profile` (context manager) or :func:`ducky.format_profiling_info` (pretty-printer).
-        Metric values are strings per the DuckDB C API; coerce numerics on the caller side.
-        """
+        """Return the latest profiling tree, or None when profiling is disabled."""
 
     def set_profile_sink(
         self,
@@ -711,40 +516,15 @@ class Connection:
         mode: str = "standard",
     ) -> None:
         """
-        Install an always-on profile sink for every :meth:`execute` / :meth:`sql` on this connection.
-
-        Parameters
-        ----------
-        sink : callable or None
-            Called as ``sink(query, info)`` after every materialized query with the same nested dict :meth:`get_profiling_info` returns.
-            Pass ``None`` to detach.
-        sample : int, default 1
-            Fire the sink every Nth query (useful in tight training loops).
-        mode : str, default 'standard'
-            DuckDB ``profiling_mode``. ``'detailed'`` adds per-operator counters like ``cpu_time``.
-
-        Notes
-        -----
-        Streaming results (``streaming=True``) are skipped — their chunks haven't been pulled when ``execute`` returns.
-        Sink exceptions are reported via ``PyErr_WriteUnraisable`` and do not propagate.
+        Call ``sink(query, info)`` after every Nth materialized query. Pass None to detach. Streaming queries are skipped.
         """
 
     def register_arrow(self, name: str, obj: Any) -> None:
-        """
-        Register an Arrow-PyCapsule source as a table named ``name``.
-
-        Accepts anything exposing ``__arrow_c_stream__`` (pyarrow Table, polars / pandas-3 DataFrame, …).
-        The source is kept and re-streamed on each query via a replacement scan, so it must support being streamed more than once. Queries scan it in parallel; primitive columns are read zero-copy from the Arrow buffers, and each execution buffers the stream's batches (cheap chunk wraps for an in-memory table, a full materialization for an unbounded reader).
-        """
+        """Register a reusable Arrow C stream source as table ``name``."""
 
     def load_extension(self, name: str) -> None:
         """
-        Load a DuckDB extension by name or by path to a ``.duckdb_extension`` binary.
-
-        Issues ``LOAD '<name>'``. DuckDB validates the binary's platform, ABI type, version, and signature against this build.
-        Unsigned or self-built extensions require the connection to have been opened with ``allow_unsigned_extensions=True``.
-        Because ducky pins a development DuckDB commit, prebuilt C++-ABI extensions from the official repository generally won't match; the reliable routes are C-API (``C_STRUCT``) extensions within the CAPI version range, or extensions built against ducky's pinned commit.
-        Raises :class:`Error` with DuckDB's message on failure.
+        Load an extension by name or path. Unsigned extensions require allow_unsigned_extensions=True when connecting.
         """
 
     def close(self) -> None:
@@ -756,24 +536,10 @@ class Connection:
         exc_type: type[BaseException] | None,
         exc_value: BaseException | None,
         traceback: TracebackType | None,
-    ) -> None:
-        pass
+    ) -> None: ...
 
 def connect(database: str = ":memory:", config: dict[str, str] | None = None) -> Connection:
-    """
-    Open ``database`` (default in-memory) and return a :class:`Connection`.
-
-    Low-level entrypoint.
-    The Python wrapper :func:`ducky.connect` accepts DuckDB settings as typed keyword arguments and is what most users want.
-
-    Parameters
-    ----------
-    database : str, default ':memory:'
-        File path, ``':memory:'``, or any DuckDB connection string.
-    config : dict[str, str], optional
-        DuckDB settings applied at open time.
-        See :func:`config_options`.
-    """
+    """Open a database with an optional string-valued configuration."""
 
 def config_options() -> list[tuple[str, str]]:
     """

@@ -18,16 +18,10 @@ namespace nb = nanobind;
 class PreparedStatement;
 struct ArrowRegistry;
 
-// A steppable handle over a duckdb_pending_result, driven from Python by
-// ducky._aio. execute_task() advances one task (GIL released); the coroutine
-// yields between ticks. drain() must not race an in-flight tick: it calls
-// duckdb_interrupt first (safe cross-thread, ends the tick promptly) then
-// takes mu_ with the GIL released so the worker can return.
+// Steppable pending result used by ducky._aio.
 class PendingResult {
    public:
-    // Takes ownership of `pending`. If `owns_stmt`, also owns and destroys
-    // `stmt` (the Connection path prepares a throwaway statement; the
-    // PreparedStatement path passes owns_stmt=false).
+    // Takes `pending`, and `stmt` when `owns_stmt`.
     PendingResult(duckdb_pending_result pending, duckdb_prepared_statement stmt, bool owns_stmt,
                   duckdb_connection con, std::shared_ptr<DuckDBHandle> handle);
     ~PendingResult();
@@ -56,36 +50,26 @@ class PendingResult {
     std::shared_ptr<DuckDBHandle> handle_;
 };
 
-// A DuckDB database handle plus one connection to it. Each Connection owns its
-// own database, so two ":memory:" connections are isolated.
+// A DuckDB database and connection.
 class Connection {
    public:
-    // `config` is an optional Mapping[str, str] applied via duckdb_set_config
-    // before open. Invalid keys/values raise DuckyError.
+    // `config` is an optional Mapping[str, str].
     Connection(const std::string& database, nb::object config);
     ~Connection();
 
     Connection(const Connection&) = delete;
     Connection& operator=(const Connection&) = delete;
 
-    // Run a query and stash the result for the PEP 249 fetch* methods. Returns
-    // *this for chaining (e.g. con.execute(...).fetchall()).
+    // Run a query and retain its result for fetch methods.
     Connection& execute(const std::string& query, nb::object parameters, bool streaming);
 
     // Run a query and return its Result directly.
     std::shared_ptr<Result> sql(const std::string& query, bool streaming);
 
-    // PEP 249 executemany: run `query` once per parameter set in `seq`,
-    // discarding each result. Prepares once (through the statement cache), so
-    // loops skip per-row parse + plan.
+    // Run once per parameter set and discard the results.
     void executemany(const std::string& query, nb::object seq);
 
-    // Execute `query` with DuckDB's Arrow result collector and return an
-    // `arrow_array_stream` PyCapsule (born-as-Arrow: batches assembled during
-    // execution, no chunk->Arrow conversion pass). One batch per
-    // `rows_per_batch`-row collector batch. `parameters` binds like execute().
-    // Uses duckdb_pending_prepared_arrow/duckdb_result_arrow_array_stream from
-    // the C-API patch stack (patches/, applied to ext/duckdb by picky).
+    // Execute with the Arrow collector and return a stream capsule.
     nb::object arrow_collected_stream(const std::string& query, nb::object parameters,
                                       uint64_t rows_per_batch);
 
@@ -93,8 +77,7 @@ class Connection {
     // The returned handle owns a throwaway prepared statement.
     PendingResult* make_pending(const std::string& query, nb::object parameters, bool streaming);
 
-    // Compile `query` once into a PreparedStatement reusable across executions
-    // with different parameters.
+    // Compile a reusable prepared statement.
     PreparedStatement* prepare(const std::string& query);
 
     nb::object fetchone();
@@ -107,14 +90,13 @@ class Connection {
     // The last result from execute(), for the DataFrame/Arrow accessors.
     std::shared_ptr<Result> current_result();
 
-    // Raw C-API connection handle. Used by UDF registration in function.cpp.
+    // Raw C API handle.
     duckdb_connection raw_connection() {
         ensure_open();
         return handle_->connection;
     }
 
-    // Shared owner of the database + connection. Used by Appender to keep the
-    // database open for the appender's lifetime.
+    // Shared database and connection owner.
     std::shared_ptr<DuckDBHandle> handle() const { return handle_; }
 
     // Thread-safe; no-op if no query is in flight.
@@ -124,38 +106,21 @@ class Connection {
     // `percentage` is -1.0 until DuckDB has an estimate. Thread-safe.
     nb::tuple progress() const;
 
-    // Post-execution profiling tree as a nested
-    // {"metrics": {str: str}, "children": [...]} dict, or None if profiling
-    // isn't enabled. Values are strings (DuckDB C API); callers coerce.
+    // Return the profiling tree, or None when disabled.
     nb::object get_profiling_info() const;
 
-    // Install an always-on profile sink: every execute()/sql() invokes
-    // sink(query, info). Enables profiling on the connection. `sample=N` fires
-    // every Nth query. Pass `sink=None` to detach; profiling settings are not
-    // restored.
+    // Invoke a profile sink every `sample` materialized queries.
     void set_profile_sink(nb::object sink, int64_t sample, const std::string& mode);
 
-    // Register an Arrow-PyCapsule source as a table named `name`. The source
-    // is kept and re-streamed on each query via a replacement scan.
+    // Register a reusable Arrow stream source as a table.
     void register_arrow(const std::string& name, nb::object obj);
 
-    // Load a DuckDB extension by name (if already installed) or by path to a
-    // `.duckdb_extension` binary. Issues `LOAD '<name>'`; DuckDB validates the
-    // binary's platform, ABI type, version, and signature. Unsigned / self-built
-    // binaries require the connection to have been opened with allow_unsigned
-    // (allow_unsigned_extensions=true), which is an open-only setting. Raises
-    // DuckyError carrying DuckDB's message (incl. the metadata-mismatch /
-    // unsigned hints) on failure.
+    // Load an extension by name or path.
     void load_extension(const std::string& name);
 
     void close();
 
-    // Cyclic-GC integration, wired to Py_tp_traverse / Py_tp_clear in
-    // ducky.cpp. A profile sink or registered Arrow source usually closes over
-    // the connection (its __globals__ or a bound self points back here), and
-    // without traversal support that cycle is uncollectable. gc_traverse
-    // visits the Python objects this connection owns; gc_clear drops them to
-    // break the cycle.
+    // Visit and clear Python references for cyclic GC.
     int gc_traverse(visitproc visit, void* arg) const;
     void gc_clear();
 
@@ -163,50 +128,57 @@ class Connection {
     void ensure_open() const;
     duckdb_result run(const std::string& query, nb::object parameters, bool streaming);
 
-    // Prepared-statement LRU for run(), keyed by exact query text, so repeated
-    // execute()/sql() calls skip parse + plan. Entries are checked out (removed)
-    // while a query runs, since run_pending releases the GIL between ticks and
-    // another thread could otherwise rebind the same statement mid-execution.
-    // Catalog changes rebind cached plans inside DuckDB; settings changes don't,
-    // so keeps_stmt_cache() in connection.cpp flushes the whole cache on those.
-    struct CachedStmt {
+    // Prepared-statement LRU keyed by exact query text.
+    struct CachedStatement {
         std::string query;
         duckdb_prepared_statement stmt;
     };
     // Returns the cached statement for `query` (removing it from the cache),
     // or nullptr on a miss.
-    duckdb_prepared_statement stmt_cache_checkout(const std::string& query);
+    duckdb_prepared_statement statement_cache_checkout(const std::string& query);
     // Returns a statement to the cache as most-recently-used, evicting the
     // least-recently-used entry past capacity.
-    void stmt_cache_checkin(const std::string& query, duckdb_prepared_statement stmt);
+    void statement_cache_checkin(const std::string& query, duckdb_prepared_statement stmt);
     // Destroys every cached statement. Must run before the connection closes.
-    void stmt_cache_clear();
-    // Shares ownership of the database/connection handle so the result (and
-    // any Arrow stream from it) outlives this Connection.
+    void statement_cache_clear();
+    // Post-run disposal of a checked-out statement: flushes plans its execution
+    // invalidated, then caches or destroys it.
+    void statement_cache_retire(const std::string& query, duckdb_prepared_statement stmt);
+
+    // One execution's checked-out or freshly prepared statement.
+    class StatementLease {
+       public:
+        // Check out an unbound cached statement or prepare one.
+        StatementLease(Connection& con, const std::string& query);
+        ~StatementLease();
+
+        StatementLease(const StatementLease&) = delete;
+        StatementLease& operator=(const StatementLease&) = delete;
+
+        duckdb_prepared_statement get() const { return stmt_; }
+        // Hands the statement back to the cache per statement_cache_retire. Call
+        // only after the execution succeeded.
+        void retire();
+
+       private:
+        Connection& con_;
+        const std::string& query_;
+        duckdb_prepared_statement stmt_ = nullptr;
+    };
+    // Make a result sharing the database handle.
     std::shared_ptr<Result> make_result(duckdb_result result);
-    // Fire the sink if installed and the sample counter hits. Called from
-    // run() for materialized queries only — streaming profiles would reflect
-    // the previous query.
+    // Fire the sink for sampled materialized queries.
     void maybe_emit_profile(const std::string& query);
 
-    // Front = most recently used. The map indexes list nodes by query text;
-    // GIL builds serialize access via the GIL (the cache is only touched with
-    // it held), free-threaded builds via nb::lock_self() on execute()/sql().
-    std::list<CachedStmt> stmt_lru_;
-    tsl::robin_map<std::string, std::list<CachedStmt>::iterator> stmt_cache_;
+    // Front is most recently used.
+    std::list<CachedStatement> statement_lru_;
+    tsl::robin_map<std::string, std::list<CachedStatement>::iterator> statement_cache_;
 
-    // Guards handle_ against interrupt()/progress() (which deliberately skip
-    // nb::lock_self() so they can preempt an in-flight execute() from another
-    // thread) racing close() (which resets handle_ under lock_self()).
-    // lock_self() alone doesn't protect this pair since interrupt()/progress()
-    // never take it. Held only around the pointer read/reset, never across the
-    // DuckDB C call itself.
+    // Guards handle_ reads and reset; never held across DuckDB calls.
     mutable nb::ft_mutex handle_mu_;
     std::shared_ptr<DuckDBHandle> handle_;
     std::shared_ptr<Result> last_result_;
-    // Declared last so it tears down first: its nb::object refs decref before
-    // the database handle closes. ~Connection is out-of-line so ArrowRegistry
-    // can be incomplete here. Shared, not owned: see install_arrow_scan.
+    // Declared last so its Python references are released first.
     std::shared_ptr<ArrowRegistry> arrow_registry_;
     // nb::none() when no sink is installed.
     nb::object profile_sink_;

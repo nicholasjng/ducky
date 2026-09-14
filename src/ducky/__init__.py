@@ -48,32 +48,10 @@ def connect(
     database: str = ":memory:",
     **config: Unpack[DuckDBConfig],
 ) -> Connection:
-    """Open ``database`` and return a :class:`Connection`.
-
-    DuckDB settings are passed as natural-typed keyword arguments using the keys declared in :class:`DuckDBConfig`.
-    Values are coerced to strings for DuckDB; an invalid key or value raises :class:`Error` at open time.
-
-    Parameters
-    ----------
-    database : str, default ':memory:'
-        File path, ``':memory:'``, or any DuckDB connection string.
-    **config : DuckDBConfig
-        DuckDB settings applied at open.
-        See :func:`config_options` for the full list.
-
-    Examples
-    --------
-    >>> con = ducky.connect(memory_limit="2GB", threads=4)
-    >>> con = ducky.connect("mydb.duckdb", access_mode="READ_ONLY")
-    >>> con = ducky.connect(allow_unsigned_extensions=True)
-    >>> con.load_extension("/path/to/my.duckdb_extension")
-    """
+    """Open a DuckDB database with optional configuration settings."""
 
     def coerce(value: object) -> str:
-        # Coerce a config value to the string form duckdb_set_config expects.
-        # bool is checked before int (it is an int subclass) so flags become
-        # DuckDB's "true"/"false" rather than "1"/"0". Strings pass through; any
-        # other scalar is stringified. DuckDB validates the result at open time.
+        # DuckDB expects lowercase Boolean strings.
         if isinstance(value, bool):
             return "true" if value else "false"
         if isinstance(value, str):
@@ -83,8 +61,6 @@ def connect(
     coerced = {key: coerce(value) for key, value in config.items()}
     con = _connect(database, coerced or None)
 
-    # if DUCKY_PROFILE_DIR is set, attach a JSONL sink so every execute()/sql()
-    # on this connection lands in {dir}/profile-{pid}.jsonl with no code change.
     if cfg := ProfileConfig.from_env():
         con.set_profile_sink(cfg.sink, sample=cfg.sample, mode=cfg.mode)
 

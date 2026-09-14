@@ -72,6 +72,27 @@ def test_decimal_round_trip(con):
     assert v == Decimal("11.0000")
 
 
+def test_widened_return_is_cast_to_declared_type(con):
+    """Cast widened Arrow results to the declared DuckDB type."""
+
+    def add_tax(x):
+        return pc.multiply(x, pa.scalar(Decimal("1.10"), type=pa.decimal128(5, 2)))
+
+    con.create_arrow_function(
+        "tax_many", add_tax, parameters=["DECIMAL(5,2)"], return_type="DECIMAL(7,4)"
+    )
+    rows = con.sql(
+        "SELECT tax_many(CAST(v AS DECIMAL(5,2))) "
+        "FROM (VALUES (10.00), (20.00), (30.00), (40.00)) t(v)"
+    ).fetchall()
+    assert [r[0] for r in rows] == [
+        Decimal("11.0000"),
+        Decimal("22.0000"),
+        Decimal("33.0000"),
+        Decimal("44.0000"),
+    ]
+
+
 def test_chunk_boundary(con):
     n = 5000
     con.create_arrow_function(

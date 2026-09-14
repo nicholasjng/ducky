@@ -157,8 +157,7 @@ def test_unsupported_column_type_rejected_at_registration(con):
     def gen():
         yield (1,)
 
-    # These used to corrupt memory at query time via the string-assignment
-    # fallback; now they raise up front.
+    # Unsupported types fail during registration.
     with pytest.raises(ducky.Error, match="unsupported type DECIMAL"):
         con.create_table_function("dec_fn", gen, parameters=[], columns={"v": "DECIMAL(9,2)"})
     with pytest.raises(ducky.Error, match="unsupported type LIST"):

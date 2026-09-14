@@ -1,13 +1,4 @@
-"""Tests for Connection.load_extension() and connect(allow_unsigned_extensions=...).
-
-ducky pins a development DuckDB commit, so we can't pull a real prebuilt
-extension from the official repository (the C++-ABI version check won't match).
-The default tests therefore exercise the binding's mechanics — the
-statically-linked path, error surfacing, SQL-literal escaping, the icu parity
-add, and the open-only allow_unsigned_extensions setting. A genuine
-not-statically-linked load is covered by test_load_external_unsigned_extension,
-gated on DUCKY_EXT_BINARY (a loadable binary built out-of-band against our pin).
-"""
+"""Extension loading and configuration."""
 
 from __future__ import annotations
 

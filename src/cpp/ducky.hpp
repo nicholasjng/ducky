@@ -10,36 +10,28 @@
 
 namespace nb = nanobind;
 
-// DuckDB's error accessors (duckdb_result_error, duckdb_pending_error,
-// duckdb_prepare_error) return nullptr when the handle carries no error — and
-// duckdb_pending_prepared_arrow reports DuckDBError without ever allocating a
-// pending result, so an error path really can be handed one. std::string(nullptr)
-// is UB, so every message read goes through here.
+// Safely copy nullable DuckDB error strings.
 inline std::string duckdb_message(const char* msg) {
     return msg ? std::string(msg) : std::string("unknown DuckDB error");
 }
 
-// Exception thrown across the binding layer. Registered with nanobind in
-// ducky.cpp so it surfaces in Python as `ducky.Error`.
+// Python-visible binding error.
 struct DuckyError : std::runtime_error {
     using std::runtime_error::runtime_error;
 };
 
-// Sentinel for "use this column's DEFAULT value" in Appender.append_row. Bound
-// in ducky.cpp as the `_Default` type; the lone instance is exposed as
-// `ducky.DEFAULT`. The appender checks for it via nb::isinstance<DefaultSentinel>.
+// Delete a Python-owning callback context while holding the GIL.
+template <typename T>
+void gil_delete(void* ptr) {
+    if (!ptr) return;
+    nb::gil_scoped_acquire gil;
+    delete (T*)ptr;
+}
+
+// Appender sentinel for a column's DEFAULT expression.
 struct DefaultSentinel {};
 
-// Lazily construct a process-wide singleton of type T from `init`, caching it
-// behind an atomic pointer guarded by a free-threading mutex. The instance is
-// intentionally leaked so its destructor never runs at interpreter shutdown,
-// when the Python objects it captures may already be torn down.
-//
-// `init` runs at most once per successful publish and may release the GIL (it
-// typically imports modules); we never hold `mu` across it, so a thread racing
-// in can't deadlock against the importing thread. On a lost race the value we
-// built is discarded. Callers own the `cached`/`mu` statics so each singleton
-// is independent. Requires the GIL on entry (the discard path decrefs T).
+// Publish a lazily built, process-lifetime singleton without locking across init.
 template <typename T, typename Init>
 const T& cached_singleton(std::atomic<T*>& cached, nb::ft_mutex& mu, Init&& init) {
     if (T* p = cached.load()) return *p;
@@ -53,11 +45,7 @@ const T& cached_singleton(std::atomic<T*>& cached, nb::ft_mutex& mu, Init&& init
     return *built;
 }
 
-// Run `body()` and funnel any C++ or Python exception into DuckDB's per-callback
-// error channel via `set_error(const char*)`. Returns true when `body` ran to
-// completion, false when it threw (and the error was reported). Used by the UDF
-// / aggregate / table trampolines, which run with the GIL held and must never
-// let an exception unwind across the C ABI boundary back into DuckDB.
+// Report callback exceptions through DuckDB instead of crossing the C ABI.
 template <typename Body, typename SetError>
 bool guard(Body&& body, SetError&& set_error) {
     try {

@@ -1,13 +1,4 @@
-"""Async drivers behind :meth:`Connection.aexecute` / :meth:`Connection.asql`.
-
-The C++ ``aexecute`` / ``asql`` methods forward here, handing us a steppable :class:`PendingResult` (see ``connection.hpp``).
-We own the executor loop from Python: each tick is offloaded to a worker thread.
-The DuckDB task releases the GIL, so the event loop thread stays free — and we yield to the loop between ticks instead of blocking on it.
-Cancellation (a cancelled task, or Ctrl-C) maps onto DuckDB's interrupt + drain teardown, mirroring the synchronous ``run_pending`` path.
-
-Unlike the synchronous :meth:`Connection.execute` (which stashes ``current_result``), the async drivers resolve to the :class:`Result` directly —
-no connection state is mutated from inside the coroutine, so concurrent awaits on one connection can't trample each other's "current result".
-"""
+"""Async query drivers."""
 
 from __future__ import annotations
 
@@ -31,15 +22,10 @@ async def _drive(pending: PendingResult) -> Result:
             if state == PendingState.ERROR:
                 raise Error(pending.error())
             if state == PendingState.NO_TASKS:
-                # Workers own the outstanding tasks. Yield to the loop first —
-                # short queries finish within a tick or two — but once the
-                # streak shows a genuinely long query, back off to a real sleep
-                # so this coroutine doesn't burn a core re-dispatching no-op
-                # ticks through the thread pool.
+                # Back off after repeated no-op ticks.
                 no_tasks_streak += 1
                 await asyncio.sleep(0 if no_tasks_streak < 4 else 0.001)
             else:
-                # NOT_READY: more for us to do — tick again immediately.
                 no_tasks_streak = 0
     except (asyncio.CancelledError, KeyboardInterrupt):
         pending.drain()

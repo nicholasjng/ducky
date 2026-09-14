@@ -1,9 +1,4 @@
-"""The per-connection prepared-statement cache used by execute()/sql().
-
-The cache is invisible by design — these tests pin down the behaviors that
-must match a fresh prepare on every call: no parameter leakage, catalog
-changes picked up, errors identical, and correctness past the LRU capacity.
-"""
+"""Prepared-statement cache behavior."""
 
 import pytest
 
@@ -65,6 +60,13 @@ def test_failed_execution_does_not_poison_the_cache(con):
         con.execute("INSERT INTO t VALUES (?)", [1])
     con.execute("INSERT INTO t VALUES (?)", [2])
     assert con.execute("SELECT count(*) FROM t").fetchitem() == 2
+
+
+def test_connection_executemany_does_not_reuse_missing_named_parameter(con):
+    con.execute("CREATE TABLE t(a INTEGER, b INTEGER)")
+    with pytest.raises(ducky.Error, match="[Pp]arameter"):
+        con.executemany("INSERT INTO t VALUES ($a, $b)", [{"a": 1, "b": 2}, {"a": 3}])
+    assert con.sql("SELECT * FROM t").fetchall() == [(1, 2)]
 
 
 def test_streaming_and_materialized_share_cached_statement(con):

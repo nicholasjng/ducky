@@ -7,6 +7,7 @@
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 
 #include "arrow_abi.h"
 #include "chunk.hpp"
@@ -17,9 +18,7 @@ using namespace nb::literals;
 
 namespace {
 
-// Python types and instances used by convert_value. Imported once,
-// intentionally leaked so destructors don't run at interpreter shutdown.
-// date / time / timedelta values are built via the PyDateTime_* CAPI macros.
+// Cached Python conversion types.
 struct PyTypes {
     nb::type_object datetime;  // datetime.datetime (tz-aware branch only)
     nb::object timezone_utc;   // datetime.timezone.utc
@@ -67,9 +66,7 @@ nb::object uhugeint_to_py(duckdb_uhugeint value) {
     return combine_128(steal_checked(PyLong_FromUnsignedLongLong(value.upper)), value.lower);
 }
 
-// The temporal constructors below can fail — DuckDB's DATE/TIMESTAMP range
-// exceeds Python's year 1..9999 — so every PyDateTime_* call goes through
-// steal_checked to surface the ValueError instead of leaking a NULL object.
+// Surface temporal constructor errors from DuckDB values outside Python's range.
 nb::object date_to_py(int32_t days) {
     duckdb_date_struct s = duckdb_from_date(duckdb_date{days});
     return steal_checked(PyDate_FromDate(s.year, s.month, s.day));
@@ -122,11 +119,7 @@ nb::object decimal_to_py(void* data, idx_t row, duckdb_type internal, uint8_t sc
 }
 
 nb::object interval_to_py(duckdb_interval value) {
-    // timedelta has no months; approximate 1 month as 30 days. Use the Arrow
-    // path for an exact month / day / micros interval. Normalize in 64-bit —
-    // months * 30 and the raw micros can each overflow the int arguments
-    // PyDelta_FromDSU takes — and range-check days against timedelta's
-    // documented ±999999999-day limit so oversized intervals raise cleanly.
+    // timedelta approximates one month as 30 days; Arrow preserves components.
     int64_t seconds = value.micros / 1000000;
     int64_t micros = value.micros - seconds * 1000000;
     int64_t days = (int64_t)value.days + (int64_t)value.months * 30 + seconds / 86400;
@@ -152,11 +145,7 @@ idx_t enum_index(void* data, idx_t row, duckdb_type internal) {
 
 nb::object convert_value(duckdb_vector vector, duckdb_logical_type logical, idx_t row);
 
-// Convert the value at `row` to a Python object. `tid`, `data` and `validity`
-// are hoisted by the caller — once per (chunk, column) on the row-decode hot
-// path (Result::ColumnCursor), or per cell by convert_value for nested
-// children — so flat types make zero C API calls per cell here. `vector` and
-// `logical` are borrowed; only the nested/dictionary cases below touch them.
+// Convert one cell using pre-resolved vector metadata.
 nb::object convert_cell(duckdb_type tid, duckdb_vector vector, duckdb_logical_type logical,
                         void* data, uint64_t* validity, idx_t row) {
     if (validity && !duckdb_validity_row_is_valid(validity, row)) return nb::none();
@@ -282,20 +271,13 @@ nb::object convert_cell(duckdb_type tid, duckdb_vector vector, duckdb_logical_ty
     }
 }
 
-// Recursive entry point for nested children (LIST/STRUCT/ARRAY/MAP elements):
-// resolves the per-vector state convert_cell expects, once per cell.
+// Resolve vector metadata and convert one nested cell.
 nb::object convert_value(duckdb_vector vector, duckdb_logical_type logical, idx_t row) {
     return convert_cell(duckdb_get_type_id(logical), vector, logical,
                         duckdb_vector_get_data(vector), duckdb_vector_get_validity(vector), row);
 }
 
-// Byte width of a fixed-width column type whose DuckDB in-memory layout is
-// bit-identical to its Arrow primitive layout, or 0 if ineligible for the
-// combined fast path: the fixed-width numerics, plus temporals whose storage
-// matches Arrow's unit 1:1 (each verified bit-equal to duckdb_data_chunk_to_arrow
-// in test_arrow.py). Excludes BOOLEAN (Arrow packs it 1 bit/value),
-// HUGEINT/DECIMAL/INTERVAL, and variable-length/nested types — those take the
-// per-chunk fallback below.
+// Return the byte width when DuckDB and Arrow layouts match, otherwise 0.
 size_t fast_arrow_width(duckdb_type t) {
     switch (t) {
         case DUCKDB_TYPE_TINYINT:
@@ -324,29 +306,21 @@ size_t fast_arrow_width(duckdb_type t) {
     }
 }
 
-// ArrowArrayStream backing for a duckdb_result. The schema always comes from
-// duckdb_to_arrow_schema. get_next has two modes: when every column is
-// fast-path-eligible, it drains the whole result into one hand-built combined
-// Arrow record batch; otherwise it falls back to one Arrow array per DuckDB
-// chunk via duckdb_data_chunk_to_arrow, which handles every type. `owner`
-// keeps the ducky Result (and its duckdb_result) alive for the stream's life.
+// Arrow stream state for a duckdb_result.
 struct ArrowStreamState {
     nb::object owner;              // keeps the Result (and its duckdb_result) alive
     duckdb_result* result;         // borrowed from owner
     duckdb_arrow_options options;  // owned by the stream, destroyed on release
     bool fast;                     // all columns eligible -> one hand-built batch
     bool done;                     // fast path emits exactly one combined batch
-    // Exact remaining row count, or 0 when unknown (streaming result, or rows
-    // already consumed): lets the fast path allocate upfront and copy out of
-    // one reused scratch chunk instead of collecting every chunk first.
+    // Exact remaining rows, or 0 when unknown.
     idx_t known_total = 0;
     duckdb_data_chunk scratch = nullptr;  // reused across get_next calls
     std::vector<size_t> widths;           // per-column element width (fast path only)
     std::string last_error;
 };
 
-// Scratch chunk matching `result`'s column layout, for duckdb_fetch_chunk_into
-// loops. Returns nullptr on failure (e.g. a zero-column result).
+// Make a reusable chunk matching the result schema.
 duckdb_data_chunk make_scratch_chunk(duckdb_result* result) {
     idx_t n = duckdb_column_count(result);
     if (n == 0) return nullptr;
@@ -357,6 +331,47 @@ duckdb_data_chunk make_scratch_chunk(duckdb_result* result) {
     return chunk;
 }
 
+// Scope owner for a scratch chunk.
+struct ScratchChunk {
+    duckdb_data_chunk chunk;
+    explicit ScratchChunk(duckdb_result* result) : chunk(make_scratch_chunk(result)) {}
+    ~ScratchChunk() {
+        if (chunk) duckdb_destroy_data_chunk(&chunk);
+    }
+    ScratchChunk(const ScratchChunk&) = delete;
+    ScratchChunk& operator=(const ScratchChunk&) = delete;
+};
+
+// Remaining chunks retained when the row count is unknown.
+struct ChunkList {
+    std::vector<duckdb_data_chunk> chunks;
+    std::vector<idx_t> sizes;
+    idx_t total = 0;
+
+    explicit ChunkList(duckdb_result& result) {
+        while (duckdb_data_chunk ch = duckdb_fetch_chunk(result)) {
+            idx_t sz = duckdb_data_chunk_get_size(ch);
+            if (sz == 0) {
+                duckdb_destroy_data_chunk(&ch);
+                continue;
+            }
+            chunks.push_back(ch);
+            sizes.push_back(sz);
+            total += sz;
+        }
+    }
+    ~ChunkList() {
+        for (duckdb_data_chunk ch : chunks) duckdb_destroy_data_chunk(&ch);
+    }
+    ChunkList(const ChunkList&) = delete;
+    ChunkList& operator=(const ChunkList&) = delete;
+
+    size_t size() const { return chunks.size(); }
+    duckdb_vector vector(size_t i, idx_t col) const {
+        return duckdb_data_chunk_get_vector(chunks[i], col);
+    }
+};
+
 // Record + destroy a duckdb_error_data; returns true when an error was present.
 bool consume_error(ArrowStreamState* state, duckdb_error_data error) {
     if (!error) return false;
@@ -366,108 +381,56 @@ bool consume_error(ArrowStreamState* state, duckdb_error_data error) {
     return has_error;
 }
 
-// Owns every heap allocation backing one hand-built record batch. The root
-// ArrowArray's release frees this; children carry a no-op release because the
-// importer only releases the root, which tears down the whole tree at once.
+// Owns all buffers and child structures for one record batch.
 struct FastBatch {
     std::vector<void*> allocations;                      // data + validity buffers to free
     std::vector<ArrowArray> children;                    // one struct per column (stable)
     std::vector<ArrowArray*> child_ptrs;                 // root.children points here
     std::vector<std::array<const void*, 2>> child_bufs;  // [validity, data] per column
     const void* root_buf[1] = {nullptr};                 // struct array: one (null) validity buf
+
+    explicit FastBatch(idx_t ncols) : children(ncols), child_ptrs(ncols), child_bufs(ncols) {}
+    ~FastBatch() {
+        for (void* p : allocations) std::free(p);
+    }
+    FastBatch(const FastBatch&) = delete;
+    FastBatch& operator=(const FastBatch&) = delete;
+
+    // Allocate and register a buffer owned by this batch.
+    void* alloc(size_t bytes) {
+        void* p = std::malloc(bytes);
+        if (!p) throw std::bad_alloc();
+        allocations.push_back(p);
+        return p;
+    }
 };
 
 void fast_release_child(ArrowArray* a) { a->release = nullptr; }  // root owns the memory
 
 void fast_release_root(ArrowArray* a) {
-    auto* b = (FastBatch*)a->private_data;
-    for (void* p : b->allocations) std::free(p);
-    delete b;
+    delete (FastBatch*)a->private_data;  // ~FastBatch frees the buffers
     a->release = nullptr;
     a->private_data = nullptr;
 }
 
-int stream_get_schema(ArrowArrayStream* stream, ArrowSchema* out) {
-    auto* state = (ArrowStreamState*)stream->private_data;
-    idx_t n = duckdb_column_count(state->result);
-    std::vector<duckdb_logical_type> types(n);
-    std::vector<const char*> names(n);
-    for (idx_t i = 0; i < n; ++i) {
-        types[i] = duckdb_column_logical_type(state->result, i);
-        names[i] = duckdb_column_name(state->result, i);
+// Merge a chunk's NULLs into a lazily allocated Arrow validity bitmap.
+void mark_nulls(FastBatch* b, uint8_t*& validity, size_t valid_bytes, uint64_t* val, idx_t sz,
+                size_t row_off) {
+    if (!validity) {
+        validity = (uint8_t*)b->alloc(valid_bytes);
+        std::memset(validity, 0xFF, valid_bytes);  // start all-valid
     }
-    duckdb_error_data error =
-        duckdb_to_arrow_schema(state->options, types.data(), names.data(), n, out);
-    for (idx_t i = 0; i < n; ++i) duckdb_destroy_logical_type(&types[i]);
-    return consume_error(state, error) ? EIO : 0;
+    for (idx_t r = 0; r < sz; ++r) {
+        if (!duckdb_validity_row_is_valid(val, r)) {
+            size_t bit = row_off + r;
+            validity[bit / 8] &= (uint8_t)~(1u << (bit % 8));
+        }
+    }
 }
 
-// Single-pass variant of build_fast_batch for a known exact row count (fresh
-// materialized result): allocates the combined buffers upfront and copies each
-// chunk out of one reused scratch chunk (duckdb_fetch_chunk_into — no per-chunk
-// allocation), instead of holding every chunk alive for a second pass.
-void build_fast_batch_known_total(ArrowStreamState* state, ArrowArray* out, idx_t total) {
-    idx_t ncols = duckdb_column_count(state->result);
-    size_t valid_bytes = (total + 7) / 8;
-
-    auto* b = new FastBatch();
-    b->children.resize(ncols);
-    b->child_ptrs.resize(ncols);
-    b->child_bufs.resize(ncols);
-    std::vector<uint8_t*> validities(ncols, nullptr);
-
-    duckdb_data_chunk scratch = nullptr;
-    try {
-        for (idx_t c = 0; c < ncols; ++c) {
-            void* data = std::malloc(total * state->widths[c]);
-            if (!data) throw std::bad_alloc();
-            b->allocations.push_back(data);
-            b->child_bufs[c] = {nullptr, data};
-        }
-
-        scratch = make_scratch_chunk(state->result);
-        if (!scratch) throw std::bad_alloc();
-        size_t row_off = 0;
-        while (duckdb_fetch_chunk_into(*state->result, scratch)) {
-            idx_t sz = duckdb_data_chunk_get_size(scratch);
-            if (row_off + sz > total) {
-                throw std::runtime_error("result produced more rows than duckdb_row_count");
-            }
-            for (idx_t c = 0; c < ncols; ++c) {
-                size_t width = state->widths[c];
-                duckdb_vector v = duckdb_data_chunk_get_vector(scratch, (idx_t)c);
-                std::memcpy((char*)b->child_bufs[c][1] + row_off * width, duckdb_vector_get_data(v),
-                            sz * width);
-                uint64_t* val = duckdb_vector_get_validity(v);
-                if (val) {
-                    uint8_t*& validity = validities[c];
-                    if (!validity) {
-                        validity = (uint8_t*)std::malloc(valid_bytes);
-                        if (!validity) throw std::bad_alloc();
-                        b->allocations.push_back(validity);
-                        std::memset(validity, 0xFF, valid_bytes);  // start all-valid
-                    }
-                    for (idx_t r = 0; r < sz; ++r) {
-                        if (!duckdb_validity_row_is_valid(val, r)) {
-                            size_t bit = row_off + r;
-                            validity[bit / 8] &= (uint8_t)~(1u << (bit % 8));
-                        }
-                    }
-                }
-            }
-            row_off += sz;
-        }
-        if (row_off != total) {
-            throw std::runtime_error("result produced fewer rows than duckdb_row_count");
-        }
-        duckdb_destroy_data_chunk(&scratch);
-    } catch (...) {
-        if (scratch) duckdb_destroy_data_chunk(&scratch);
-        for (void* p : b->allocations) std::free(p);
-        delete b;
-        throw;
-    }
-
+// Publish the batch as a struct array, transferring ownership to `out`.
+void finish_fast_batch(std::unique_ptr<FastBatch> b, ArrowArray* out, idx_t total, idx_t ncols,
+                       const std::vector<uint8_t*>& validities) {
     for (idx_t c = 0; c < ncols; ++c) {
         b->child_bufs[c][0] = validities[c];
         ArrowArray& child = b->children[c];
@@ -487,12 +450,62 @@ void build_fast_batch_known_total(ArrowStreamState* state, ArrowArray* out, idx_
     out->buffers = b->root_buf;
     out->children = b->child_ptrs.data();
     out->release = fast_release_root;
-    out->private_data = b;
+    out->private_data = b.release();
 }
 
-// Drain the whole result and hand-build one combined Arrow record batch. Only
-// called when every column is fast_arrow_width-eligible. Sets out->release to
-// nullptr (end-of-stream) for an empty result. Throws on allocation failure.
+int stream_get_schema(ArrowArrayStream* stream, ArrowSchema* out) {
+    auto* state = (ArrowStreamState*)stream->private_data;
+    idx_t n = duckdb_column_count(state->result);
+    std::vector<duckdb_logical_type> types(n);
+    std::vector<const char*> names(n);
+    for (idx_t i = 0; i < n; ++i) {
+        types[i] = duckdb_column_logical_type(state->result, i);
+        names[i] = duckdb_column_name(state->result, i);
+    }
+    duckdb_error_data error =
+        duckdb_to_arrow_schema(state->options, types.data(), names.data(), n, out);
+    for (idx_t i = 0; i < n; ++i) duckdb_destroy_logical_type(&types[i]);
+    return consume_error(state, error) ? EIO : 0;
+}
+
+// Build a combined batch in one pass when the row count is exact.
+void build_fast_batch_known_total(ArrowStreamState* state, ArrowArray* out, idx_t total) {
+    idx_t ncols = duckdb_column_count(state->result);
+    size_t valid_bytes = (total + 7) / 8;
+
+    auto b = std::make_unique<FastBatch>(ncols);
+    std::vector<uint8_t*> validities(ncols, nullptr);
+    for (idx_t c = 0; c < ncols; ++c) {
+        b->child_bufs[c] = {nullptr, b->alloc(total * state->widths[c])};
+    }
+
+    ScratchChunk scratch(state->result);
+    if (!scratch.chunk) throw std::bad_alloc();
+    size_t row_off = 0;
+    while (duckdb_fetch_chunk_into(*state->result, scratch.chunk)) {
+        idx_t sz = duckdb_data_chunk_get_size(scratch.chunk);
+        if (row_off + sz > total) {
+            throw std::runtime_error("result produced more rows than duckdb_row_count");
+        }
+        for (idx_t c = 0; c < ncols; ++c) {
+            size_t width = state->widths[c];
+            duckdb_vector v = duckdb_data_chunk_get_vector(scratch.chunk, c);
+            std::memcpy((char*)b->child_bufs[c][1] + row_off * width, duckdb_vector_get_data(v),
+                        sz * width);
+            if (uint64_t* val = duckdb_vector_get_validity(v)) {
+                mark_nulls(b.get(), validities[c], valid_bytes, val, sz, row_off);
+            }
+        }
+        row_off += sz;
+    }
+    if (row_off != total) {
+        throw std::runtime_error("result produced fewer rows than duckdb_row_count");
+    }
+
+    finish_fast_batch(std::move(b), out, total, ncols, validities);
+}
+
+// Drain layout-compatible columns into one Arrow batch.
 void build_fast_batch(ArrowStreamState* state, ArrowArray* out) {
     if (state->known_total > 0) {
         build_fast_batch_known_total(state, out, state->known_total);
@@ -500,96 +513,31 @@ void build_fast_batch(ArrowStreamState* state, ArrowArray* out) {
     }
     idx_t ncols = duckdb_column_count(state->result);
 
-    std::vector<duckdb_data_chunk> chunks;
-    std::vector<idx_t> sizes;
-    idx_t total = 0;
-    while (true) {
-        duckdb_data_chunk ch = duckdb_fetch_chunk(*state->result);
-        if (!ch) break;
-        idx_t sz = duckdb_data_chunk_get_size(ch);
-        if (sz == 0) {
-            duckdb_destroy_data_chunk(&ch);
-            continue;
-        }
-        chunks.push_back(ch);
-        sizes.push_back(sz);
-        total += sz;
-    }
-    auto cleanup_chunks = [&] {
-        for (duckdb_data_chunk ch : chunks) duckdb_destroy_data_chunk(&ch);
-    };
-    if (total == 0) {  // no rows -> emit no batch (out->release stays nullptr)
-        cleanup_chunks();
-        return;
-    }
-
-    auto* b = new FastBatch();
-    b->children.resize(ncols);
-    b->child_ptrs.resize(ncols);
-    b->child_bufs.resize(ncols);
+    ChunkList pulled(*state->result);
+    if (pulled.total == 0) return;  // no rows -> emit no batch (out->release stays nullptr)
+    idx_t total = pulled.total;
     size_t valid_bytes = (total + 7) / 8;
 
-    try {
-        for (idx_t c = 0; c < ncols; ++c) {
-            size_t width = state->widths[c];
-            void* data = std::malloc(total * width);
-            if (!data) throw std::bad_alloc();
-            b->allocations.push_back(data);
-
-            // Concatenate each chunk's flat data buffer; build a validity bitmap
-            // lazily and per-row (so it is correct regardless of chunk sizes) the
-            // first time a column actually carries nulls. No nulls anywhere -> no
-            // validity buffer at all, matching Arrow's all-valid convention.
-            uint8_t* validity = nullptr;
-            size_t row_off = 0;
-            for (size_t i = 0; i < chunks.size(); ++i) {
-                duckdb_vector v = duckdb_data_chunk_get_vector(chunks[i], (idx_t)c);
-                std::memcpy((char*)data + row_off * width, duckdb_vector_get_data(v),
-                            sizes[i] * width);
-                uint64_t* val = duckdb_vector_get_validity(v);
-                if (val) {
-                    if (!validity) {
-                        validity = (uint8_t*)std::malloc(valid_bytes);
-                        if (!validity) throw std::bad_alloc();
-                        b->allocations.push_back(validity);
-                        std::memset(validity, 0xFF, valid_bytes);  // start all-valid
-                    }
-                    for (idx_t r = 0; r < sizes[i]; ++r) {
-                        if (!duckdb_validity_row_is_valid(val, r)) {
-                            size_t bit = row_off + r;
-                            validity[bit / 8] &= (uint8_t)~(1u << (bit % 8));
-                        }
-                    }
-                }
-                row_off += sizes[i];
+    auto b = std::make_unique<FastBatch>(ncols);
+    std::vector<uint8_t*> validities(ncols, nullptr);
+    for (idx_t c = 0; c < ncols; ++c) {
+        // Concatenate data and validity across chunks.
+        size_t width = state->widths[c];
+        void* data = b->alloc(total * width);
+        b->child_bufs[c] = {nullptr, data};
+        size_t row_off = 0;
+        for (size_t i = 0; i < pulled.size(); ++i) {
+            duckdb_vector v = pulled.vector(i, c);
+            std::memcpy((char*)data + row_off * width, duckdb_vector_get_data(v),
+                        pulled.sizes[i] * width);
+            if (uint64_t* val = duckdb_vector_get_validity(v)) {
+                mark_nulls(b.get(), validities[c], valid_bytes, val, pulled.sizes[i], row_off);
             }
-
-            b->child_bufs[c] = {validity, data};
-            ArrowArray& child = b->children[c];
-            child = {};
-            child.length = (int64_t)total;
-            child.null_count = validity ? -1 : 0;  // -1: importer counts lazily
-            child.n_buffers = 2;
-            child.buffers = b->child_bufs[c].data();
-            child.release = fast_release_child;
-            b->child_ptrs[c] = &child;
+            row_off += pulled.sizes[i];
         }
-    } catch (...) {
-        cleanup_chunks();
-        for (void* p : b->allocations) std::free(p);
-        delete b;
-        throw;
     }
-    cleanup_chunks();
 
-    *out = {};
-    out->length = (int64_t)total;
-    out->n_buffers = 1;  // struct validity buffer, null = all valid
-    out->n_children = (int64_t)ncols;
-    out->buffers = b->root_buf;
-    out->children = b->child_ptrs.data();
-    out->release = fast_release_root;
-    out->private_data = b;
+    finish_fast_batch(std::move(b), out, total, ncols, validities);
 }
 
 int stream_get_next(ArrowArrayStream* stream, ArrowArray* out) {
@@ -606,9 +554,7 @@ int stream_get_next(ArrowArrayStream* stream, ArrowArray* out) {
         }
         return 0;
     }
-    // Fallback: one Arrow array per DuckDB data chunk (correct for every type).
-    // The scratch chunk is refilled in place per batch; duckdb_data_chunk_to_arrow
-    // copies its contents into Arrow-owned buffers, so reuse is safe.
+    // Convert one reusable DuckDB chunk into Arrow-owned buffers.
     if (!state->scratch) {
         state->scratch = make_scratch_chunk(state->result);
         if (!state->scratch) return 0;
@@ -649,14 +595,10 @@ nb::object Result::arrow_c_stream(nb::object self, bool allow_fast) {
     if (!handle_ || !handle_->connection) {
         throw DuckyError("ducky: Arrow export is unavailable; the connection is closed");
     }
-    // Options for the C-API schema path (and the per-chunk fallback). Taken from
-    // the result so the schema matches the arrays we produce. Owned by the stream.
+    // Stream-owned conversion options derived from the result.
     duckdb_arrow_options options = duckdb_result_get_arrow_options(&result_);
 
-    // Pick the fast path only if every column's DuckDB layout is bit-identical to
-    // its Arrow layout, so the combined batch can be a raw buffer concatenation.
-    // `allow_fast` callers that want per-chunk streaming (bounded memory) force
-    // the fallback, which emits one batch per data chunk instead.
+    // Combine only bit-compatible layouts when permitted.
     std::vector<size_t> widths(column_count_);
     bool fast = allow_fast && column_count_ > 0;
     for (idx_t c = 0; c < column_count_; ++c) {
@@ -675,8 +617,7 @@ nb::object Result::arrow_c_stream(nb::object self, bool allow_fast) {
     state->options = options;
     state->fast = fast;
     state->done = false;
-    // Exact remaining count only for a fresh materialized result: fetch* may
-    // have consumed rows already, and streaming results don't know their size.
+    // Only untouched materialized results have an exact remaining count.
     state->known_total = (rows_returned_ == 0 && !chunk_ && !duckdb_result_is_streaming(result_))
                              ? duckdb_row_count(&result_)
                              : 0;
@@ -754,9 +695,7 @@ nb::object Result::description() const {
 
 bool Result::ensure_row() {
     while (!chunk_ || cursor_ >= chunk_size_) {
-        // The cursor chunk is scratch: rows already handed out are materialized
-        // Python objects, so duckdb_fetch_chunk_into can refill it in place
-        // (reusing its buffers) instead of allocating a chunk per refill.
+        // Refill the cursor's scratch chunk in place.
         if (!chunk_) {
             chunk_ = make_scratch_chunk(&result_);
             if (!chunk_) return false;  // zero-column result
@@ -782,9 +721,7 @@ bool Result::ensure_row() {
 nb::object Result::build_row() {
     idx_t row = cursor_++;
     rows_returned_++;
-    // Held as an owning nb::object so a throwing convert_cell (e.g. an
-    // out-of-range DATE) releases the partial tuple; tuple dealloc tolerates
-    // the not-yet-filled NULL slots.
+    // Own the partial tuple across conversion errors.
     nb::object tuple = steal_checked(PyTuple_New((Py_ssize_t)column_count_));
     for (idx_t c = 0; c < column_count_; ++c) {
         const ColumnCursor& cur = cursors_[c];
@@ -795,8 +732,7 @@ nb::object Result::build_row() {
     return tuple;
 }
 
-// The cursor methods below mutate chunk_/cursor_/vectors_; nb::lock_self() in
-// ducky.cpp serializes concurrent calls on free-threaded builds.
+// Binding-level locks serialize cursor mutation.
 nb::object Result::fetchone() {
     if (!ensure_row()) return nb::none();
     return build_row();
@@ -809,10 +745,7 @@ nb::list Result::fetchmany(int64_t size) {
 }
 
 nb::list Result::fetchall() {
-    // Materialized results know their size (duckdb_row_count returns 0 for
-    // streaming): pre-size the list so 1M-row fetches skip append's repeated
-    // growth reallocations. rows_returned_ accounts for fetchone/fetchmany
-    // calls that already consumed part of the result.
+    // Pre-size for the known unconsumed materialized rows.
     idx_t total = duckdb_result_is_streaming(result_) ? 0 : duckdb_row_count(&result_);
     if (total > rows_returned_) {
         idx_t remaining = total - rows_returned_;
@@ -865,22 +798,14 @@ int64_t Result::rows_changed() {
 
 duckdb_data_chunk Result::fetch_raw_chunk() {
     duckdb_data_chunk chunk = pull_raw_chunk();
-    // Count the rows here too, not just in the fetch*/row-cursor path:
-    // rows_returned_ == 0 is what to_numpy() and arrow_c_stream() use to decide
-    // the result is untouched and duckdb_row_count() is their exact remaining
-    // count. Without this, a fetch_chunk() followed by either raised a bogus
-    // "row count changed during the scan" instead of taking the general path.
+    // Track consumption for later row-count decisions.
     if (chunk) rows_returned_ += duckdb_data_chunk_get_size(chunk);
     return chunk;
 }
 
 duckdb_data_chunk Result::pull_raw_chunk() {
     if (duckdb_data_chunk reused = chunk_pool_->take()) {
-        // Refill in place (no allocation) -- the same pattern to_numpy() uses
-        // for its own scratch chunk. `false` means exhausted, matching the
-        // convention every other duckdb_fetch_chunk_into call site in this
-        // file uses (ensure_row(), the to_numpy() loop): no separate
-        // mid-stream error check.
+        // Refill a pooled buffer; false means exhausted.
         if (!duckdb_fetch_chunk_into(result_, reused)) {
             duckdb_destroy_data_chunk(&reused);
             return nullptr;
@@ -893,20 +818,14 @@ duckdb_data_chunk Result::pull_raw_chunk() {
 nb::object Result::fetch_chunk() {
     duckdb_data_chunk chunk = fetch_raw_chunk();
     if (!chunk) return nb::none();
-    // nb::cast()'s default policy is automatic_reference, which for a raw
-    // pointer resolves to a *non-owning* reference (nanobind never calls the
-    // destructor or delete) -- take_ownership must be explicit here, or the
-    // Chunk (and its duckdb_data_chunk) leaks for the process's lifetime.
+    // The Python wrapper owns the allocated Chunk.
     return nb::cast(new Chunk(chunk, schema_, handle_, chunk_pool_), nb::rv_policy::take_ownership);
 }
 
 nb::object Result::fetch_numpy_chunk() {
     duckdb_data_chunk chunk = fetch_raw_chunk();
     if (!chunk) return nb::none();
-    // The Chunk owns the buffer (frees it, or hands it back to chunk_pool_,
-    // in its dtor) and is the keep-alive owner for every column view; the
-    // dict's ndarrays hold it alive, so it is released once the consumer
-    // drops the batch. See fetch_chunk() above re: the explicit policy.
+    // Column views keep their owning Chunk alive.
     nb::object chunk_obj =
         nb::cast(new Chunk(chunk, schema_, handle_, chunk_pool_), nb::rv_policy::take_ownership);
     Chunk& c = nb::cast<Chunk&>(chunk_obj);
@@ -920,11 +839,7 @@ nb::object Result::fetch_numpy_chunk() {
 
 namespace {
 
-// Per-column plan resolved upfront by to_numpy_native. `elem_size` is the raw
-// byte width DuckDB lays out in memory; `dtype` describes how to surface it.
-// If `struct_view` is non-null we allocate a uint8 buffer of `total*elem_size`
-// bytes and finish with `arr.view(struct_view)` to reinterpret as a structured
-// array of `total` items (HUGEINT/UHUGEINT/INTERVAL + DECIMAL/HUGEINT-internal).
+// NumPy output layout resolved before scanning.
 struct NumpyColumnPlan {
     size_t elem_size;
     nb::dlpack::dtype dtype;
@@ -962,9 +877,7 @@ NumpyColumnPlan plan_column(duckdb_type tid, duckdb_logical_type logical, const 
 }  // namespace
 
 nb::object Result::to_numpy(nb::object columns) {
-    // Resolve `columns` (None → all) into a selection mask, and resolve the
-    // per-column layout (typespec or struct view). Both run before the scan so
-    // we don't waste work on a recoverable type error.
+    // Validate selected columns and layouts before scanning.
     std::vector<bool> selected(column_count_, true);
     if (!columns.is_none()) {
         std::fill(selected.begin(), selected.end(), false);
@@ -984,10 +897,7 @@ nb::object Result::to_numpy(nb::object columns) {
         plans[c] = plan_column(types_[c], column_types_[c], schema_->names[c]);
     }
 
-    // Single pass when the exact remaining row count is known (fresh
-    // materialized result): allocate every column buffer upfront and copy each
-    // chunk out of one reused scratch chunk — no per-chunk allocation, no
-    // holding the whole result twice.
+    // Allocate upfront when the exact remaining row count is known.
     if (rows_returned_ == 0 && !chunk_ && !duckdb_result_is_streaming(result_)) {
         idx_t total = duckdb_row_count(&result_);
         nb::dict out;
@@ -1005,21 +915,20 @@ nb::object Result::to_numpy(nb::object columns) {
         }
 
         if (total > 0 && column_count_ > 0) {
-            duckdb_data_chunk scratch = make_scratch_chunk(&result_);
-            if (!scratch) throw std::bad_alloc();
+            ScratchChunk scratch(&result_);
+            if (!scratch.chunk) throw std::bad_alloc();
             idx_t offset = 0;
-            while (duckdb_fetch_chunk_into(result_, scratch)) {
-                idx_t sz = duckdb_data_chunk_get_size(scratch);
+            while (duckdb_fetch_chunk_into(result_, scratch.chunk)) {
+                idx_t sz = duckdb_data_chunk_get_size(scratch.chunk);
                 if (offset + sz > total) break;  // caught by the != check below
                 for (idx_t c = 0; c < column_count_; ++c) {
                     if (!selected[c]) continue;
-                    duckdb_vector v = duckdb_data_chunk_get_vector(scratch, c);
+                    duckdb_vector v = duckdb_data_chunk_get_vector(scratch.chunk, c);
                     std::memcpy(bufs[c] + offset * plans[c].elem_size, duckdb_vector_get_data(v),
                                 sz * plans[c].elem_size);
                 }
                 offset += sz;
             }
-            duckdb_destroy_data_chunk(&scratch);
             if (offset != total) {
                 throw DuckyError("ducky: to_numpy: result row count changed during the scan");
             }
@@ -1043,64 +952,39 @@ nb::object Result::to_numpy(nb::object columns) {
         return out;
     }
 
-    // Pass 1: pull every chunk, recording size; keep them alive for pass 2's
-    // memcpy. duckdb_destroy_data_chunk only happens after we've copied out.
-    std::vector<duckdb_data_chunk> chunks;
-    std::vector<idx_t> sizes;
-    idx_t total = 0;
-    while (true) {
-        duckdb_data_chunk ch = duckdb_fetch_chunk(result_);
-        if (!ch) break;
-        idx_t sz = duckdb_data_chunk_get_size(ch);
-        if (sz == 0) {
-            duckdb_destroy_data_chunk(&ch);
-            continue;
-        }
-        chunks.push_back(ch);
-        sizes.push_back(sz);
-        total += sz;
-    }
-
-    auto cleanup_chunks = [&] {
-        for (duckdb_data_chunk ch : chunks) duckdb_destroy_data_chunk(&ch);
-    };
+    // Retain chunks when the total must be discovered first.
+    ChunkList pulled(result_);
+    idx_t total = pulled.total;
 
     nb::dict out;
-    try {
-        for (idx_t c = 0; c < column_count_; ++c) {
-            if (!selected[c]) continue;
-            const NumpyColumnPlan& p = plans[c];
-            size_t bytes = total * p.elem_size;
-            void* buf = bytes ? std::malloc(bytes) : nullptr;
-            if (bytes && !buf) throw std::bad_alloc();
-            // Capsule frees `buf` when the ndarray's owner ref hits zero.
-            nb::capsule owner(buf, [](void* p) noexcept { std::free(p); });
+    for (idx_t c = 0; c < column_count_; ++c) {
+        if (!selected[c]) continue;
+        const NumpyColumnPlan& p = plans[c];
+        size_t bytes = total * p.elem_size;
+        void* buf = bytes ? std::malloc(bytes) : nullptr;
+        if (bytes && !buf) throw std::bad_alloc();
+        // Capsule frees `buf` when the ndarray's owner ref hits zero.
+        nb::capsule owner(buf, [](void* p) noexcept { std::free(p); });
 
-            size_t offset = 0;
-            for (size_t i = 0; i < chunks.size(); ++i) {
-                duckdb_vector v = duckdb_data_chunk_get_vector(chunks[i], (idx_t)c);
-                const void* src = duckdb_vector_get_data(v);
-                std::memcpy((char*)buf + offset, src, sizes[i] * p.elem_size);
-                offset += sizes[i] * p.elem_size;
-            }
-
-            nb::object arr;
-            if (p.struct_view) {
-                // Wrap as a flat uint8 buffer (total * elem_size bytes) and let
-                // numpy reinterpret it as a structured array of `total` items.
-                size_t byte_shape[1] = {bytes};
-                nb::ndarray<nb::numpy> raw(buf, 1, byte_shape, owner, nullptr, p.dtype);
-                arr = nb::cast(raw).attr("view")(p.struct_view);
-            } else {
-                size_t shape[1] = {(size_t)total};
-                arr = nb::cast(nb::ndarray<nb::numpy>(buf, 1, shape, owner, nullptr, p.dtype));
-            }
-            out[schema_->names[c].c_str()] = arr;
+        size_t offset = 0;
+        for (size_t i = 0; i < pulled.size(); ++i) {
+            const void* src = duckdb_vector_get_data(pulled.vector(i, c));
+            std::memcpy((char*)buf + offset, src, pulled.sizes[i] * p.elem_size);
+            offset += pulled.sizes[i] * p.elem_size;
         }
-    } catch (...) {
-        cleanup_chunks();
-        throw;
+
+        nb::object arr;
+        if (p.struct_view) {
+            // Wrap as a flat uint8 buffer (total * elem_size bytes) and let
+            // numpy reinterpret it as a structured array of `total` items.
+            size_t byte_shape[1] = {bytes};
+            nb::ndarray<nb::numpy> raw(buf, 1, byte_shape, owner, nullptr, p.dtype);
+            arr = nb::cast(raw).attr("view")(p.struct_view);
+        } else {
+            size_t shape[1] = {(size_t)total};
+            arr = nb::cast(nb::ndarray<nb::numpy>(buf, 1, shape, owner, nullptr, p.dtype));
+        }
+        out[schema_->names[c].c_str()] = arr;
     }
-    cleanup_chunks();
     return out;
 }

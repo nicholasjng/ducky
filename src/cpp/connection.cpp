@@ -20,8 +20,7 @@ namespace {
 
 using namespace nb::literals;
 
-// Cached Python types and 128-bit constants used by bind_one. Imported once,
-// intentionally leaked so the destructors don't run at interpreter shutdown.
+// Cached Python types and 128-bit constants.
 struct BindTypes {
     nb::type_object decimal;          // decimal.Decimal
     nb::type_object uuid;             // uuid.UUID
@@ -101,12 +100,7 @@ void bind_check(duckdb_state state, idx_t idx) {
     }
 }
 
-// Bind an int64-fitting Python int at the width the statement expects. DuckDB
-// re-binds *and re-plans* on every execute whose bound type differs from the
-// planned parameter type (PreparedStatementData::RequireRebind), so always
-// binding BIGINT would turn a prepared loop over e.g. an INTEGER column into a
-// per-row replan (~2x slowdown on executemany). Out-of-range values fall back
-// to int64, paying that rebind, with DuckDB's normal cast/error behavior.
+// Match the planned width to avoid DuckDB replanning on each execute.
 void bind_int64_as_param_type(duckdb_prepared_statement stmt, idx_t idx, int64_t v) {
     switch (duckdb_param_type(stmt, idx)) {
         case DUCKDB_TYPE_TINYINT:
@@ -200,9 +194,7 @@ void bind_one(duckdb_prepared_statement stmt, idx_t idx, nb::handle value) {
     }
     if (nb::isinstance<nb::float_>(value)) {
         double v = nb::cast<double>(value);
-        // Same rebind-avoidance as the int path: a FLOAT parameter fed a
-        // DOUBLE value replans per execute; the narrowing cast here equals
-        // the DOUBLE→FLOAT cast DuckDB would apply on that rebind.
+        // Match FLOAT parameters to avoid replanning.
         if (duckdb_param_type(stmt, idx) == DUCKDB_TYPE_FLOAT) {
             bind_check(duckdb_bind_float(stmt, idx, (float)v), idx);
         } else {
@@ -279,8 +271,7 @@ void bind_one(duckdb_prepared_statement stmt, idx_t idx, nb::handle value) {
         bind_check(duckdb_bind_varchar(stmt, idx, s.c_str()), idx);
         return;
     }
-    // numpy scalars (anything exposing .item() → native Python): re-dispatch
-    // on the unboxed value.
+    // Unbox NumPy scalars.
     if (nb::hasattr(value, "item")) {
         nb::object item;
         try {
@@ -289,8 +280,6 @@ void bind_one(duckdb_prepared_statement stmt, idx_t idx, nb::handle value) {
             item = nb::object();
         }
         if (item) {
-            // Native Python scalars never expose .item(), so the type-change
-            // check terminates immediately — no infinite recursion.
             if (item.type().ptr() != value.type().ptr()) {
                 bind_one(stmt, idx, item);
                 return;
@@ -331,19 +320,17 @@ void bind_parameters(duckdb_prepared_statement stmt, nb::handle parameters) {
     }
 }
 
-// Shared by PreparedStatement::executemany and Connection::executemany.
-// Skips run_pending's per-row GIL release + signal-check loop: each row's
-// INSERT/UPDATE completes synchronously in microseconds, so the loop's
-// overhead dominates per-row cost. duckdb_execute_prepared blocks until
-// done; we check for signals every PERIOD rows so Ctrl-C is still snappy.
+// Shared executemany loop with periodic signal checks.
 void executemany_loop(duckdb_prepared_statement stmt, nb::handle seq) {
     constexpr idx_t SIGNAL_CHECK_PERIOD = 1024;
     idx_t since_check = 0;
     for (nb::handle params : seq) {
-        // No duckdb_clear_bindings: bind_parameters writes all positional
-        // params 1..N, overwriting any prior values. Named-dict callers are
-        // expected to use the same key set per row (PEP-249's executemany
-        // contract is row-shape consistency).
+        // Every parameter set must stand alone. Without clearing, a short
+        // positional row or a named dict missing a key silently inherits the
+        // previous row's binding and writes incorrect data.
+        if (duckdb_clear_bindings(stmt) == DuckDBError) {
+            throw DuckyError("ducky: failed to clear prepared-statement bindings");
+        }
         bind_parameters(stmt, params);
         duckdb_result result;
         if (duckdb_execute_prepared(stmt, &result) == DuckDBError) {
@@ -359,12 +346,7 @@ void executemany_loop(duckdb_prepared_statement stmt, nb::handle seq) {
     }
 }
 
-// Drive duckdb_pending_execute_task in a GIL-releasing loop until READY (or
-// error), then materialize via duckdb_execute_pending. Ticking one task at a
-// time (instead of blocking inside duckdb_execute_prepared) lets
-// PyErr_CheckSignals run between ticks, so Ctrl-C interrupts mid-query. Takes
-// ownership of `pending`; `init` is its originating duckdb_pending_prepared*
-// call's return state.
+// Drive and consume `pending`, checking Python signals between ticks.
 duckdb_result drive_pending(duckdb_connection con, duckdb_pending_result pending,
                             duckdb_state init) {
     if (init == DuckDBError) {
@@ -373,26 +355,17 @@ duckdb_result drive_pending(duckdb_connection con, duckdb_pending_result pending
         throw DuckyError(message);
     }
 
-    // Consecutive NO_TASKS probes; persists across GIL round-trips so a long
-    // starved stretch keeps sleeping instead of re-spinning every 10 ms.
     int no_tasks_streak = 0;
     for (;;) {
         duckdb_pending_state state;
         {
-            // Tick with the GIL released, resurfacing every ~10ms for Ctrl-C.
-            // Several ticks per GIL round-trip matters: once workers own the
-            // remaining tasks, paying release/acquire + PyErr_CheckSignals per
-            // NO_TASKS probe dominated short-query latency.
+            // Release the GIL and resurface every 10 ms for signals.
             nb::gil_scoped_release release;
             auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(10);
             for (;;) {
                 state = duckdb_pending_execute_task(pending);
                 if (state == DUCKDB_PENDING_RESULT_READY || state == DUCKDB_PENDING_ERROR) break;
-                // Workers own the remaining tasks: yield() first (an immediate
-                // 1ms sleep cost ~100s across 100k single-row INSERTs), then
-                // back off to a real sleep once the streak shows genuine
-                // starvation (workers busy/blocked on IO). Short queries never
-                // reach the threshold — 256 yield-probes pass in well under 1ms.
+                // Yield first, then sleep after repeated no-op ticks.
                 if (state == DUCKDB_PENDING_NO_TASKS_AVAILABLE) {
                     if (++no_tasks_streak > 256) {
                         std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -451,9 +424,7 @@ void arrow_stream_capsule_destructor(PyObject* capsule) {
     }
 }
 
-// Consume an Arrow-collected `result` (produced by duckdb_pending_prepared_arrow)
-// into an `arrow_array_stream` PyCapsule. Destroys `result` either way: the
-// stream owns the collected batches outright, so it keeps nothing else alive.
+// Move an Arrow-collected result into a stream capsule.
 nb::object arrow_stream_capsule_from_result(duckdb_result* result) {
     auto* stream = (ArrowArrayStream*)calloc(1, sizeof(ArrowArrayStream));
     if (!stream) {
@@ -559,8 +530,8 @@ void Connection::load_extension(const std::string& name) {
     duckdb_destroy_result(&result);
 
     // LOAD can register new functions / types / settings, so drop cached plans
-    // — mirrors run()'s keeps_stmt_cache() flush for LOAD statements.
-    stmt_cache_clear();
+    // — mirrors the caches_statement() flush run() applies to LOAD statements.
+    statement_cache_clear();
 }
 
 nb::tuple Connection::progress() const {
@@ -656,9 +627,7 @@ void Connection::set_profile_sink(nb::object sink, int64_t sample, const std::st
     }
     duckdb_connection con = handle_->connection;
     exec_no_result(con, "SET enable_profiling='no_output'");
-    // Always set explicitly: profiling_mode is a persistent connection setting,
-    // so switching from a prior detailed-mode sink back to "standard" must
-    // actually reset it, not just skip the "detailed" SET.
+    // profiling_mode persists, so always set it.
     exec_no_result(con, ("SET profiling_mode='" + mode + "'").c_str());
     profile_sink_ = sink;
     profile_sample_ = sample;
@@ -673,9 +642,7 @@ void Connection::maybe_emit_profile(const std::string& query) {
     duckdb_profiling_info info = duckdb_get_profiling_info(handle_->connection);
     if (!info) return;
     nb::object tree = walk_profiling_node(info);
-    // Sink errors must not break the query — report via sys.unraisablehook and
-    // continue. python_error's constructor fetched (cleared) the error
-    // indicator; restore it first or WriteUnraisable has nothing to report.
+    // Report sink errors without failing the query.
     try {
         profile_sink_(query, tree);
     } catch (nb::python_error& e) {
@@ -709,13 +676,9 @@ void Connection::register_arrow(const std::string& name, nb::object obj) {
             "(__arrow_c_stream__)");
     }
 
-    // Lazy, zero-copy: stash the source and resolve `SELECT * FROM name` to the
-    // ducky_arrow_scan table function via the replacement scan, re-streaming the
-    // source on each execution (so it must support being streamed more than once).
     if (!arrow_registry_) arrow_registry_ = install_arrow_scan(*this);
-    // Cached plans bound the previous source's schema; force a re-plan so a
-    // re-registered source with a different shape doesn't hit a stale plan.
-    stmt_cache_clear();
+    // Re-registering may change the schema.
+    statement_cache_clear();
     std::lock_guard<std::mutex> lock(arrow_registry_->mu);
     arrow_registry_->sources[name] = std::move(obj);  // insert / overwrite (GIL held)
 }
@@ -723,16 +686,9 @@ void Connection::register_arrow(const std::string& name, nb::object obj) {
 Connection::~Connection() { close(); }
 
 void Connection::close() {
-    // Release this Connection's references. The database stays open until the
-    // last Result sharing the handle is also gone. Cached statements go first:
-    // they reference the connection they were prepared on.
-    stmt_cache_clear();
+    // Results retain shared ownership of the database.
+    statement_cache_clear();
     last_result_.reset();
-    // Drop the Python objects a closed connection can no longer use, so
-    // registered Arrow sources / the profile sink don't stay pinned until the
-    // wrapper is garbage-collected. The registry itself stays alive — the
-    // database-side registrations co-own it — and simply reports "no source
-    // registered" to anything that re-binds afterwards.
     if (arrow_registry_) {
         std::lock_guard<std::mutex> lock(arrow_registry_->mu);
         arrow_registry_->sources.clear();
@@ -746,10 +702,7 @@ void Connection::close() {
 
 int Connection::gc_traverse(visitproc visit, void* arg) const {
     Py_VISIT(profile_sink_.ptr());
-    // No arrow_registry_->mu here: on GIL builds the sources map is only
-    // mutated with the GIL held (which the GC holds too), and on free-threaded
-    // builds the GC stops the world — while a suspended thread holding the
-    // mutex would deadlock us.
+    // GC holds the GIL or stops all threads; taking mu could deadlock.
     if (arrow_registry_) {
         for (const auto& [name, obj] : arrow_registry_->sources) Py_VISIT(obj.ptr());
     }
@@ -766,17 +719,10 @@ void Connection::gc_clear() {
 
 namespace {
 
-// Capacity of the per-connection prepared-statement cache. Plans are small
-// relative to result data; 128 covers repeated-query workloads (the same
-// ballpark as sqlite3's per-connection statement cache).
-constexpr size_t kStmtCacheCapacity = 128;
+constexpr size_t kStatementCacheCapacity = 128;
 
-// Statement types safe to keep cached plans across. Anything else — SET/RESET,
-// PRAGMA, LOAD, ATTACH/DETACH, CALL, DDL, ... — flushes the cache: a SET
-// doesn't trigger DuckDB's RebindPreparedStatement, so a plan that folded in a
-// settings-dependent expression (e.g. current_setting()) would return stale
-// values. DDL is already rebind-safe but flushing on it is cheap insurance.
-bool keeps_stmt_cache(duckdb_statement_type type) {
+// Cache queries whose plans remain valid across repeated use.
+bool caches_statement(duckdb_statement_type type) {
     switch (type) {
         case DUCKDB_STATEMENT_TYPE_SELECT:
         case DUCKDB_STATEMENT_TYPE_INSERT:
@@ -793,90 +739,104 @@ bool keeps_stmt_cache(duckdb_statement_type type) {
     }
 }
 
+// Writes invalidate plans that may contain folded statistics.
+bool invalidates_statement_cache(duckdb_statement_type type) {
+    switch (type) {
+        case DUCKDB_STATEMENT_TYPE_INSERT:
+        case DUCKDB_STATEMENT_TYPE_UPDATE:
+        case DUCKDB_STATEMENT_TYPE_DELETE:
+        case DUCKDB_STATEMENT_TYPE_COPY:
+        case DUCKDB_STATEMENT_TYPE_TRANSACTION:
+            return true;
+        default:
+            return false;
+    }
+}
+
 }  // namespace
 
-duckdb_prepared_statement Connection::stmt_cache_checkout(const std::string& query) {
-    auto it = stmt_cache_.find(query);
-    if (it == stmt_cache_.end()) return nullptr;
+// Retire a successfully executed statement under the cache policy.
+void Connection::statement_cache_retire(const std::string& query, duckdb_prepared_statement stmt) {
+    duckdb_statement_type type = duckdb_prepared_statement_type(stmt);
+    if (invalidates_statement_cache(type)) statement_cache_clear();
+    if (caches_statement(type)) {
+        statement_cache_checkin(query, stmt);
+    } else {
+        statement_cache_clear();
+        duckdb_destroy_prepare(&stmt);
+    }
+}
+
+duckdb_prepared_statement Connection::statement_cache_checkout(const std::string& query) {
+    auto it = statement_cache_.find(query);
+    if (it == statement_cache_.end()) return nullptr;
     duckdb_prepared_statement stmt = it->second->stmt;
-    stmt_lru_.erase(it->second);
-    stmt_cache_.erase(it);
+    statement_lru_.erase(it->second);
+    statement_cache_.erase(it);
     return stmt;
 }
 
-void Connection::stmt_cache_checkin(const std::string& query, duckdb_prepared_statement stmt) {
-    auto it = stmt_cache_.find(query);
-    if (it != stmt_cache_.end()) {
-        // A concurrent run() of the same query prepared its own copy and
-        // finished first; replace it — ours is the most recently used.
+void Connection::statement_cache_checkin(const std::string& query, duckdb_prepared_statement stmt) {
+    auto it = statement_cache_.find(query);
+    if (it != statement_cache_.end()) {
+        // Replace a concurrently returned copy.
         duckdb_destroy_prepare(&it->second->stmt);
-        stmt_lru_.erase(it->second);
-        stmt_cache_.erase(it);
+        statement_lru_.erase(it->second);
+        statement_cache_.erase(it);
     }
-    stmt_lru_.push_front(CachedStmt{query, stmt});
-    stmt_cache_.emplace(query, stmt_lru_.begin());
-    if (stmt_lru_.size() > kStmtCacheCapacity) {
-        CachedStmt& victim = stmt_lru_.back();
+    statement_lru_.push_front(CachedStatement{query, stmt});
+    statement_cache_.emplace(query, statement_lru_.begin());
+    if (statement_lru_.size() > kStatementCacheCapacity) {
+        CachedStatement& victim = statement_lru_.back();
         duckdb_destroy_prepare(&victim.stmt);
-        stmt_cache_.erase(victim.query);
-        stmt_lru_.pop_back();
+        statement_cache_.erase(victim.query);
+        statement_lru_.pop_back();
     }
 }
 
-void Connection::stmt_cache_clear() {
-    for (CachedStmt& entry : stmt_lru_) duckdb_destroy_prepare(&entry.stmt);
-    stmt_lru_.clear();
-    stmt_cache_.clear();
+void Connection::statement_cache_clear() {
+    for (CachedStatement& entry : statement_lru_) duckdb_destroy_prepare(&entry.stmt);
+    statement_lru_.clear();
+    statement_cache_.clear();
 }
 
 void Connection::ensure_open() const {
     if (!handle_ || !handle_->connection) throw DuckyError("ducky: connection is closed");
 }
 
+Connection::StatementLease::StatementLease(Connection& con, const std::string& query)
+    : con_(con), query_(query) {
+    stmt_ = con_.statement_cache_checkout(query);
+    // Cached statements must start unbound.
+    if (stmt_ && duckdb_clear_bindings(stmt_) == DuckDBError) {
+        duckdb_destroy_prepare(&stmt_);
+        stmt_ = nullptr;
+    }
+    if (!stmt_ && duckdb_prepare(con_.handle_->connection, query.c_str(), &stmt_) == DuckDBError) {
+        std::string message = duckdb_message(duckdb_prepare_error(stmt_));
+        duckdb_destroy_prepare(&stmt_);
+        throw DuckyError(message);
+    }
+}
+
+Connection::StatementLease::~StatementLease() {
+    // Do not cache statements whose execution threw.
+    if (stmt_) duckdb_destroy_prepare(&stmt_);
+}
+
+void Connection::StatementLease::retire() {
+    con_.statement_cache_retire(query_, stmt_);
+    stmt_ = nullptr;
+}
+
 duckdb_result Connection::run(const std::string& query, nb::object parameters, bool streaming) {
     ensure_open();
     duckdb_connection con = handle_->connection;
 
-    // Always go through prepare + pending-execute so the run_pending semantics
-    // (signal handling, streaming) apply. Single statement only. Repeated query
-    // text reuses the cached prepared statement, skipping parse + plan; the
-    // bindings are cleared so a cached statement starts unbound exactly like a
-    // fresh prepare (no parameter leakage between calls).
-    duckdb_prepared_statement stmt = stmt_cache_checkout(query);
-    if (stmt && duckdb_clear_bindings(stmt) == DuckDBError) {
-        duckdb_destroy_prepare(&stmt);
-        stmt = nullptr;
-    }
-    if (!stmt) {
-        if (duckdb_prepare(con, query.c_str(), &stmt) == DuckDBError) {
-            std::string message = duckdb_message(duckdb_prepare_error(stmt));
-            duckdb_destroy_prepare(&stmt);
-            throw DuckyError(message);
-        }
-    }
-    if (!parameters.is_none()) {
-        try {
-            bind_parameters(stmt, parameters);
-        } catch (...) {
-            duckdb_destroy_prepare(&stmt);
-            throw;
-        }
-    }
-    duckdb_result result;
-    try {
-        result = run_pending(con, stmt, streaming);
-    } catch (...) {
-        // Conservative: don't cache a statement whose execution failed — the
-        // next run re-prepares from scratch, matching pre-cache error paths.
-        duckdb_destroy_prepare(&stmt);
-        throw;
-    }
-    if (keeps_stmt_cache(duckdb_prepared_statement_type(stmt))) {
-        stmt_cache_checkin(query, stmt);
-    } else {
-        stmt_cache_clear();
-        duckdb_destroy_prepare(&stmt);
-    }
+    StatementLease stmt(*this, query);
+    if (!parameters.is_none()) bind_parameters(stmt.get(), parameters);
+    duckdb_result result = run_pending(con, stmt.get(), streaming);
+    stmt.retire();
     // Skip streaming: chunks haven't been pulled when run_pending returns,
     // so the profile would reflect the previous query.
     if (!streaming) {
@@ -900,34 +860,9 @@ std::shared_ptr<Result> Connection::sql(const std::string& query, bool streaming
 
 void Connection::executemany(const std::string& query, nb::object seq) {
     ensure_open();
-    duckdb_connection con = handle_->connection;
-
-    // Same cached-statement dance as run(): reuse the parsed+planned statement
-    // for repeated query text, cleared so no bindings leak in.
-    duckdb_prepared_statement stmt = stmt_cache_checkout(query);
-    if (stmt && duckdb_clear_bindings(stmt) == DuckDBError) {
-        duckdb_destroy_prepare(&stmt);
-        stmt = nullptr;
-    }
-    if (!stmt) {
-        if (duckdb_prepare(con, query.c_str(), &stmt) == DuckDBError) {
-            std::string message = duckdb_message(duckdb_prepare_error(stmt));
-            duckdb_destroy_prepare(&stmt);
-            throw DuckyError(message);
-        }
-    }
-    try {
-        executemany_loop(stmt, seq);
-    } catch (...) {
-        duckdb_destroy_prepare(&stmt);
-        throw;
-    }
-    if (keeps_stmt_cache(duckdb_prepared_statement_type(stmt))) {
-        stmt_cache_checkin(query, stmt);
-    } else {
-        stmt_cache_clear();
-        duckdb_destroy_prepare(&stmt);
-    }
+    StatementLease stmt(*this, query);
+    executemany_loop(stmt.get(), seq);
+    stmt.retire();
 }
 
 nb::object Connection::arrow_collected_stream(const std::string& query, nb::object parameters,
@@ -935,48 +870,17 @@ nb::object Connection::arrow_collected_stream(const std::string& query, nb::obje
     ensure_open();
     duckdb_connection con = handle_->connection;
 
-    // Same cached-statement dance as run(): reuse the parsed+planned statement
-    // for repeated query text.
-    duckdb_prepared_statement stmt = stmt_cache_checkout(query);
-    if (stmt && duckdb_clear_bindings(stmt) == DuckDBError) {
-        duckdb_destroy_prepare(&stmt);
-        stmt = nullptr;
-    }
-    if (!stmt) {
-        if (duckdb_prepare(con, query.c_str(), &stmt) == DuckDBError) {
-            std::string message = duckdb_message(duckdb_prepare_error(stmt));
-            duckdb_destroy_prepare(&stmt);
-            throw DuckyError(message);
-        }
-    }
-    if (!parameters.is_none()) {
-        try {
-            bind_parameters(stmt, parameters);
-        } catch (...) {
-            duckdb_destroy_prepare(&stmt);
-            throw;
-        }
-    }
+    StatementLease stmt(*this, query);
+    if (!parameters.is_none()) bind_parameters(stmt.get(), parameters);
 
-    nb::object capsule;
-    try {
-        // duckdb_pending_prepared_arrow plans the query with DuckDB's Arrow
-        // result collector, so execution assembles Arrow batches directly; the
-        // normal pending tick loop keeps it Ctrl-C interruptible.
-        duckdb_pending_result pending = nullptr;
-        duckdb_state init = duckdb_pending_prepared_arrow(stmt, rows_per_batch, &pending);
-        duckdb_result result = drive_pending(con, pending, init);
-        capsule = arrow_stream_capsule_from_result(&result);
-    } catch (...) {
-        duckdb_destroy_prepare(&stmt);
-        throw;
-    }
-    if (keeps_stmt_cache(duckdb_prepared_statement_type(stmt))) {
-        stmt_cache_checkin(query, stmt);
-    } else {
-        stmt_cache_clear();
-        duckdb_destroy_prepare(&stmt);
-    }
+    // duckdb_pending_prepared_arrow plans the query with DuckDB's Arrow result
+    // collector, so execution assembles Arrow batches directly; the normal
+    // pending tick loop keeps it Ctrl-C interruptible.
+    duckdb_pending_result pending = nullptr;
+    duckdb_state init = duckdb_pending_prepared_arrow(stmt.get(), rows_per_batch, &pending);
+    duckdb_result result = drive_pending(con, pending, init);
+    nb::object capsule = arrow_stream_capsule_from_result(&result);
+    stmt.retire();
     return capsule;
 }
 
@@ -997,9 +901,7 @@ void PendingResult::cleanup_locked() {
 }
 
 PendingResult::~PendingResult() {
-    // Backstop for an abandoned coroutine. A live worker would hold a ref to
-    // this object via execute_task, so no tick can be in flight — no lock
-    // needed. Interrupt first so a partial query stops promptly.
+    // Cancel an abandoned coroutine.
     if (pending_) {
         if (con_) duckdb_interrupt(con_);
         duckdb_result drained;
@@ -1040,9 +942,7 @@ std::shared_ptr<Result> PendingResult::materialize() {
 }
 
 void PendingResult::drain() {
-    // Interrupt before taking the lock so a mid-tick worker on another thread
-    // returns promptly and lets the lock free up. GIL is dropped so the worker
-    // can reacquire it to finish.
+    // Interrupt before waiting for an in-flight tick.
     if (con_) duckdb_interrupt(con_);
     nb::gil_scoped_release release;
     std::lock_guard<std::mutex> lock(mu_);
@@ -1096,8 +996,6 @@ PreparedStatement* Connection::prepare(const std::string& query) {
 }
 
 std::shared_ptr<Result> Connection::current_result() {
-    // Co-owning shared_ptr keeps the Result alive for the caller even if a
-    // concurrent execute() replaces last_result_.
     if (!last_result_) throw DuckyError("ducky: no result set; call execute() first");
     return last_result_;
 }
@@ -1117,8 +1015,6 @@ nb::object Connection::columns() const {
     return nb::cast(last_result_->column_names());
 }
 
-// Implemented here (rather than prepared.cpp) to reuse bind_parameters().
-
 PreparedStatement::PreparedStatement(duckdb_prepared_statement stmt,
                                      std::shared_ptr<DuckDBHandle> handle)
     : stmt_(stmt), handle_(std::move(handle)) {}
@@ -1133,11 +1029,11 @@ void PreparedStatement::ensure_valid() const {
 
 std::shared_ptr<Result> PreparedStatement::execute(nb::object parameters, bool streaming) {
     ensure_valid();
+    // Each execution starts unbound.
+    if (duckdb_clear_bindings(stmt_) == DuckDBError) {
+        throw DuckyError("ducky: failed to clear prepared-statement bindings");
+    }
     if (!parameters.is_none()) {
-        // Clear any prior binding so a positional set doesn't linger across calls.
-        if (duckdb_clear_bindings(stmt_) == DuckDBError) {
-            throw DuckyError("ducky: failed to clear prepared-statement bindings");
-        }
         bind_parameters(stmt_, parameters);
     }
     duckdb_result result = run_pending(handle_->connection, stmt_, streaming);

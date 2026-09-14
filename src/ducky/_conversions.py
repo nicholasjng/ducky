@@ -1,11 +1,4 @@
-"""Conversions from a ducky result into DataFrame / array libraries.
-
-Each function takes any object implementing the Arrow C stream interface (``__arrow_c_stream__``) — typically a ducky :class:`Result` or :class:`Connection`
-— and imports its target library lazily, so none of these are hard dependencies.
-The extension itself only knows how to produce the Arrow stream; everything here is plain Python on top of it.
-
-Consuming the stream drains the underlying result, so call exactly one of these (or the ``fetch*`` methods) per executed query.
-"""
+"""Convert query results to Arrow and array-library objects."""
 
 from __future__ import annotations
 
@@ -25,10 +18,7 @@ if TYPE_CHECKING:
 
 
 class ArrowSource(Protocol):
-    """Anything implementing the Arrow C stream PyCapsule interface.
-
-    Covers ducky's own :class:`Result` / :class:`Connection` and any third-party object exposing ``__arrow_c_stream__`` — pyarrow ``Table``, polars ``DataFrame``, pandas 3.x ``DataFrame``, etc.
-    """
+    """An object implementing the Arrow C stream interface."""
 
     def __arrow_c_stream__(self, requested_schema: Any = None) -> Any: ...
 
@@ -51,19 +41,9 @@ def arrow(source: ArrowSource) -> pyarrow.Table:
 
 
 def arrow_batches(source: ArrowSource) -> pyarrow.RecordBatchReader:
-    """Stream ``source`` as a ``pyarrow.RecordBatchReader`` (one batch per chunk).
-
-    The lazy, Arrow-native counterpart of :func:`iter_batches`: it yields one
-    ``RecordBatch`` per DuckDB chunk (~2048 rows) without materializing the whole
-    table. Emitting a single Arrow object per chunk (rather than a dict of N
-    column ndarrays) makes it cheaper than :func:`iter_batches` for wide results.
-    Wraps ``source``'s per-chunk Arrow C stream, so it stays zero-copy where
-    DuckDB's Arrow export is.
-    """
+    """Stream one Arrow record batch per DuckDB chunk."""
     import pyarrow as pa
 
-    # Use the per-chunk stream (not __arrow_c_stream__, which coalesces an
-    # all-flat result into a single batch — defeating bounded-memory streaming).
     return pa.RecordBatchReader._import_from_c_capsule(source._arrow_chunk_stream())
 
 
@@ -92,30 +72,15 @@ def arrow_reader(
     parameters: Any = None,
     rows_per_batch: int = 1_000_000,
 ) -> pyarrow.RecordBatchReader:
-    """Bounded-memory ``pyarrow.RecordBatchReader`` for ``query`` (backs Connection.arrow_reader).
-
-    Executes ``query`` as a lazily-pulled (streaming) result and coalesces
-    consecutive ~2048-row DuckDB chunks into batches of up to ``rows_per_batch``
-    rows before handing them to the caller. Peak memory is bounded by one
-    batch's worth of rows, not the whole result, regardless of how large the
-    query is — unlike DuckDB's Arrow result collector (see :func:`arrow_query`),
-    which must finish the whole query before yielding anything.
-    ``parameters`` binds like ``execute()``.
-
-    Use :func:`arrow_batches` instead if you want the smallest possible
-    per-batch footprint (exactly one DuckDB chunk, ~2048 rows, no coalescing).
-    """
+    """Execute ``query`` and stream batches of up to ``rows_per_batch`` rows."""
+    if rows_per_batch < 1:
+        raise ValueError("rows_per_batch must be positive")
     import pyarrow as pa
 
     result = con.execute(query, parameters, streaming=True).current_result
     chunk_reader = pa.RecordBatchReader._import_from_c_capsule(result._arrow_chunk_stream())
 
     def coalesced() -> Iterator[pyarrow.RecordBatch]:
-        # Accumulate whole chunks (cheap: no copy) until they'd reach
-        # rows_per_batch. The common case — rows_per_batch at or above one
-        # DuckDB chunk (~2048 rows), e.g. the default — needs no copy at all:
-        # a lone pending batch is sliced directly. combine_chunks only runs
-        # when actually merging multiple physical chunks into one.
         pending: list[pyarrow.RecordBatch] = []
         pending_rows = 0
         for batch in chunk_reader:
@@ -144,17 +109,7 @@ def arrow_reader(
 
 
 def arrow_query(con: _CollectedArrowSource, query: str, parameters: Any = None) -> pyarrow.Table:
-    """Born-as-Arrow ``pyarrow.Table`` for ``query`` (backs Connection.arrow(query)).
-
-    The fastest path from a query to a whole Arrow table: executes with DuckDB's
-    Arrow result collector (batches assembled *during* execution, no
-    chunk->Arrow conversion pass) and concatenates the collected batches.
-    Equivalent in result to ``con.execute(query, parameters).arrow()``, just
-    faster. The return value is a whole Table, so memory is inherently
-    unbounded here regardless of implementation — use :func:`arrow_reader` for
-    a bounded, incrementally-consumed alternative. ``parameters`` binds like
-    ``execute()``.
-    """
+    """Execute ``query`` and return the complete result as an Arrow table."""
     import pyarrow as pa
 
     return pa.RecordBatchReader._import_from_c_capsule(
@@ -179,11 +134,7 @@ def pl(source: ArrowSource, lazy: bool = False) -> polars.DataFrame | polars.Laz
 
 
 def fetchnumpy(source: _ChunkSource) -> dict[str, np.ndarray]:
-    """Return ``source`` as a ``{column: numpy.ndarray}`` dict.
-
-    Delegates to the C++ :meth:`Result.to_numpy` chunk-direct path (numeric /
-    temporal columns only); for strings / nested types go through :func:`arrow`.
-    """
+    """Return numeric and temporal columns as NumPy arrays."""
     return source.to_numpy()
 
 
@@ -217,22 +168,7 @@ def iter_batches(
     columns: Iterable[str] | None = None,
     with_validity: bool = False,
 ) -> Iterator[dict[str, np.ndarray] | dict[str, tuple[np.ndarray, np.ndarray | None]]]:
-    """Yield one ``{name: ndarray}`` dict per chunk.
-
-    Parameters
-    ----------
-    source : _ChunkSource
-        A ducky :class:`Result` or :class:`Connection`.
-    columns : Iterable[str], optional
-        Subset of column names to yield; defaults to all columns.
-    with_validity : bool, default False
-        When True each value becomes a ``(values, mask)`` tuple.
-        ``mask`` is a uint8 ndarray (1 = valid, 0 = NULL) or ``None`` if the chunk's column has no nulls.
-    """
-    # Fast path (all columns, no validity): the C++ side assembles the whole
-    # {name: ndarray} dict per chunk, so we cross the binding once per chunk
-    # instead of once per column. `fetch_numpy_chunk` lives on Result; the
-    # _ChunkSource Protocol keeps `source` duck-typed.
+    """Yield NumPy columns per chunk, optionally with uint8 validity masks."""
     if columns is None and not with_validity:
         fetch_numpy_chunk = getattr(source, "fetch_numpy_chunk", None)
         if fetch_numpy_chunk is not None:
@@ -251,11 +187,7 @@ def iter_batches(
 
 
 def to_numpy(source: _ChunkSource, columns: Iterable[str] | None = None) -> dict[str, np.ndarray]:
-    """Thin alias for ``source.to_numpy(columns)``.
-
-    Kept so ``from ducky._conversions import to_numpy`` still resolves; the real
-    implementation lives on :meth:`Result.to_numpy` (C++).
-    """
+    """Return selected columns as NumPy arrays."""
     return source.to_numpy(columns)
 
 
@@ -264,12 +196,7 @@ def iter_batches_torch(
     columns: Iterable[str] | None = None,
     device: torch.device | str | int | None = None,
 ) -> Iterator[dict[str, torch.Tensor]]:
-    """Yield one ``{name: torch.Tensor}`` dict per chunk.
-
-    Each tensor is derived directly from the chunk's buffer via DLPack (zero-copy on CPU).
-    If ``device`` is given each tensor is moved there before yielding.
-    Chunks are released as soon as the caller advances the iterator, so peak memory is bounded to one chunk.
-    """
+    """Yield Torch tensors per chunk, moving them to ``device`` if set."""
     import torch
 
     names: list[str] | None = None
@@ -290,13 +217,7 @@ def to_torch(
     columns: Iterable[str] | None = None,
     device: torch.device | str | int | None = None,
 ) -> dict[str, torch.Tensor]:
-    """Eagerly drain all chunks into ``{name: torch.Tensor}``.
-
-    Goes through :func:`to_numpy` rather than accumulating :func:`iter_batches_torch`
-    chunks in Python — measured ~15x faster on a multi-chunk result, since
-    per-chunk dispatch overhead adds up fast. ``torch.from_numpy`` is
-    zero-copy on CPU. For memory-bounded streaming use :func:`iter_batches_torch`.
-    """
+    """Return selected columns as Torch tensors."""
     import torch
 
     arrays = source.to_numpy(columns)
@@ -310,12 +231,7 @@ def iter_batches_jax(
     columns: Iterable[str] | None = None,
     device: jax.Device | None = None,
 ) -> Iterator[dict[str, jax.Array]]:
-    """Yield one ``{name: jax.Array}`` dict per chunk.
-
-    Each array is derived directly from the chunk's buffer.
-    On CPU JAX shares the buffer (zero-copy); on accelerators a transfer occurs.
-    Chunks are released as soon as the caller advances the iterator.
-    """
+    """Yield JAX arrays per chunk on ``device``."""
     import jax.numpy as jnp
 
     names: list[str] | None = None
@@ -330,11 +246,7 @@ def to_jax(
     columns: Iterable[str] | None = None,
     device: jax.Device | None = None,
 ) -> dict[str, jax.Array]:
-    """Eagerly drain all chunks into ``{name: jax.Array}``.
-
-    Goes through :func:`to_numpy` rather than per-chunk accumulation — see
-    :func:`to_torch` for why. For memory-bounded streaming use :func:`iter_batches_jax`.
-    """
+    """Return selected columns as JAX arrays on ``device``."""
     import jax.numpy as jnp
 
     arrays = source.to_numpy(columns)
@@ -345,13 +257,7 @@ def iter_batches_mlx(
     source: _ChunkSource,
     columns: Iterable[str] | None = None,
 ) -> Iterator[dict[str, mx.array]]:
-    """Yield one ``{name: mlx.core.array}`` dict per chunk.
-
-    Each array is built directly from the chunk's buffer via nanobind's native mlx ndarray dispatch (zero-copy on the CPU backend) — no separate DLPack + ``mx.array()`` step.
-    MLX uses a unified-memory model, so — unlike the JAX and torch variants — there is no per-array ``device`` argument; set the active device globally with ``mlx.core.set_default_device`` if needed.
-    MLX has no float64, so ``DOUBLE`` columns arrive as float32.
-    Chunks are released as soon as the caller advances the iterator.
-    """
+    """Yield MLX arrays per chunk. ``DOUBLE`` columns become float32."""
     names: list[str] | None = None
     for chunk in chunks(source):
         if names is None:
@@ -363,12 +269,7 @@ def to_mlx(
     source: _ChunkSource,
     columns: Iterable[str] | None = None,
 ) -> dict[str, mx.array]:
-    """Eagerly drain all chunks into ``{name: mlx.core.array}``.
-
-    Goes through :func:`to_numpy` rather than per-chunk accumulation — see
-    :func:`to_torch` for why. MLX has no float64, so ``DOUBLE`` columns
-    arrive as float32. For memory-bounded streaming use :func:`iter_batches_mlx`.
-    """
+    """Return selected columns as MLX arrays; ``DOUBLE`` becomes float32."""
     import mlx.core as mx  # ty: ignore[unresolved-import]
 
     arrays = source.to_numpy(columns)

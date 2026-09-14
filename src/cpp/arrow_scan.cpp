@@ -63,17 +63,13 @@ struct ArrowScanState {
     std::vector<duckdb_data_chunk> chunks;  // converted batches, owned
     std::vector<ArrowScanWindow> windows;   // emission schedule over `chunks`
     std::atomic<idx_t> next_window{0};
-};
 
-void arrow_scan_state_destroy(void* ptr) {
-    if (!ptr) return;
-    auto* s = (ArrowScanState*)ptr;
-    // Chunks co-own the source Arrow arrays; releasing those may call back
-    // into pyarrow, so destroy under the GIL.
-    nb::gil_scoped_acquire gil;
-    for (duckdb_data_chunk& ch : s->chunks) duckdb_destroy_data_chunk(&ch);
-    delete s;
-}
+    // Destroyed via gil_delete: the chunks co-own the source Arrow arrays, and
+    // releasing those can call back into pyarrow, so this must run under the GIL.
+    ~ArrowScanState() {
+        for (duckdb_data_chunk& ch : chunks) duckdb_destroy_data_chunk(&ch);
+    }
+};
 
 // Per-thread scratch: the dictionary-slice emit shares the selection vector's
 // buffer with the emitted output chunk, so it cannot be shared across workers.
@@ -202,7 +198,7 @@ void arrow_scan_init(duckdb_init_info info) {
             // drained here — see ArrowScanState. The capsule is released at
             // scope exit; the converted chunks co-own the Arrow buffers.
             auto* s = new ArrowScanState{};
-            duckdb_init_set_init_data(info, s, &arrow_scan_state_destroy);
+            duckdb_init_set_init_data(info, s, &gil_delete<ArrowScanState>);
             ArrowArrayStream* stream = nullptr;
             nb::object capsule = open_stream(b->reg, b->name, stream);
             idx_t vec_size = duckdb_vector_size();

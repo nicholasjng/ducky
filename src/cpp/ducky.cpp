@@ -23,8 +23,7 @@ using namespace nb::literals;
 
 namespace {
 
-// Cached module handles — imported once, intentionally leaked. See
-// cached_singleton() in ducky.hpp.
+// Cached module handles.
 const nb::module_& conversions() {
     static std::atomic<nb::module_*> cached{nullptr};
     static nb::ft_mutex mu;
@@ -37,10 +36,7 @@ const nb::module_& aio() {
     return cached_singleton(cached, mu, [] { return nb::module_::import_("ducky._aio"); });
 }
 
-// Register the DataFrame/array/Arrow accessors shared by Result and Connection.
-// `src` maps the bound object to the Arrow/chunk source — identity for Result,
-// `.current_result()` for Connection. Defining them here once keeps the two
-// surfaces in lockstep and lets stubgen emit them.
+// Register conversions shared by Result and Connection.
 template <typename Cls, typename Src>
 void def_conversions(Cls& cls, Src src) {
     cls.def(
@@ -50,8 +46,7 @@ void def_conversions(Cls& cls, Src src) {
         "arrow_batches",
         [src](nb::object self) { return conversions().attr("arrow_batches")(src(self)); },
         nb::sig("def arrow_batches(self) -> pyarrow.RecordBatchReader"),
-        "Stream the result as a pyarrow.RecordBatchReader, one RecordBatch per chunk "
-        "(~2048 rows). The lazy, Arrow-native counterpart of iter_batches.");
+        "Stream one Arrow record batch per DuckDB chunk.");
     cls.def(
         "df", [src](nb::object self) { return conversions().attr("df")(src(self)); },
         nb::sig("def df(self) -> pandas.DataFrame"), "Return the result as a pandas.DataFrame.");
@@ -65,8 +60,8 @@ void def_conversions(Cls& cls, Src src) {
         "fetchnumpy",
         [src](nb::object self) { return conversions().attr("fetchnumpy")(src(self)); },
         nb::sig("def fetchnumpy(self) -> dict[str, numpy.ndarray]"),
-        "Return the result as a dict of column name -> numpy array. Numeric / "
-        "temporal columns only; use arrow() for strings / nested types.");
+        "Return the result as a dict of column name -> numpy array. Numeric and "
+        "temporal columns only; use arrow() for strings and nested types.");
     cls.def(
         "chunks", [src](nb::object self) { return conversions().attr("chunks")(src(self)); },
         nb::sig("def chunks(self) -> collections.abc.Iterator[Chunk]"),
@@ -91,7 +86,7 @@ void def_conversions(Cls& cls, Src src) {
         nb::sig("def iter_batches_torch(self, columns: collections.abc.Iterable[str] | None = "
                 "None, device: torch.device | str | int | None = None) "
                 "-> collections.abc.Iterator[dict[str, torch.Tensor]]"),
-        "Yield one dict per chunk: {name: torch.Tensor}. Zero-copy on CPU via DLPack.");
+        "Yield Torch tensors per chunk.");
     cls.def(
         "iter_batches_jax",
         [src](nb::object self, nb::object columns, nb::object device) {
@@ -110,7 +105,7 @@ void def_conversions(Cls& cls, Src src) {
         "columns"_a = nb::none(),
         nb::sig("def iter_batches_mlx(self, columns: collections.abc.Iterable[str] | None = "
                 "None) -> collections.abc.Iterator[dict[str, mlx.core.array]]"),
-        "Yield one dict per chunk: {name: mlx.core.array}. Zero-copy on CPU via DLPack.");
+        "Yield MLX arrays per chunk.");
     cls.def(
         "to_torch",
         [src](nb::object self, nb::object columns, nb::object device) {
@@ -120,7 +115,7 @@ void def_conversions(Cls& cls, Src src) {
         nb::sig("def to_torch(self, columns: collections.abc.Iterable[str] | None = None, "
                 "device: torch.device | str | int | None = None) "
                 "-> dict[str, torch.Tensor]"),
-        "Eagerly concatenate all chunks into {name: torch.Tensor}.");
+        "Return selected columns as Torch tensors.");
     cls.def(
         "to_jax",
         [src](nb::object self, nb::object columns, nb::object device) {
@@ -129,7 +124,7 @@ void def_conversions(Cls& cls, Src src) {
         "columns"_a = nb::none(), "device"_a = nb::none(),
         nb::sig("def to_jax(self, columns: collections.abc.Iterable[str] | None = None, "
                 "device: jax.Device | None = None) -> dict[str, jax.Array]"),
-        "Eagerly concatenate all chunks into {name: jax.Array}.");
+        "Return selected columns as JAX arrays.");
     cls.def(
         "to_mlx",
         [src](nb::object self, nb::object columns) {
@@ -138,18 +133,12 @@ void def_conversions(Cls& cls, Src src) {
         "columns"_a = nb::none(),
         nb::sig("def to_mlx(self, columns: collections.abc.Iterable[str] | None = None) "
                 "-> dict[str, mlx.core.array]"),
-        "Eagerly concatenate all chunks into {name: mlx.core.array}.");
+        "Return selected columns as MLX arrays.");
 }
 
-// Cyclic-GC slots for Connection: a profile sink or registered Arrow source
-// usually closes over its connection, and without tp_traverse that cycle is
-// invisible to the collector (nanobind instances aren't GC-tracked by
-// default). nanobind detects the Py_tp_traverse slot and enables GC on the
-// type. See Connection::gc_traverse / gc_clear.
+// Let Python collect cycles through sinks and registered Arrow sources.
 int connection_tp_traverse(PyObject* self, visitproc visit, void* arg) {
-    // Heap types visit their own type (Python 3.9+ requirement).
     Py_VISIT(Py_TYPE(self));
-    // The C++ instance may not be constructed yet when the GC first looks.
     if (!nb::inst_ready(self)) return 0;
     return nb::inst_ptr<Connection>(self)->gc_traverse(visit, arg);
 }
@@ -171,26 +160,15 @@ NB_MODULE(_core, m) {
     m.doc() = "ducky: tiny nanobind bindings for the DuckDB C API";
     m.attr("__duckdb_version__") = duckdb_library_version();
 
-    // C++ DuckyError -> Python ducky.Error.
     // NOLINTNEXTLINE(bugprone-unused-raii)
     nb::exception<DuckyError>(m, "Error");
 
-    // `ducky.DEFAULT`: a singleton sentinel passed to Appender.append_row in
-    // place of a value to fall back on the target column's DEFAULT expression
-    // (constants and foldable expressions like now()). The `Default` type has
-    // no public constructor, so the exposed instance is the only one that can
-    // exist.
     nb::class_<DefaultSentinel>(m, "Default",
                                 "Sentinel type for appender DEFAULT values; use ``ducky.DEFAULT``.")
         .def("__repr__", [](const DefaultSentinel&) { return "ducky.DEFAULT"; });
     m.attr("DEFAULT") = nb::cast(DefaultSentinel{});
 
-    // nb::pooled(): Chunk is short-lived and minted per fetch_chunk; pooling
-    // recycles the released Python wrapper instead of reallocating it.
-    nb::class_<Chunk>(m, "Chunk", nb::pooled(),
-                      "A column-major batch of up to STANDARD_VECTOR_SIZE rows.\n\n"
-                      "Numeric and temporal columns are exposed as zero-copy ndarrays "
-                      "over DuckDB's internal buffers.")
+    nb::class_<Chunk>(m, "Chunk", nb::pooled(), "A column-major DuckDB result batch.")
         .def("__len__", &Chunk::size, "Number of rows.")
         .def_prop_ro("columns", &Chunk::column_names, "Column names.")
         .def_prop_ro("types", &Chunk::column_types, "Column type names.")
@@ -200,11 +178,7 @@ NB_MODULE(_core, m) {
                 return nb::cast<Chunk&>(self).column(key, self);
             },
             "key"_a, nb::sig("def column(self, key: int | str) -> numpy.ndarray"),
-            "Return the column at `key` as a 1-D ndarray view.\n\n"
-            "Parameters\n"
-            "----------\n"
-            "key : int or str\n"
-            "    Column index or name.")
+            "Return a zero-copy 1-D ndarray view by index or name.")
         .def(
             "validity",
             [](nb::object self, nb::object key) {
@@ -214,23 +188,19 @@ NB_MODULE(_core, m) {
             "Return a uint8 validity mask (1 = valid, 0 = NULL), or None if no nulls.")
         .def("decimal_scale", &Chunk::decimal_scale, "key"_a,
              nb::sig("def decimal_scale(self, key: int | str) -> int"),
-             "Return the scale (digits after the decimal point) of a DECIMAL column.")
+             "Return a DECIMAL column's scale.")
         .def(
             "dlpack",
             [](nb::object self, nb::object key) {
                 return nb::cast<Chunk&>(self).dlpack(key, self);
             },
             "key"_a, nb::sig("def dlpack(self, key: int | str) -> typing.Any"),
-            "Return the column as a DLPack object (``__dlpack__`` / "
-            "``__dlpack_device__``), without going through numpy.\n"
-            "Flat numeric / temporal types only.")
+            "Return a numeric or temporal column as a DLPack object.")
         .def(
             "mlx",
             [](nb::object self, nb::object key) { return nb::cast<Chunk&>(self).mlx(key, self); },
             "key"_a, nb::sig("def mlx(self, key: int | str) -> mlx.core.array"),
-            "Return the column as an ``mlx.core.array``, built directly via "
-            "nanobind's native mlx ndarray dispatch (zero-copy on CPU).\n"
-            "Flat numeric / temporal types only.");
+            "Return a numeric or temporal column as an MLX array.");
 
     nb::class_<Result> result_cls(m, "Result",
                                   "A query result. Iterate or call ``fetch*`` to pull rows.");
@@ -239,8 +209,6 @@ NB_MODULE(_core, m) {
         .def_prop_ro("description", &Result::description,
                      nb::sig("def description(self) -> list[tuple] | None"),
                      "PEP 249 result description, or None if the result is closed.")
-        // nb::lock_self() serializes cursor mutation on free-threaded builds;
-        // no-op under the GIL.
         .def("fetchone", &Result::fetchone, nb::sig("def fetchone(self) -> tuple | None"),
              "Return the next row as a tuple, or None at end of result.", nb::lock_self())
         .def("fetchmany", &Result::fetchmany, "size"_a = 1,
@@ -249,27 +217,21 @@ NB_MODULE(_core, m) {
         .def("fetchall", &Result::fetchall, nb::sig("def fetchall(self) -> list[tuple]"),
              "Return all remaining rows.", nb::lock_self())
         .def("fetchitem", &Result::fetchitem, nb::sig("def fetchitem(self) -> typing.Any"),
-             "Return the lone scalar of a 1-row × 1-column result.\n\n"
-             "Useful for ``COUNT(*)``-style queries."
-             "Raises :class:`Error` if the result is not exactly one row and one column.",
+             "Return the lone scalar of a 1x1 result, for ``COUNT(*)``-style queries. "
+             "Raises :class:`Error` on any other shape.",
              nb::lock_self())
         .def_prop_ro("rows_changed", &Result::rows_changed,
-                     "Rows affected by an INSERT / UPDATE / DELETE.\n\n"
-                     "0 for statements that don't report changed rows (SELECT, DDL) "
-                     "and for streaming results.",
-                     nb::lock_self())
+                     "Rows affected by INSERT, UPDATE, or DELETE; otherwise 0.", nb::lock_self())
         .def("fetch_chunk", &Result::fetch_chunk, nb::sig("def fetch_chunk(self) -> Chunk | None"),
              "Pull the next :class:`Chunk`, or None at end of stream.", nb::lock_self())
         .def("fetch_numpy_chunk", &Result::fetch_numpy_chunk,
              nb::sig("def fetch_numpy_chunk(self) -> dict[str, numpy.ndarray] | None"),
-             "Pull the next chunk as a {name: numpy.ndarray} dict of zero-copy views, "
-             "or None at end of stream. Backs the iter_batches fast path.",
-             nb::lock_self())
+             "Pull the next chunk as NumPy arrays, or None at end.", nb::lock_self())
         .def("to_numpy", &Result::to_numpy, "columns"_a = nb::none(),
              nb::sig("def to_numpy(self, columns: collections.abc.Iterable[str] "
                      "| None = None) -> dict[str, numpy.ndarray]"),
              "Drain the result into a {name: numpy.ndarray} dict. "
-             "Raises on VARCHAR/LIST/STRUCT/MAP — use .arrow() for those.",
+             "Raises on VARCHAR/LIST/STRUCT/MAP; use arrow() for those.",
              nb::lock_self())
         .def(
             "__arrow_c_stream__",
@@ -286,11 +248,7 @@ NB_MODULE(_core, m) {
                 return nb::cast<Result&>(self).arrow_c_stream(self, /*allow_fast=*/false);
             },
             nb::sig("def _arrow_chunk_stream(self) -> typing.Any"),
-            "Per-chunk Arrow C stream capsule (one batch per ~2048-row chunk, bounded "
-            "memory); backs arrow_batches(). Unlike __arrow_c_stream__ it never coalesces "
-            "the result into a single batch.",
-            nb::lock_self());
-    // The Result *is* the Arrow/chunk source the conversion helpers consume.
+            "Return a per-chunk Arrow C stream capsule.", nb::lock_self());
     def_conversions(result_cls, [](nb::object self) { return self; });
     result_cls
         .def(
@@ -305,36 +263,22 @@ NB_MODULE(_core, m) {
             },
             nb::sig("def __next__(self) -> tuple"), nb::lock_self());
 
-    nb::class_<Appender>(m, "Appender",
-                         "Bulk-insert handle for a target table.\n\n"
-                         "Supports row-at-a-time inserts, a columnar fast path for "
-                         "numeric / temporal ndarrays, and an Arrow ingest path that "
-                         "covers VARCHAR / LIST / STRUCT.")
+    nb::class_<Appender>(m, "Appender", "Buffered bulk-insert handle for a table.")
         .def_prop_ro("columns", &Appender::column_names, "Target column names.")
         .def_prop_ro("types", &Appender::column_types, "Target column type names.")
-        // nb::lock_self() serializes buffered-chunk mutation on free-threaded
-        // builds; no-op under the GIL.
         .def("append_row", &Appender::append_row,
              nb::sig("def append_row(self, *values: object) -> None"),
              "Append one row of positional values, in target column order.", nb::lock_self())
         .def("append_columns", &Appender::append_columns, "columns"_a, "masks"_a = nb::none(),
              nb::sig("def append_columns(self, columns: dict[str, numpy.ndarray], "
                      "masks: dict[str, numpy.ndarray] | None = None) -> None"),
-             "Append a batch of named columns; missing columns are filled with NULL.\n\n"
-             "Parameters\n"
-             "----------\n"
-             "columns : dict[str, numpy.ndarray]\n"
-             "    Column-name → 1-D ndarray of equal length.\n"
-             "masks : dict[str, numpy.ndarray], optional\n"
-             "    Per-column validity (1-D bool / uint8; True = valid).",
+             "Append equal-length numeric or temporal arrays with optional validity masks. "
+             "Missing columns become NULL.",
              nb::lock_self())
         .def("append_arrow", &Appender::append_arrow, "source"_a,
              nb::sig("def append_arrow(self, source: typing.Any) -> None"),
-             "Append from any object exposing the Arrow PyCapsule interface.\n\n"
-             "Accepts ``__arrow_c_stream__`` (pyarrow Table / RecordBatchReader / "
-             "polars / pandas-3 / a ducky :class:`Result`) or ``__arrow_c_array__`` "
-             "(a pyarrow RecordBatch).\n"
-             "Columns must line up positionally with the target table and match its types.",
+             "Append an Arrow stream or array. Columns must match the table by position "
+             "and type.",
              nb::lock_self())
         .def("flush", &Appender::flush, "Flush pending rows to the table.", nb::lock_self())
         .def("close", &Appender::close, "Flush and tear down the appender.", nb::lock_self())
@@ -347,34 +291,17 @@ NB_MODULE(_core, m) {
             nb::sig("def __exit__(self, exc_type: type[BaseException] | None, exc_value: "
                     "BaseException | None, traceback: types.TracebackType | None) -> None"));
 
-    nb::class_<PreparedStatement>(
-        m, "PreparedStatement",
-        "A SQL statement compiled once via :meth:`Connection.prepare`.\n\n"
-        "Executable repeatedly with different parameters without re-parsing.")
-        // nb::lock_self() everywhere — methods mutate stmt_, which close()
-        // frees. No-op under the GIL.
+    nb::class_<PreparedStatement>(m, "PreparedStatement", "A reusable compiled SQL statement.")
         .def("execute", &PreparedStatement::execute, "parameters"_a = nb::none(),
              "streaming"_a = false,
              nb::sig("def execute(self, parameters: list | tuple | dict[str, typing.Any] | None = "
                      "None, streaming: bool = False) -> Result"),
-             "Bind ``parameters`` and run the statement, returning its :class:`Result`.\n\n"
-             "Parameters\n"
-             "----------\n"
-             "parameters : list | tuple | dict[str, Any], optional\n"
-             "    Positional sequence or named dict; ``None`` runs without binding.\n"
-             "streaming : bool, default False\n"
-             "    Return a streaming result whose chunks are pulled lazily (peak "
-             "memory stays bounded to one chunk).\n"
-             "    Single-pass; consume via ``fetch*`` or ``iter_batches_*``, not both.",
+             "Bind parameters and return the result. Streaming results are single-pass.",
              nb::lock_self())
         .def("executemany", &PreparedStatement::executemany, "parameters"_a,
              nb::sig("def executemany(self, parameters: collections.abc.Iterable[list | tuple | "
                      "dict[str, typing.Any]]) -> None"),
-             "Run the statement once per parameter set, discarding each result.\n\n"
-             "The fast path for batched ``INSERT`` / ``UPDATE`` / ``DELETE``. Holds the "
-             "GIL for the whole batch, so a cross-thread :meth:`Connection.interrupt` "
-             "can't preempt an in-flight call until it returns.",
-             nb::lock_self())
+             "Run once per parameter set and discard the results.", nb::lock_self())
         .def_prop_ro("num_parameters", &PreparedStatement::num_parameters,
                      "Number of bind parameters.", nb::lock_self())
         .def("parameter_name", &PreparedStatement::parameter_name, "index"_a,
@@ -390,7 +317,7 @@ NB_MODULE(_core, m) {
                      "Result column type names, known ahead of execution.", nb::lock_self())
         .def_prop_ro("statement_type", &PreparedStatement::statement_type,
                      nb::sig("def statement_type(self) -> str"),
-                     "Statement kind: ``'SELECT'``, ``'INSERT'``, ``'UPDATE'``, ….",
+                     "Statement kind: ``'SELECT'``, ``'INSERT'``, ``'UPDATE'``, ...",
                      nb::lock_self())
         .def("close", &PreparedStatement::close, "Destroy the prepared statement.", nb::lock_self())
         .def(
@@ -404,7 +331,6 @@ NB_MODULE(_core, m) {
                     "BaseException | None, traceback: types.TracebackType | None) -> None"),
             nb::lock_self());
 
-    // Async substrate driven by ducky._aio; end users go through aexecute / asql.
     nb::enum_<duckdb_pending_state>(m, "PendingState",
                                     "State of an async query's executor after a tick.")
         .value("READY", DUCKDB_PENDING_RESULT_READY, "The result is ready to materialize.")
@@ -413,12 +339,7 @@ NB_MODULE(_core, m) {
         .value("NO_TASKS", DUCKDB_PENDING_NO_TASKS_AVAILABLE,
                "Workers own the outstanding tasks; yield, then tick again.");
 
-    nb::class_<PendingResult>(
-        m, "PendingResult",
-        "Steppable handle over an in-flight async query.\n\n"
-        "Internal: built by :meth:`Connection.make_pending` and driven by the "
-        "``ducky._aio`` event-loop helpers.\n"
-        "Prefer :meth:`Connection.aexecute` / :meth:`Connection.asql`.")
+    nb::class_<PendingResult>(m, "PendingResult", "Steppable in-flight query handle.")
         .def("execute_task", &PendingResult::execute_task,
              nb::sig("def execute_task(self) -> PendingState"),
              "Advance the executor by one task (GIL released) and return the new state.")
@@ -430,58 +351,22 @@ NB_MODULE(_core, m) {
              "Interrupt the query and drain the executor (cancellation teardown).");
 
     nb::class_<Connection> conn_cls(m, "Connection", nb::type_slots(connection_slots),
-                                    "A connection to a DuckDB database.\n\n"
-                                    "Each :func:`connect` returns one connection that owns its own "
-                                    "database handle; two ``connect(\":memory:\")`` calls are "
-                                    "isolated.");
+                                    "A connection to a DuckDB database.");
     conn_cls
         .def("execute", &Connection::execute, "query"_a, "parameters"_a = nb::none(),
              "streaming"_a = false, nb::rv_policy::reference,
              nb::sig("def execute(self, query: str, parameters: list | tuple | "
                      "dict[str, typing.Any] | None = None, streaming: bool = False) -> Connection"),
-             "Execute a SQL query and stash the result for the ``fetch*`` methods.\n\n"
-             "Repeated query text reuses a per-connection cache of prepared "
-             "statements, skipping re-parsing and re-planning.\n\n"
-             "Parameters\n"
-             "----------\n"
-             "query : str\n"
-             "    SQL text.\n"
-             "    Single statement only.\n"
-             "parameters : list | tuple | dict[str, Any], optional\n"
-             "    Positional sequence or named dict; ``None`` runs without binding.\n"
-             "streaming : bool, default False\n"
-             "    Return a streaming result whose chunks are pulled lazily; useful "
-             "for ``iter_batches_*`` on large queries.\n"
-             "    Single-pass; consume via ``fetch*`` or ``iter_batches_*``, not both.\n\n"
-             "Returns\n"
-             "-------\n"
-             "Connection\n"
-             "    ``self``, so calls can be chained (e.g. "
-             "``con.execute(sql).fetchall()``).\n\n"
-             "Examples\n"
-             "--------\n"
-             ">>> rows = con.execute(\"SELECT * FROM t WHERE id = ?\", [42]).fetchall()",
+             "Execute one statement and retain its result for fetch methods. Streaming "
+             "results are single-pass. Returns ``self``.",
              nb::lock_self())
         .def("executemany", &Connection::executemany, "query"_a, "parameters"_a,
              nb::sig("def executemany(self, query: str, parameters: "
                      "collections.abc.Iterable[list | tuple | dict[str, typing.Any]]) -> None"),
-             "Run ``query`` once per parameter set, discarding each result.\n\n"
-             "PEP 249 companion to :meth:`execute`; prepares the statement once "
-             "(through the per-connection statement cache), so loops skip per-row "
-             "parsing and planning. The fast path for batched ``INSERT`` / "
-             "``UPDATE`` / ``DELETE``.\n\n"
-             "Unlike :meth:`execute`, this holds the GIL for the whole batch (each "
-             "row completes in microseconds, so per-row GIL release would cost more "
-             "than it saves) - a cross-thread :meth:`interrupt` can't preempt an "
-             "in-flight call until it returns.",
-             nb::lock_self())
-        // The returned Result shares the DuckDBHandle, so no keep_alive needed.
+             "Run once per parameter set and discard the results.", nb::lock_self())
         .def("sql", &Connection::sql, "query"_a, "streaming"_a = false,
              nb::sig("def sql(self, query: str, streaming: bool = False) -> Result"),
-             "Run a query and return its :class:`Result` directly.\n\n"
-             "Unlike :meth:`execute`, ``sql`` does not stash the result on the connection.\n"
-             "See :meth:`execute` for ``streaming``.",
-             nb::lock_self())
+             "Run a query and return its result directly.", nb::lock_self())
         .def("query", &Connection::sql, "query"_a, "streaming"_a = false,
              nb::sig("def query(self, query: str, streaming: bool = False) -> Result"),
              "Alias for :meth:`sql`.", nb::lock_self())
@@ -490,9 +375,7 @@ NB_MODULE(_core, m) {
              nb::sig("def _arrow_collected_stream(self, query: str, parameters: list | tuple | "
                      "dict[str, typing.Any] | None = None, rows_per_batch: int = 1000000) "
                      "-> typing.Any"),
-             "Low-level born-as-Arrow capsule producer backing :meth:`arrow` and "
-             ":meth:`arrow_reader`. Returns an ``arrow_array_stream`` PyCapsule.",
-             nb::lock_self())
+             "Return the query as an Arrow C stream capsule.", nb::lock_self())
         .def(
             "aexecute",
             [](nb::object self, const std::string& query, nb::object parameters, bool streaming) {
@@ -502,10 +385,7 @@ NB_MODULE(_core, m) {
             nb::sig("def aexecute(self, query: str, parameters: list | tuple | "
                     "dict[str, typing.Any] | None = None, streaming: bool = False) "
                     "-> collections.abc.Coroutine[typing.Any, typing.Any, Result]"),
-            "Async variant of :meth:`execute`.\n\n"
-            "Ticks the executor one task at a time off-thread so the event loop stays "
-            "responsive; cancelling the await interrupts the query.\n"
-            "Resolves to the :class:`Result` directly — does not set ``current_result``.")
+            "Execute asynchronously and return a Result without setting current_result.")
         .def(
             "asql",
             [](nb::object self, const std::string& query, bool streaming) {
@@ -520,33 +400,22 @@ NB_MODULE(_core, m) {
              nb::sig("def make_pending(self, query: str, parameters: list | tuple | "
                      "dict[str, typing.Any] | None = None, streaming: bool = False) "
                      "-> PendingResult"),
-             "Build a steppable :class:`PendingResult` for the ``ducky._aio`` drivers.\n"
-             "Low-level; prefer :meth:`aexecute` / :meth:`asql`.",
-             nb::lock_self())
+             "Build a steppable pending result.", nb::lock_self())
         .def("prepare", &Connection::prepare, "query"_a,
              nb::sig("def prepare(self, query: str) -> PreparedStatement"),
-             "Compile ``query`` once into a :class:`PreparedStatement` for repeated "
-             "execution, avoiding per-call re-parsing and planning.",
-             nb::lock_self())
-        // lock_self() guards last_result_ against a concurrent swap.
+             "Compile a reusable prepared statement.", nb::lock_self())
         .def("fetchone", &Connection::fetchone, nb::sig("def fetchone(self) -> tuple | None"),
-             "Fetch one row from the most recent :meth:`execute` result. Delegates to "
-             ":meth:`Result.fetchone`.",
-             nb::lock_self())
+             "Fetch one row from the latest execute result.", nb::lock_self())
         .def("fetchmany", &Connection::fetchmany, "size"_a = 1,
              nb::sig("def fetchmany(self, size: int = 1) -> list[tuple]"),
-             "Fetch up to ``size`` rows. Delegates to :meth:`Result.fetchmany`.", nb::lock_self())
+             "Fetch up to ``size`` rows from the latest result.", nb::lock_self())
         .def("fetchall", &Connection::fetchall, nb::sig("def fetchall(self) -> list[tuple]"),
-             "Fetch all remaining rows. Delegates to :meth:`Result.fetchall`.", nb::lock_self())
+             "Fetch all remaining rows from the latest result.", nb::lock_self())
         .def("fetchitem", &Connection::fetchitem, nb::sig("def fetchitem(self) -> typing.Any"),
-             "Return the lone scalar of a 1-row × 1-column result.\n"
-             "Delegates to :meth:`Result.fetchitem`.",
-             nb::lock_self())
+             "Return the lone scalar from the latest 1x1 result.", nb::lock_self())
         .def_prop_ro(
             "rows_changed", [](Connection& self) { return self.current_result()->rows_changed(); },
-            "Rows affected by the most recent INSERT / UPDATE / DELETE.\n"
-            "Delegates to :attr:`Result.rows_changed`.",
-            nb::lock_self())
+            "Rows affected by the latest INSERT, UPDATE, or DELETE.", nb::lock_self())
         .def_prop_ro("description", &Connection::description,
                      nb::sig("def description(self) -> list[tuple] | None"),
                      "PEP 249 result description for the most recent query, or None.",
@@ -556,21 +425,10 @@ NB_MODULE(_core, m) {
                      "Column names of the most recent result, or None.", nb::lock_self())
         .def_prop_ro("current_result", &Connection::current_result,
                      nb::sig("def current_result(self) -> Result"),
-                     "The most recent :class:`Result` from :meth:`execute`.\n\n"
-                     "Raises :class:`Error` if no query has run yet.\n"
-                     "The conversion accessors (``arrow`` / ``df`` / ``pl`` / …) "
-                     "delegate to this.",
-                     nb::lock_self());
-    // Connection's conversion accessors operate on its most recent result.
+                     "The latest execute result; raises if no query has run.", nb::lock_self());
     def_conversions(conn_cls, [](nb::object self) {
         return nb::cast(nb::cast<Connection&>(self).current_result());
     });
-    // Born-as-Arrow entry points: take a query and execute it with DuckDB's
-    // Arrow result collector (batches assembled during execution, no
-    // chunk->Arrow conversion pass). Distinct from the accessors above, which
-    // convert an already-executed result. `arrow(query)` overloads the no-arg
-    // arrow() accessor: with a query it collects, without one it converts the
-    // current result.
     conn_cls.def(
         "arrow",
         [](nb::object self, const std::string& query, nb::object parameters) {
@@ -579,11 +437,7 @@ NB_MODULE(_core, m) {
         "query"_a, "parameters"_a = nb::none(),
         nb::sig("def arrow(self, query: str, parameters: list | tuple | "
                 "dict[str, typing.Any] | None = None) -> pyarrow.Table"),
-        "Execute `query` born-as-Arrow (DuckDB's Arrow collector) and return a "
-        "pyarrow.Table — the fast whole-result path, equivalent in result to "
-        "execute(query, parameters).arrow(). Since the return value is a whole "
-        "Table, memory is inherently unbounded here; use arrow_reader() for a "
-        "bounded, incrementally-consumed alternative. `parameters` binds like execute().");
+        "Execute a query and return its complete Arrow table.");
     conn_cls.def(
         "arrow_reader",
         [](nb::object self, const std::string& query, nb::object parameters,
@@ -594,12 +448,7 @@ NB_MODULE(_core, m) {
         nb::sig("def arrow_reader(self, query: str, parameters: list | tuple | "
                 "dict[str, typing.Any] | None = None, rows_per_batch: int = 1000000) -> "
                 "pyarrow.RecordBatchReader"),
-        "Execute `query` as a lazily-pulled result and return a pyarrow.RecordBatchReader, "
-        "coalescing DuckDB chunks into batches of up to `rows_per_batch` rows. Peak memory "
-        "is bounded by one batch, not the whole result. `parameters` binds like execute().");
-    // to_numpy is bound directly (not via def_conversions) so it doesn't
-    // detour through the Python conversions module — the C++ method runs the
-    // chunk loop without leaving the binding.
+        "Execute a query and stream batches of up to ``rows_per_batch`` rows.");
     conn_cls.def(
         "to_numpy",
         [](nb::object self, nb::object columns) {
@@ -609,7 +458,7 @@ NB_MODULE(_core, m) {
         nb::sig("def to_numpy(self, columns: collections.abc.Iterable[str] | None = None) "
                 "-> dict[str, numpy.ndarray]"),
         "Drain the latest result into a {name: numpy.ndarray} dict. "
-        "Raises on VARCHAR/LIST/STRUCT/MAP — use .arrow() for those.");
+        "Raises on VARCHAR/LIST/STRUCT/MAP; use arrow() for those.");
     conn_cls
         .def(
             "create_function",
@@ -628,36 +477,8 @@ NB_MODULE(_core, m) {
                     "varargs: str | None = None, "
                     "init: collections.abc.Callable[[], typing.Any] | None = None, "
                     "*, volatile: bool = False, special_handling: bool = False) -> None"),
-            "Register a Python callable as a DuckDB scalar UDF.\n\n"
-            "Inputs arrive as zero-copy 1-D ndarrays; ``fn`` must return one "
-            "ndarray of matching dtype.\n\n"
-            "Parameters\n"
-            "----------\n"
-            "name : str\n"
-            "    Name to register the function under.\n"
-            "fn : callable\n"
-            "    Called as ``fn(*args)`` (positional ``parameters``) or "
-            "``fn(kwargs)`` (dict ``parameters``).\n"
-            "parameters : list[str] | dict[str, str], optional\n"
-            "    DuckDB type strings — list for positional, dict for keyword.\n"
-            "    If omitted, types are inferred from ``fn``'s annotations "
-            "(``bool``/``int``/``float`` → ``BOOLEAN``/``BIGINT``/``DOUBLE``).\n"
-            "return_type : str, optional\n"
-            "    Inferred from annotations if omitted.\n"
-            "varargs : str, optional\n"
-            "    DuckDB type for a variable-arity function.\n"
-            "    Mutually exclusive with ``parameters``.\n"
-            "init : callable, optional\n"
-            "    Zero-arg factory for per-worker-thread state.\n"
-            "    Its return value becomes the first positional arg of ``fn`` on "
-            "every chunk.\n"
-            "volatile : bool, default False\n"
-            "    Mark non-deterministic (e.g. RNG, clock) so the optimizer "
-            "won't fold or cache it.\n"
-            "special_handling : bool, default False\n"
-            "    NULL-aware: arguments arrive as ``(values, mask)`` tuples "
-            "(``mask`` is a 1-D uint8 ndarray, 1 = valid) and the UDF emits "
-            "NULLs via the same return shape.",
+            "Register a chunk-wise NumPy scalar UDF. Types may be explicit or inferred. "
+            "With special_handling, inputs and output use ``(values, validity)`` tuples.",
             nb::lock_self())
         .def(
             "create_arrow_function",
@@ -670,13 +491,8 @@ NB_MODULE(_core, m) {
             nb::sig("def create_arrow_function(self, name: str, fn: collections.abc.Callable, "
                     "parameters: list[str] | dict[str, str], return_type: str, "
                     "record_batch: bool = False) -> None"),
-            "Register a scalar UDF backed by the Arrow C-API path.\n\n"
-            "Supports VARCHAR, LIST, STRUCT, DECIMAL, MAP — anything DuckDB can "
-            "round-trip through Arrow.\n"
-            "``fn`` is called with one ``pyarrow.Array`` per column (positional, or "
-            "``{name: Array}`` dict if ``parameters`` is a dict); set "
-            "``record_batch=True`` to receive one ``pyarrow.RecordBatch`` instead.\n"
-            "Must return a ``pyarrow.Array``.",
+            "Register an Arrow scalar UDF. The callable receives Arrow arrays, a named "
+            "array dict, or a RecordBatch, and returns an Arrow array.",
             nb::lock_self())
         .def(
             "create_aggregate_function",
@@ -687,15 +503,8 @@ NB_MODULE(_core, m) {
             "name"_a, "cls"_a, "parameters"_a, "return_type"_a,
             nb::sig("def create_aggregate_function(self, name: str, cls: type, "
                     "parameters: list[str] | dict[str, str], return_type: str) -> None"),
-            "Register a Python class as a DuckDB aggregate UDF.\n\n"
-            "``cls`` must define ``__init__``, ``update(self, *arrays)``, and "
-            "``finalize(self) -> scalar``.\n"
-            "An optional ``combine(self, other)`` merges partial states into ``self``. "
-            "Without it, DuckDB's routine single-state merge (every query goes through "
-            "one, even single-threaded ones) still works via a plain state copy; only a "
-            "genuine parallel/repartitioned merge of two states that *both* accumulated "
-            "real data raises a clear error at query time instead of silently returning "
-            "a wrong aggregate value.",
+            "Register an aggregate class defining update and finalize. Define combine "
+            "to support merging populated partial states.",
             nb::lock_self())
         .def(
             "create_table_function",
@@ -707,12 +516,7 @@ NB_MODULE(_core, m) {
             nb::sig("def create_table_function(self, name: str, "
                     "factory: collections.abc.Callable, "
                     "parameters: list[str], columns: dict[str, str]) -> None"),
-            "Register a Python generator as a DuckDB table function.\n\n"
-            "``factory`` is called with the SQL arguments and must return a "
-            "generator that yields one tuple per row.\n"
-            "``columns`` is an ordered dict ``{column_name: type_string}`` "
-            "declaring the output schema.",
-            nb::lock_self())
+            "Register a table function yielding rows matching ``columns``.", nb::lock_self())
         .def(
             "appender",
             [](Connection& self, const std::string& table, std::optional<std::string> schema,
@@ -722,83 +526,31 @@ NB_MODULE(_core, m) {
             "table"_a, "schema"_a = nb::none(), "catalog"_a = nb::none(),
             nb::sig("def appender(self, table: str, schema: str | None = None, "
                     "catalog: str | None = None) -> Appender"),
-            "Open an :class:`Appender` for bulk inserts into ``table``.\n\n"
-            "The appender shares the connection's database handle, so the "
-            "database stays open until the appender is closed.",
-            nb::lock_self())
-        // interrupt() / progress() use thread-safe DuckDB C calls and are
-        // meant to run from another thread while execute() holds the lock —
-        // no lock_self() on them.
+            "Open a bulk appender for ``table``.", nb::lock_self())
         .def("interrupt", &Connection::interrupt,
-             "Best-effort cancel of any query running on this connection.\n\n"
-             "Safe to call from another thread while :meth:`execute` is in flight.")
+             "Request cancellation of a running query; thread-safe.")
         .def("progress", &Connection::progress,
              nb::sig("def progress(self) -> tuple[float, int, int]"),
-             "Snapshot of the current query's progress.\n\n"
-             "Returns\n"
-             "-------\n"
-             "tuple[float, int, int]\n"
-             "    ``(percentage, rows_processed, total_rows_to_process)``.\n"
-             "    ``percentage`` is ``-1.0`` until DuckDB has an estimate.")
+             "Return ``(percentage, rows_processed, total_rows)``; percentage is -1 "
+             "until estimated.")
         .def("get_profiling_info", &Connection::get_profiling_info,
              nb::sig("def get_profiling_info(self) -> dict[str, typing.Any] | None"),
-             "Programmatic EXPLAIN ANALYZE for the most recent query.\n\n"
-             "Returns a nested ``{\"metrics\": {str: str}, \"children\": [...]}`` "
-             "dict, or ``None`` if profiling isn't enabled.\n"
-             "For ergonomics use :func:`ducky.profile` (context manager) or "
-             ":func:`ducky.format_profiling_info` (pretty-printer).\n"
-             "Metric values are strings per the DuckDB C API; coerce numerics on "
-             "the caller side.")
+             "Return the latest profiling tree, or None when profiling is disabled.")
         .def("set_profile_sink", &Connection::set_profile_sink, "sink"_a.none(), nb::kw_only(),
              "sample"_a = 1, "mode"_a = "standard",
              nb::sig("def set_profile_sink(self, sink: collections.abc.Callable[[str, "
                      "dict[str, typing.Any]], None] | None, *, sample: int = 1, "
                      "mode: str = 'standard') -> None"),
-             "Install an always-on profile sink for every :meth:`execute` / "
-             ":meth:`sql` on this connection.\n\n"
-             "Parameters\n"
-             "----------\n"
-             "sink : callable or None\n"
-             "    Called as ``sink(query, info)`` after every materialized query "
-             "with the same nested dict :meth:`get_profiling_info` returns.\n"
-             "    Pass ``None`` to detach.\n"
-             "sample : int, default 1\n"
-             "    Fire the sink every Nth query (useful in tight training loops).\n"
-             "mode : str, default 'standard'\n"
-             "    DuckDB ``profiling_mode``. ``'detailed'`` adds per-operator "
-             "counters like ``cpu_time``.\n\n"
-             "Notes\n"
-             "-----\n"
-             "Streaming results (``streaming=True``) are skipped — their chunks "
-             "haven't been pulled when ``execute`` returns.\n"
-             "Sink exceptions are reported via ``PyErr_WriteUnraisable`` and do "
-             "not propagate.",
+             "Call ``sink(query, info)`` after every Nth materialized query. Pass None "
+             "to detach. Streaming queries are skipped.",
              nb::lock_self())
         .def("register_arrow", &Connection::register_arrow, "name"_a, "obj"_a,
              nb::sig("def register_arrow(self, name: str, obj: typing.Any) -> None"),
-             "Register an Arrow-PyCapsule source as a table named ``name``.\n\n"
-             "Accepts anything exposing ``__arrow_c_stream__`` (pyarrow Table, "
-             "polars / pandas-3 DataFrame, …).\n"
-             "The source is kept and re-streamed on each query via a replacement "
-             "scan, so it must support being streamed more than once. Queries scan "
-             "it in parallel; primitive columns are read zero-copy from the Arrow "
-             "buffers, and each execution buffers the stream's batches (cheap "
-             "chunk wraps for an in-memory table, a full materialization for an "
-             "unbounded reader).",
-             nb::lock_self())
+             "Register a reusable Arrow C stream source as table ``name``.", nb::lock_self())
         .def("load_extension", &Connection::load_extension, "name"_a,
              nb::sig("def load_extension(self, name: str) -> None"),
-             "Load a DuckDB extension by name or by path to a "
-             "``.duckdb_extension`` binary.\n\n"
-             "Issues ``LOAD '<name>'``. DuckDB validates the binary's platform, "
-             "ABI type, version, and signature against this build.\n"
-             "Unsigned or self-built extensions require the connection to have "
-             "been opened with ``allow_unsigned_extensions=True``.\n"
-             "Because ducky pins a development DuckDB commit, prebuilt C++-ABI "
-             "extensions from the official repository generally won't match; the "
-             "reliable routes are C-API (``C_STRUCT``) extensions within the CAPI "
-             "version range, or extensions built against ducky's pinned commit.\n"
-             "Raises :class:`Error` with DuckDB's message on failure.",
+             "Load an extension by name or path. Unsigned extensions require "
+             "allow_unsigned_extensions=True when connecting.",
              nb::lock_self())
         .def("close", &Connection::close, "Close the connection.", nb::lock_self())
         .def(
@@ -819,17 +571,7 @@ NB_MODULE(_core, m) {
         "database"_a = ":memory:", "config"_a = nb::none(),
         nb::sig("def connect(database: str = ':memory:', config: dict[str, str] | None = None) "
                 "-> Connection"),
-        "Open ``database`` (default in-memory) and return a :class:`Connection`.\n\n"
-        "Low-level entrypoint.\n"
-        "The Python wrapper :func:`ducky.connect` accepts DuckDB settings as typed "
-        "keyword arguments and is what most users want.\n\n"
-        "Parameters\n"
-        "----------\n"
-        "database : str, default ':memory:'\n"
-        "    File path, ``':memory:'``, or any DuckDB connection string.\n"
-        "config : dict[str, str], optional\n"
-        "    DuckDB settings applied at open time.\n"
-        "    See :func:`config_options`.");
+        "Open a database with an optional string-valued configuration.");
 
     m.def(
         "config_options",

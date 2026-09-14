@@ -320,7 +320,9 @@ def test_profile_config_from_env_reads_all_knobs(monkeypatch, tmp_path):
 def test_profile_config_constructor_defaults():
     # The class is general-purpose, not tied to env — defaults match
     # set_profile_sink's defaults.
-    sink = lambda _s, _i: None
+    def sink(_sql, _info):
+        return None
+
     cfg = ducky.ProfileConfig(sink)
     assert cfg.sink is sink
     assert cfg.sample == 1

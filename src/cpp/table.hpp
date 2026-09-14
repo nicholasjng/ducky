@@ -23,8 +23,7 @@ struct TableUDFContext {
     TableUDFContext(const TableUDFContext&) = delete;
     TableUDFContext& operator=(const TableUDFContext&) = delete;
 
-    // Owns the logical types so a create_table_function that throws mid-parse
-    // cleans up the ones already built, not just the extra-info destroy path.
+    // Owns logical types during parsing and registration.
     ~TableUDFContext() {
         for (duckdb_logical_type& t : param_types) duckdb_destroy_logical_type(&t);
         for (duckdb_logical_type& t : col_types) duckdb_destroy_logical_type(&t);

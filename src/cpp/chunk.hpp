@@ -14,23 +14,13 @@
 
 namespace nb = nanobind;
 
-// Shared schema (column names + name → index) for all the chunks of one
-// Result. Built once by Result and held by every Chunk it spawns, so
-// fetch_chunk doesn't deep-copy the name vector per chunk.
+// Schema shared by every chunk of a result.
 struct ChunkSchema {
     std::vector<std::string> names;
     tsl::robin_map<std::string, idx_t> name_to_idx;
 };
 
-// Per-Result pool of freed `duckdb_data_chunk` buffers. duckdb_fetch_chunk
-// (the API Result::fetch_chunk/fetch_numpy_chunk use) allocates a brand-new
-// DataChunk on every call; when a Chunk is destroyed it hands its buffer back
-// here instead of destroying it, so the next fetch can refill it in place via
-// duckdb_fetch_chunk_into (no allocation) rather than paying that cost again.
-// Falls back to a fresh allocation whenever the pool is empty (e.g. a caller
-// holding more than one live batch at once) — always correct, just not
-// always fast. No dependency on Result, to avoid a circular header include
-// (result.hpp already includes chunk.hpp).
+// Reusable data-chunk buffers for one result.
 struct ChunkPool {
     nb::ft_mutex mu_;
     std::vector<duckdb_data_chunk> free_;
@@ -59,31 +49,10 @@ struct ChunkPool {
     }
 };
 
-// Owns a single `duckdb_data_chunk` and exposes each numeric/temporal column as
-// a zero-copy nb::ndarray (numpy framework, DLPack-compatible).
-//
-// Supported types:
-//   Primitive: BOOLEAN, [U]TINYINT/SMALLINT/INTEGER/BIGINT, FLOAT, DOUBLE
-//   Temporal:  DATE (int32 days), TIME/TIMESTAMP*/TIMESTAMP_TZ (int64 micros)
-//   Structured (numpy structured dtype, zero-copy via .view()):
-//     HUGEINT  → dtype([('lower','u8'),('upper','i8')])
-//     UHUGEINT → dtype([('lower','u8'),('upper','u8')])
-//     INTERVAL → dtype([('months','i4'),('days','i4'),('micros','i8')])
-//     DECIMAL  → raw integer matching internal storage (same structured dtype
-//                for high-precision DECIMAL backed by HUGEINT); call
-//                decimal_scale() to recover the exponent.
-//
-// String, list, struct, map and other non-flat types are not supported here —
-// go through the Arrow path (`Result.arrow()`) for those.
-//
-// The ndarray's lifetime is tied to the Python Chunk object via nanobind's
-// owner mechanism: the chunk (and the database that allocated it) is kept
-// alive for as long as any column view is held.
+// A data chunk exposing flat columns as zero-copy arrays.
 class Chunk {
    public:
-    // `pool`, if alive, receives `chunk`'s buffer back on destruction instead
-    // of it being destroyed outright — see ChunkPool. Defaults to empty for
-    // any construction site that doesn't have (or want) a pool.
+    // Return the buffer to `pool` on destruction when possible.
     Chunk(duckdb_data_chunk chunk, std::shared_ptr<const ChunkSchema> schema,
           std::shared_ptr<DuckDBHandle> handle, std::weak_ptr<ChunkPool> pool = {});
     ~Chunk();
@@ -115,10 +84,7 @@ class Chunk {
     // structured types (HUGEINT, INTERVAL, DECIMAL, VARCHAR, ...).
     nb::object dlpack(nb::object key, nb::handle owner);
 
-    // Returns the column at `key` as an mlx.core.array, via nanobind's native
-    // mlx ndarray framework (nb::mlx, added in nanobind 2.13). Same
-    // zero-copy-on-CPU path as dlpack() + mx.array() in Python, done in one
-    // C++ call instead of two. Same type restrictions as dlpack().
+    // Return a flat column as an MLX array.
     nb::object mlx(nb::object key, nb::handle owner);
 
     // Returns a uint8 ndarray (1 = valid, 0 = null) of length `size`, or None
@@ -128,11 +94,7 @@ class Chunk {
 
    private:
     idx_t resolve(nb::object key) const;
-    // Lazy per-column accessors. Chunk construction sits on the per-chunk hot
-    // path (fetch_chunk / iter_batches at ~489 chunks per 1M rows), so the
-    // constructor materializes no per-column state; logical types — which
-    // duckdb allocates per duckdb_vector_get_column_type call — are fetched
-    // and cached only for the columns actually touched.
+    // Lazily resolve and cache logical types.
     duckdb_vector vector(idx_t i) const { return duckdb_data_chunk_get_vector(chunk_, i); }
     duckdb_logical_type logical_type(idx_t i);
     duckdb_type type_id(idx_t i);

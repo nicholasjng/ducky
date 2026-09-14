@@ -1,5 +1,4 @@
-"""Tests for the runtime-control surface: config, config_options,
-Connection.interrupt(), Connection.progress()."""
+"""Runtime controls."""
 
 from __future__ import annotations
 
@@ -68,7 +67,7 @@ def test_config_bad_key_raises():
     # error verbatim. The kwargs splat deliberately bypasses DuckDBConfig's
     # static key check, which is exactly the runtime scenario we want.
     with pytest.raises(ducky.Error, match="not_a_real_setting"):
-        ducky.connect(not_a_real_setting="x")  # ty: ignore[invalid-argument-type]
+        ducky.connect(not_a_real_setting="x")
 
 
 def test_config_options_returns_known_keys():
@@ -144,11 +143,7 @@ def test_interrupt_cancels_born_as_arrow_query():
 
 @pytest.mark.skipif(sys.platform == "win32", reason="SIGINT-on-self is unreliable on Windows")
 def test_keyboard_interrupt_lands_mid_query():
-    # The pending-execute loop checks PyErr_CheckSignals() between ticks, so
-    # SIGINT delivered to the process raises KeyboardInterrupt out of execute()
-    # rather than parking the main thread until the query finishes. Without the
-    # pending substrate the old gil_scoped_release path could only surface
-    # signals *after* duckdb_execute_prepared returned.
+    # Signal checks must interrupt the query before it completes.
     con = ducky.connect(threads=2)
 
     prior = signal.getsignal(signal.SIGINT)

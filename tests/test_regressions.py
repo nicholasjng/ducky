@@ -1,8 +1,4 @@
-"""Regression tests for bugs found in the 2026-07 codebase review.
-
-Each test pins a specific fixed defect; see the test docstrings for the
-original failure mode.
-"""
+"""Regression tests."""
 
 import datetime
 import gc
@@ -14,12 +10,7 @@ import pytest
 
 import ducky
 
-# ---------------------------------------------------------------------------
-# Failed UDF registration used to double-free the context (SIGABRT): DuckDB's
-# function object owns extra_info via its delete callback even when
-# registration fails, and ducky freed it a second time. Run in a subprocess so
-# a regression aborts the child, not the test session.
-# ---------------------------------------------------------------------------
+# Isolate native failures from the test process.
 
 _FAILED_REGISTRATION_SCRIPT = """
 import ducky
@@ -60,22 +51,17 @@ print("OK")
 """
 
 
-def test_failed_udf_registration_does_not_crash():
+def test_failed_udf_registration_does_not_crash(subprocess_python):
+    executable, env = subprocess_python
     proc = subprocess.run(
-        [sys.executable, "-c", _FAILED_REGISTRATION_SCRIPT],
+        [executable, "-c", _FAILED_REGISTRATION_SCRIPT],
         capture_output=True,
         text=True,
         timeout=120,
+        env=env,
     )
     assert proc.returncode == 0, f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
     assert "OK" in proc.stdout
-
-
-# ---------------------------------------------------------------------------
-# Temporal values outside Python's datetime range used to leak a NULL object
-# out of the decoder ("SystemError: ... returned a result with an exception
-# set"). They must surface the constructor's ValueError instead.
-# ---------------------------------------------------------------------------
 
 
 def test_out_of_range_date_raises_cleanly(con):
@@ -90,12 +76,6 @@ def test_out_of_range_timestamp_raises_cleanly(con):
         con.sql("SELECT TIMESTAMP '2000-01-01' + INTERVAL 9000 YEARS").fetchone()
 
 
-# ---------------------------------------------------------------------------
-# INTERVAL decoding used to compute months*30 and pass raw microseconds
-# through `int` arguments, silently overflowing for large values.
-# ---------------------------------------------------------------------------
-
-
 def test_interval_large_seconds_decodes_exactly(con):
     value = con.sql("SELECT INTERVAL '100000000' SECONDS").fetchitem()
     assert value == datetime.timedelta(seconds=100_000_000)
@@ -106,20 +86,12 @@ def test_interval_months_beyond_timedelta_range_raises(con):
         con.sql("SELECT INTERVAL '200000000' MONTHS").fetchone()
 
 
-# ---------------------------------------------------------------------------
-# A raising profile sink used to call PyErr_WriteUnraisable after the error
-# indicator was already cleared, so the exception vanished without reaching
-# sys.unraisablehook.
-# ---------------------------------------------------------------------------
-
-
 def test_profile_sink_exception_reaches_unraisablehook(con):
 
     def bad_sink(sql, info):
         raise ValueError("sink boom")
 
-    # Keep only (type, message): retaining the UnraisableHookArgs would pin
-    # its traceback (and through the frame chain, this test's locals) forever.
+    # Avoid retaining the traceback through UnraisableHookArgs.
     seen = []
     previous_hook = sys.unraisablehook
     sys.unraisablehook = lambda args: seen.append((args.exc_type, str(args.exc_value)))
@@ -132,13 +104,6 @@ def test_profile_sink_exception_reaches_unraisablehook(con):
 
     assert rows == [(1,)]  # the sink error must not break the query
     assert seen == [(ValueError, "sink boom")]
-
-
-# ---------------------------------------------------------------------------
-# Dropping an Appender whose final flush fails (e.g. a constraint violation)
-# used to throw out of the destructor and terminate the process. The error is
-# still observable via an explicit close().
-# ---------------------------------------------------------------------------
 
 
 def test_appender_destructor_swallows_flush_error(con):
@@ -158,12 +123,6 @@ def test_appender_explicit_close_surfaces_flush_error(con):
         app.close()
 
 
-# ---------------------------------------------------------------------------
-# Table-UDF BLOB output went through the strlen-based string assignment,
-# truncating at the first embedded NUL byte (and rejecting bytes values).
-# ---------------------------------------------------------------------------
-
-
 def test_table_udf_blob_with_embedded_nul(con):
     payload = b"a\x00b"
 
@@ -172,13 +131,6 @@ def test_table_udf_blob_with_embedded_nul(con):
 
     con.create_table_function("blob_rows", factory, [], {"b": "BLOB"})
     assert con.sql("SELECT b FROM blob_rows()").fetchitem() == payload
-
-
-# ---------------------------------------------------------------------------
-# A profile sink / registered Arrow source usually closes over its connection.
-# Connection lacked tp_traverse/tp_clear, so those reference cycles were
-# invisible to the garbage collector and leaked.
-# ---------------------------------------------------------------------------
 
 
 def test_profile_sink_cycle_is_collectable():
@@ -222,12 +174,6 @@ def test_registered_arrow_source_cycle_is_collectable():
     assert ref() is None
 
 
-# ---------------------------------------------------------------------------
-# close() used to keep the profile sink and registered Arrow sources pinned
-# until the Connection wrapper itself was collected.
-# ---------------------------------------------------------------------------
-
-
 def test_close_releases_profile_sink(con):
 
     def sink(_sql, _info):
@@ -260,13 +206,6 @@ def test_close_releases_registered_arrow_sources(con):
     assert ref() is None
 
 
-# ---------------------------------------------------------------------------
-# A type-string parse failure partway through Arrow/table UDF registration
-# used to leak the logical types (and Arrow options) parsed before it. The
-# contexts now own those resources; these tests exercise the throwing path.
-# ---------------------------------------------------------------------------
-
-
 def test_arrow_udf_invalid_parameter_type_raises(con):
     with pytest.raises(ducky.Error, match="invalid DuckDB type"):
         con.create_arrow_function("bad", lambda a, b: a, ["INTEGER", "NOT_A_TYPE"], "INTEGER")
@@ -277,12 +216,6 @@ def test_table_udf_invalid_column_type_raises(con):
     with pytest.raises(ducky.Error, match="invalid DuckDB type"):
         con.create_table_function("bad", lambda: iter(()), [], {"a": "INTEGER", "b": "NOT_A_TYPE"})
     assert con.sql("SELECT 1").fetchitem() == 1
-
-
-# ---------------------------------------------------------------------------
-# append_columns now reuses one data chunk across vector-size slices
-# (duckdb_data_chunk_reset must restore all-valid validity between slices).
-# ---------------------------------------------------------------------------
 
 
 def test_appender_columns_multiple_slices_with_masks(con):

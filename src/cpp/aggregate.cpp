@@ -15,12 +15,6 @@ namespace nb = nanobind;
 
 namespace {
 
-void agg_extra_info_destroy(void* ptr) {
-    if (!ptr) return;
-    nb::gil_scoped_acquire gil;
-    delete (AggregateUDFContext*)ptr;
-}
-
 idx_t agg_state_size(duckdb_function_info /*info*/) { return sizeof(PyObject*); }
 
 // Marks `inst` as having received a real update() call, so agg_combine_copy
@@ -294,7 +288,7 @@ void create_aggregate_function(Connection& con, const std::string& name, nb::obj
     // Ownership of ctx passes to the function object here: its destroy callback
     // runs whether or not registration succeeds (a failed registration's
     // duckdb_destroy_aggregate_function drops the last reference).
-    duckdb_aggregate_function_set_extra_info(f, ctx.get(), &agg_extra_info_destroy);
+    duckdb_aggregate_function_set_extra_info(f, ctx.get(), &gil_delete<AggregateUDFContext>);
     // NOLINTNEXTLINE(bugprone-unused-return-value)
     (void)ctx.release();
 

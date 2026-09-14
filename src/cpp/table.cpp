@@ -51,9 +51,7 @@ nb::object duckdb_value_to_python(duckdb_value val) {
     }
 }
 
-// Column types write_column_value can encode. Everything else is rejected at
-// registration time in create_table_function — the old fallback (string
-// assignment into an arbitrarily-typed vector) corrupted non-VARCHAR buffers.
+// Column types supported by write_column_value.
 bool table_output_type_supported(duckdb_type t) {
     switch (t) {
         case DUCKDB_TYPE_BOOLEAN:
@@ -214,26 +212,6 @@ void write_column_value(duckdb_vector vec, idx_t row, nb::object val, duckdb_typ
     }
 }
 
-void table_extra_info_destroy(void* ptr) {
-    if (!ptr) return;
-    // ~TableUDFContext frees the owned logical types; the GIL covers the
-    // nb::callable member's decref.
-    nb::gil_scoped_acquire gil;
-    delete (TableUDFContext*)ptr;
-}
-
-void bind_data_destroy(void* ptr) {
-    if (!ptr) return;
-    nb::gil_scoped_acquire gil;
-    delete (TableUDFBindData*)ptr;
-}
-
-void init_data_destroy(void* ptr) {
-    if (!ptr) return;
-    nb::gil_scoped_acquire gil;
-    delete (TableUDFInitData*)ptr;
-}
-
 void table_bind(duckdb_bind_info info) {
     auto* ctx = (TableUDFContext*)duckdb_bind_get_extra_info(info);
     nb::gil_scoped_acquire gil;
@@ -260,7 +238,7 @@ void table_bind(duckdb_bind_info info) {
 
             auto* bd =
                 new TableUDFBindData{ctx->factory, python_args, ctx->col_type_ids, ctx->col_names};
-            duckdb_bind_set_bind_data(info, bd, &bind_data_destroy);
+            duckdb_bind_set_bind_data(info, bd, &gil_delete<TableUDFBindData>);
         },
         [&](const char* what) { duckdb_bind_set_error(info, what); });
 }
@@ -274,7 +252,7 @@ void table_init(duckdb_init_info info) {
         [&] {
             nb::object gen = bd->factory(*nb::tuple(bd->python_args));
             auto* id = new TableUDFInitData{std::move(gen)};
-            duckdb_init_set_init_data(info, id, &init_data_destroy);
+            duckdb_init_set_init_data(info, id, &gil_delete<TableUDFInitData>);
         },
         [&](const char* what) { duckdb_init_set_error(info, what); });
 }
@@ -391,7 +369,7 @@ void create_table_function(Connection& con, const std::string& name, nb::callabl
     // Ownership of ctx passes to the function object here: its destroy callback
     // runs whether or not registration succeeds (a failed registration's
     // duckdb_destroy_table_function drops the last reference).
-    duckdb_table_function_set_extra_info(f, ctx.get(), &table_extra_info_destroy);
+    duckdb_table_function_set_extra_info(f, ctx.get(), &gil_delete<TableUDFContext>);
     // NOLINTNEXTLINE(bugprone-unused-return-value)
     (void)ctx.release();
     duckdb_table_function_set_bind(f, &table_bind);

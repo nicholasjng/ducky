@@ -1,23 +1,10 @@
-"""Typing surface for :func:`ducky.connect`.
-
-:class:`DuckDBConfig` is a curated :class:`~typing.TypedDict` of common DuckDB settings, used via :pep:`692` ``Unpack[DuckDBConfig]`` on the ``**config`` parameter of :func:`ducky.connect` so call sites read as plain keyword arguments::
-
-    ducky.connect(memory_limit="2GB", threads=4)
-
-The runtime accepts any string-keyed mapping; DuckDB validates names and values at open time.
-See :func:`ducky.config_options` for the full runtime list of accepted keys.
-"""
+"""Types for DuckDB connection settings."""
 
 from typing import Literal, TypedDict
 
 
 class DuckDBConfig(TypedDict, total=False):
-    """A curated subset of DuckDB global configuration options.
-
-    Values are given as their natural Python type — ``int`` for counts, ``bool`` for flags, ``str`` for sizes / paths / enums (e.g. ``"2GB"``, ``"READ_ONLY"``).
-    :func:`ducky.connect` coerces them to the string form ``duckdb_set_config`` expects (``True`` → ``"true"``, ``4`` → ``"4"``); DuckDB validates names and values at open time.
-    See :func:`ducky.config_options` for the full runtime list.
-    """
+    """Common DuckDB settings accepted by :func:`ducky.connect`."""
 
     access_mode: Literal["AUTOMATIC", "READ_ONLY", "READ_WRITE"]
     """How the database file is opened."""
@@ -44,16 +31,13 @@ class DuckDBConfig(TypedDict, total=False):
     """Install extensions on first reference."""
 
     allow_unsigned_extensions: bool
-    """Permit loading unsigned / self-built extensions via
-    :meth:`Connection.load_extension`. Open-only: it cannot be changed after the
-    connection is opened, so it must be passed to :func:`ducky.connect`."""
+    """Permit unsigned extensions. This must be set when connecting."""
 
     enable_progress_bar: bool
     """Show a progress bar for long-running queries."""
 
     threads: int
-    """Number of worker threads.
-    ``1`` disables parallelism."""
+    """Number of worker threads; ``1`` disables parallelism."""
 
     worker_threads: int
     """Alias of :attr:`threads`."""

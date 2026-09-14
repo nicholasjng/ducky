@@ -15,6 +15,13 @@ def test_prepare_execute_positional(con):
     assert stmt.execute([10, 20]).fetchone() == (30,)
 
 
+def test_prepare_execute_does_not_reuse_omitted_parameters(con):
+    stmt = con.prepare("SELECT ?::INTEGER")
+    assert stmt.execute([7]).fetchitem() == 7
+    with pytest.raises(ducky.Error, match="[Pp]arameter"):
+        stmt.execute()
+
+
 def test_prepare_execute_named(con):
     stmt = con.prepare("SELECT $x AS x, $y AS y")
     assert stmt.num_parameters == 2
@@ -37,6 +44,14 @@ def test_executemany_batched_insert(con):
         (2, "b"),
         (3, "c"),
     ]
+
+
+def test_prepared_executemany_does_not_reuse_short_row(con):
+    con.execute("CREATE TABLE t(a INTEGER, b INTEGER)")
+    stmt = con.prepare("INSERT INTO t VALUES (?, ?)")
+    with pytest.raises(ducky.Error, match="[Pp]arameter"):
+        stmt.executemany([(1, 2), (3,)])
+    assert con.sql("SELECT * FROM t").fetchall() == [(1, 2)]
 
 
 def test_result_schema_and_statement_type_before_execution(con):

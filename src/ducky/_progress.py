@@ -1,8 +1,4 @@
-"""Live progress bar for long-running queries.
-
-See :func:`progress_bar`.
-Renders via ``tqdm`` when installed; falls back to a minimal stderr bar otherwise (the import never hard-fails on missing tqdm).
-"""
+"""Live query progress bars."""
 
 from __future__ import annotations
 
@@ -98,40 +94,11 @@ def progress_bar(
     out: IO[str] | None = None,
     use_tqdm: bool = True,
 ) -> Iterator[Connection]:
-    """Render a live progress bar for queries inside the block.
-
-    Enables DuckDB progress tracking, polls :meth:`Connection.progress` from a background thread, and restores the connection's progress settings on exit.
-
-    Parameters
-    ----------
-    con : Connection
-        The connection whose queries should be tracked.
-    desc : str, default 'query'
-        Label shown to the left of the bar.
-    interval : float, default 0.1
-        Seconds between progress polls.
-    out : file-like, optional
-        Text stream to draw on.
-        Defaults to ``sys.stderr``.
-    use_tqdm : bool, default True
-        Render through ``tqdm`` when installed; set ``False`` to force the stderr fallback.
-
-    Yields
-    ------
-    Connection
-        The same connection, so ``with progress_bar(con) as c:`` works.
-
-    Examples
-    --------
-    >>> with ducky.progress_bar(con):
-    ...     con.execute("SELECT count(*) FROM range(1_000_000_000) WHERE i % 7 = 0")
-    """
-    # Imported lazily so importing ducky doesn't pull in threading machinery.
+    """Show query progress, using ``tqdm`` when available."""
     import threading
 
     out = sys.stderr if out is None else out
 
-    # Snapshot the settings we touch so we can restore them afterwards.
     prev_enabled = _bool_setting(con, "enable_progress_bar")
     prev_print = _bool_setting(con, "enable_progress_bar_print")
     _set_bool(con, "enable_progress_bar", True)

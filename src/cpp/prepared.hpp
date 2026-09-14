@@ -76,11 +76,7 @@ inline const char* duckdb_statement_type_name(duckdb_statement_type type) {
     }
 }
 
-// A compiled SQL statement that can be executed repeatedly with different
-// parameters. Created via Connection.prepare(); shares the connection's
-// DuckDBHandle so the database stays open for as long as the statement (and any
-// Result it produced) is alive. The parse + bind + plan happens once at
-// prepare() time, so executing in a loop avoids re-compiling the query.
+// A reusable prepared statement sharing its connection handle.
 class PreparedStatement {
    public:
     PreparedStatement(duckdb_prepared_statement stmt, std::shared_ptr<DuckDBHandle> handle);
@@ -89,11 +85,7 @@ class PreparedStatement {
     PreparedStatement(const PreparedStatement&) = delete;
     PreparedStatement& operator=(const PreparedStatement&) = delete;
 
-    // Bind `parameters` (list/tuple positional, dict named, or None) and run
-    // the statement, returning its Result. The executor is driven one task at
-    // a time with the GIL released between ticks, so KeyboardInterrupt lands
-    // mid-query and DuckDB's scheduler (plus any UDF workers) can run. Pass
-    // `streaming=true` for a lazy chunk-pull result; see Connection::execute.
+    // Bind parameters and execute, optionally streaming.
     std::shared_ptr<Result> execute(nb::object parameters, bool streaming);
 
     // Run the statement once per parameter set in `seq`, discarding each

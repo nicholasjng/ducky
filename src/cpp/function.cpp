@@ -15,6 +15,8 @@
 
 namespace {
 
+using namespace nb::literals;
+
 template <typename T>
 nb::dlpack::dtype dt() {
     return nb::dtype<T>();
@@ -24,6 +26,7 @@ nb::dlpack::dtype dt() {
 struct PyArrowAPI {
     nb::object import_from_c;  // pa.RecordBatch._import_from_c
     nb::object from_arrays;    // pa.RecordBatch.from_arrays
+    nb::object schema_import;  // pa.Schema._import_from_c
 };
 
 const PyArrowAPI& pyarrow_api() {
@@ -32,7 +35,8 @@ const PyArrowAPI& pyarrow_api() {
     return cached_singleton(cached, mu, [] {
         nb::module_ pa = nb::module_::import_("pyarrow");
         nb::object rb_cls = pa.attr("RecordBatch");
-        return PyArrowAPI{rb_cls.attr("_import_from_c"), rb_cls.attr("from_arrays")};
+        return PyArrowAPI{rb_cls.attr("_import_from_c"), rb_cls.attr("from_arrays"),
+                          pa.attr("Schema").attr("_import_from_c")};
     });
 }
 
@@ -146,18 +150,6 @@ struct UDFState {
     nb::object obj;
 };
 
-void udf_extra_info_destroy(void* ptr) {
-    if (!ptr) return;
-    nb::gil_scoped_acquire gil;
-    delete (UDFContext*)ptr;
-}
-
-void udf_state_destroy(void* ptr) {
-    if (!ptr) return;
-    nb::gil_scoped_acquire gil;
-    delete (UDFState*)ptr;
-}
-
 // Called once per worker thread; builds per-thread state via init=callable.
 void udf_init_trampoline(duckdb_init_info info) {
     auto* ctx = (UDFContext*)duckdb_scalar_function_init_get_extra_info(info);
@@ -165,7 +157,7 @@ void udf_init_trampoline(duckdb_init_info info) {
     try {
         nb::object state = ctx->init_callable();
         auto* holder = new UDFState{std::move(state)};
-        duckdb_scalar_function_init_set_state(info, holder, &udf_state_destroy);
+        duckdb_scalar_function_init_set_state(info, holder, &gil_delete<UDFState>);
     } catch (nb::python_error& e) {
         std::string msg = std::string("ducky UDF init error: ") + e.what();
         duckdb_scalar_function_init_set_error(info, msg.c_str());
@@ -314,6 +306,10 @@ struct ArrowUDFContext {
     //   record_batch=false, dict_style=true  → fn({"name": col, ...})  [dict of pa.Array]
     bool record_batch = false;
     bool dict_style = false;
+    // Arrow view of `return_type`, built lazily on the first call (registration
+    // must not require pyarrow). Filled under the GIL by ensure_out_schema.
+    nb::object out_schema;  // pa.Schema, one field
+    nb::object out_type;    // that field's pa.DataType
 
     ArrowUDFContext() = default;
     ArrowUDFContext(const ArrowUDFContext&) = delete;
@@ -329,14 +325,6 @@ struct ArrowUDFContext {
     }
 };
 
-void arrow_udf_extra_info_destroy(void* ptr) {
-    if (!ptr) return;
-    // ~ArrowUDFContext frees the owned DuckDB objects; the GIL covers the
-    // nb::callable member's decref.
-    nb::gil_scoped_acquire gil;
-    delete (ArrowUDFContext*)ptr;
-}
-
 // RAII for an ArrowSchema/ArrowArray pair on the stack: releases whichever
 // halves still own data when we leave scope (e.g. on exception).
 struct ArrowPair {
@@ -347,6 +335,24 @@ struct ArrowPair {
         if (array.release) array.release(&array);
     }
 };
+
+// Resolve `return_type` into the pa.Schema the output batch is exported with.
+// Cached on the context; called with the GIL held.
+void ensure_out_schema(ArrowUDFContext* ctx) {
+    if (ctx->out_type.is_valid()) return;
+    ArrowSchema target{};
+    const char* name = "x";
+    std::string err;
+    if (drain_arrow_error(
+            duckdb_to_arrow_schema(ctx->options, &ctx->return_type, &name, 1, &target), err)) {
+        throw DuckyError("ducky: failed to build the Arrow schema for the UDF return type: " + err);
+    }
+    SchemaRelease guard{&target};
+    nb::object schema = pyarrow_api().schema_import((uintptr_t)(&target));
+    target.release = nullptr;  // pyarrow took ownership
+    ctx->out_schema = schema;
+    ctx->out_type = schema.attr("field")(0).attr("type");
+}
 
 // RAII wrappers for DuckDB heap objects used in the Arrow trampoline.
 struct ChunkGuard {
@@ -400,10 +406,22 @@ void arrow_udf_trampoline(duckdb_function_info info, duckdb_data_chunk input,
             // Wrap the user's pa.Array into a single-field RecordBatch so we can
             // round-trip back through duckdb_data_chunk_from_arrow (which expects a
             // struct-shaped ArrowArray representing one chunk).
-            nb::list out_arrays, out_names;
+            //
+            // The batch is pinned to the *declared* return type rather than to
+            // whatever the callable happened to produce: pyarrow's kernels widen
+            // types (pc.multiply on two DECIMAL(5,2) yields DECIMAL(11,4)), and a
+            // widened array would reach duckdb_vector_reference_vector below with a
+            // physical layout the output vector doesn't share -- DECIMAL(11,4) is
+            // int64-backed, DECIMAL(7,4) int32-backed. That trips an assertion in
+            // debug DuckDB and silently misreads the buffer in release builds, so
+            // cast here and let pyarrow reject a genuinely incompatible return.
+            ensure_out_schema(ctx);
+            if (!nb::cast<bool>(result.attr("type").attr("equals")(ctx->out_type))) {
+                result = result.attr("cast")(ctx->out_type);
+            }
+            nb::list out_arrays;
             out_arrays.append(result);
-            out_names.append(nb::str("x"));
-            nb::object out_rb = pa.from_arrays(out_arrays, out_names);
+            nb::object out_rb = pa.from_arrays(out_arrays, "schema"_a = ctx->out_schema);
 
             ArrowPair out;
             out_rb.attr("_export_to_c")((uintptr_t)(&out.array), (uintptr_t)(&out.schema));
@@ -554,7 +572,7 @@ void create_scalar_function(Connection& con, const std::string& name, nb::callab
     // runs whether or not registration succeeds — on failure the
     // duckdb_destroy_scalar_function below drops the last reference to the
     // shared function info, whose destructor invokes the callback.
-    duckdb_scalar_function_set_extra_info(f, ctx.get(), &udf_extra_info_destroy);
+    duckdb_scalar_function_set_extra_info(f, ctx.get(), &gil_delete<UDFContext>);
     // NOLINTNEXTLINE(bugprone-unused-return-value)
     (void)ctx.release();
 
@@ -613,7 +631,7 @@ void create_arrow_scalar_function(Connection& con, const std::string& name, nb::
     duckdb_scalar_function_set_function(f, &arrow_udf_trampoline);
     // Ownership of ctx passes to the function object here; see
     // create_scalar_function.
-    duckdb_scalar_function_set_extra_info(f, ctx.get(), &arrow_udf_extra_info_destroy);
+    duckdb_scalar_function_set_extra_info(f, ctx.get(), &gil_delete<ArrowUDFContext>);
     // NOLINTNEXTLINE(bugprone-unused-return-value)
     (void)ctx.release();
 

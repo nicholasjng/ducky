@@ -13,17 +13,10 @@
 
 namespace nb = nanobind;
 
-// Owns a `duckdb_result` and decodes it into Python objects on demand.
-//
-// Rows are pulled lazily, one DuckDB data chunk (a column-major batch of up to
-// STANDARD_VECTOR_SIZE rows) at a time, via the modern duckdb_fetch_chunk API.
-// We keep the current chunk plus a cursor into it, so fetchone/fetchmany stream
-// without materializing the whole result up front.
+// A lazily decoded duckdb_result.
 class Result {
    public:
-    // `handle` is the shared database/connection owner; the Result keeps it
-    // alive so that fetching and Arrow export keep working even after the
-    // originating Connection is dropped.
+    // `handle` keeps the database alive.
     Result(duckdb_result result, std::shared_ptr<DuckDBHandle> handle);
     ~Result();
 
@@ -49,35 +42,16 @@ class Result {
     // streaming results (the C API can't read the count without materializing).
     int64_t rows_changed();
 
-    // Pulls the next data chunk and returns it as a `Chunk` Python object, or
-    // None when the result is exhausted. Each call advances the same underlying
-    // cursor as fetch*/arrow_c_stream — don't mix them on one result.
+    // Pull the next chunk. Shares the cursor with other consumers.
     nb::object fetch_chunk();
 
-    // Pulls the next data chunk and returns it as a {name: ndarray} dict (the
-    // zero-copy views Chunk.column produces), or None when exhausted. Builds
-    // the whole dict in one C++ call so streaming consumers (iter_batches) pay
-    // a single Python<->C++ crossing per chunk instead of one per column.
-    // Shares the cursor with fetch_chunk/fetch*; don't mix them on one result.
+    // Pull the next chunk as NumPy arrays.
     nb::object fetch_numpy_chunk();
 
-    // Drain the result into a {name: numpy.ndarray} dict. Loops chunks in C++,
-    // pre-allocates one buffer per column, memcpy's each chunk's vector data
-    // into the right slice, and wraps the buffer as a numpy ndarray (HUGEINT /
-    // UHUGEINT / INTERVAL / DECIMAL-HUGEINT get reinterpreted via .view() into
-    // a structured dtype). `columns` is an Iterable[str] or None for all.
-    // Raises DuckyError on column types with no flat ndarray representation
-    // (VARCHAR, LIST, STRUCT, MAP) — callers should route to .arrow() instead.
+    // Drain selected flat columns into NumPy arrays.
     nb::object to_numpy(nb::object columns);
 
-    // Arrow PyCapsule interface: exports the remaining result as an Arrow C
-    // stream. `self` is the owning Python object, kept alive for the stream's
-    // lifetime. Consumes the result (mutually exclusive with the fetch* path).
-    //
-    // `allow_fast` (the default, used by __arrow_c_stream__) lets all-flat
-    // results be drained into a single combined batch — cheapest for whole-table
-    // consumers. Pass false for a per-chunk stream (one batch per ~2048-row
-    // chunk), which keeps peak memory bounded to one batch for streaming.
+    // Export the remaining rows as an Arrow C stream.
     nb::object arrow_c_stream(nb::object self, bool allow_fast = true);
 
    private:
@@ -105,11 +79,7 @@ class Result {
     // decoder doesn't allocate one per cell (a column's type is constant).
     std::vector<duckdb_logical_type> column_types_;
 
-    // Per-column decode state for the chunk currently being decoded, resolved
-    // once per (chunk, column) in ensure_row() so the row decoder makes zero
-    // C API calls per cell on flat types (data/validity/type are constant
-    // across a vector). `vector` stays as the entry point for nested types,
-    // whose children the decoder still resolves per cell.
+    // Per-column state for the current chunk.
     struct ColumnCursor {
         duckdb_vector vector;
         void* data;
@@ -119,14 +89,9 @@ class Result {
     duckdb_data_chunk chunk_ = nullptr;
     idx_t chunk_size_ = 0;
     idx_t cursor_ = 0;
-    // Buffer pool for fetch_chunk()/fetch_numpy_chunk() (the Chunk-returning
-    // API) — distinct from chunk_ above, which is ensure_row()'s own scratch
-    // buffer for the row-cursor path (fetchone/fetchmany/fetchall). One pool
-    // per Result, so a reused buffer always already matches this Result's
-    // own column layout.
+    // Buffer pool for chunk-returning APIs.
     std::shared_ptr<ChunkPool> chunk_pool_ = std::make_shared<ChunkPool>();
-    // Rows handed out via fetchone/fetchmany/fetchall so far; lets fetchall
-    // pre-size its list from duckdb_row_count on materialized results.
+    // Rows consumed through any cursor.
     idx_t rows_returned_ = 0;
     std::vector<ColumnCursor> cursors_;
 };
