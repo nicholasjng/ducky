@@ -1,33 +1,8 @@
 #!/bin/sh
 #
-# Record native-frame profiles for the benchmarks where ducky trails duckdb,
-# one isolated case per benchmark. Uses `mew profile` (xctrace on macOS,
-# py-spy/perf on Linux) — the out-of-process native profiler, not `mew run
-# --sample` (which is Python-only).
-#
-# Usage:
-#   scripts/profile-gaps.sh [ducky|duckdb]
-#
-#   engine   Which bench file to profile (default: ducky). Run with `duckdb`
-#            too for the A/B: same case on both engines, diff the native frames
-#            to see *why* ducky's path costs more (e.g. connect, executemany).
-#
-# Artifacts land in .mew-traces/<engine>/<name>/. Open in Instruments (macOS)
-# or pass --open by editing the command below.
-#
-# --iterations is sized per case so the ~1 kHz sampler gets enough hits — slow
-# bodies (executemany ~12 s/iter) need a handful, µs-fast ones need many.
-#
-# IMPORTANT: an out-of-process native sampler records the *whole* process; it
-# cannot honour mew's in-process state.pause(). So per-iteration setup shows up
-# in the trace. The cases below are chosen so that's a non-issue — their setup
-# is either one-time (select_* call _populate() once before the loop, amortized
-# over thousands of iters) or dwarfed by the body (executemany's body is ~12 s
-# vs ~15 ms setup). bench_bulk_insert_arrow is deliberately omitted: its body
-# (~18 ms) is per-iteration ducky.connect() (~6 ms) plus the INSERT, so its
-# trace is ~30% connect frames. Profile that one with a standalone driver that
-# hoists connect()/register_arrow() out of the loop, or read only the INSERT
-# subtree in the viewer.
+# Profile selected benchmarks with native frames.
+# Usage: scripts/profile-gaps.sh [ducky|duckdb]
+# Output: .mew-traces/<engine>/<name>/
 set -eu
 
 engine="${1:-ducky}"
@@ -42,8 +17,7 @@ esac
 bench="benchmarks/bench_${engine}.py"
 outroot=".mew-traces/${engine}"
 
-# name | -k regex (pins one parametrized case) | --iterations (~15-25 s of samples)
-# Only cases whose body dominates the native trace (see the setup note above).
+# name | pattern | iterations
 gaps='
 connect|^bench_connect$|2500
 executemany|bench_executemany\[n=100000\]|2

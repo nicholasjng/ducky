@@ -1,9 +1,4 @@
-"""Engine-agnostic data fixtures shared by bench_ducky.py and bench_duckdb.py.
-
-We can't import ducky and the upstream duckdb Python module in the same
-process — both statically link DuckDB and the symbols collide. Engine-specific
-benchmark files import only their own engine; this file imports neither.
-"""
+"""Shared engine-independent benchmark data."""
 
 from __future__ import annotations
 

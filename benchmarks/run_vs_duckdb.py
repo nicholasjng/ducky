@@ -1,19 +1,4 @@
-"""ducky vs duckdb-python: side-by-side runtime + memory comparison.
-
-ducky and the upstream ``duckdb`` module both statically link DuckDB and can't
-share an interpreter, so each runs in its own subprocess. mew's variant runner
-(`mew run --variant`) does this directly — interleaving repetitions so drift
-doesn't bias one engine, forwarding the profilers to each child, and tagging
-each row with its variant and per-engine context. `mew compare --by variant`
-then pivots the single result file (it matches on the function name across
-variants automatically) and annotates each column with its engine version, so
-the (usually different) embedded DuckDB builds are visible.
-
-Usage:
-    uv run --group bench python benchmarks/run_vs_duckdb.py
-    uv run --group bench python benchmarks/run_vs_duckdb.py --memory
-    uv run --group bench python benchmarks/run_vs_duckdb.py --tag ml
-"""
+"""Compare ducky and duckdb-python benchmarks in separate processes."""
 
 from __future__ import annotations
 
@@ -24,17 +9,13 @@ import tempfile
 from pathlib import Path
 
 BENCH_DIR = Path(__file__).parent
-# duckdb first so it's the comparison baseline (speedup reads ducky-vs-duckdb).
-VARIANTS = {"duckdb": BENCH_DIR / "bench_duckdb.py", "ducky": BENCH_DIR / "bench_ducky.py"}
-# allocations_per_iteration is the per-call, cross-engine-comparable count;
-# peak_bytes is an iteration-independent high-water mark. total_allocations is
-# deliberately omitted — it's a single-pass count dominated by first-call costs.
+SUITES = {"duckdb": BENCH_DIR / "bench_duckdb.py", "ducky": BENCH_DIR / "bench_ducky.py"}
 MEMORY_METRICS = ("memory.peak_bytes", "memory.allocations_per_iteration")
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--memory", action="store_true", help="add a memray pass (per variant)")
+    parser.add_argument("--memory", action="store_true", help="add a memray pass per engine")
     parser.add_argument(
         "-t", "--tag", default=None, help="filter to a tag (select, insert, ml, udf, ...)"
     )
@@ -42,15 +23,14 @@ def main() -> int:
         "-k",
         "--pattern",
         default=None,
-        help="filter to benchmarks whose name contains this substring",
+        help="run benchmarks whose name matches this regex",
     )
     parser.add_argument(
         "-r",
         "--repetitions",
         type=int,
         default=1,
-        help="process-level samples per (benchmark x variant), interleaved across variants; "
-        ">1 surfaces per-engine stddev so outliers are visible",
+        help="samples per benchmark and engine; >1 enables stddev columns",
     )
     args = parser.parse_args()
     filter_args = (["-t", args.tag] if args.tag else []) + (
@@ -62,19 +42,14 @@ def main() -> int:
     metrics = ("real_time", *MEMORY_METRICS) if args.memory else ("real_time",)
 
     with tempfile.TemporaryDirectory() as tmp:
-        out = Path(tmp) / "vs.jsonl"
-        subprocess.run(
-            [
-                "mew",
-                "run",
-                *(f"--variant={name}={path}" for name, path in VARIANTS.items()),
-                *run_args,
-                "-o",
-                str(out),
-                *filter_args,
-            ],
-            check=True,
-        )
+        results: dict[str, Path] = {}
+        for name, suite in SUITES.items():
+            out = Path(tmp) / f"{name}.json"
+            subprocess.run(
+                ["mew", "run", str(suite), *run_args, "-o", str(out), *filter_args],
+                check=True,
+            )
+            results[name] = out
         rc = 0
         for metric in metrics:
             rc = (
@@ -82,11 +57,10 @@ def main() -> int:
                     [
                         "mew",
                         "compare",
-                        str(out),
-                        "--by",
-                        "variant",
-                        "--baseline",
-                        "duckdb",
+                        str(results["ducky"]),
+                        str(results["duckdb"]),
+                        "--key",
+                        "func",
                         "--metric",
                         metric,
                         "--stddev",

@@ -1,8 +1,4 @@
-"""ducky-side workloads. Run with `mew run benchmarks/bench_ducky.py`.
-
-Pair with bench_duckdb.py (run in a separate process) for cross-engine
-comparison — see benchmarks/run_vs_duckdb.py.
-"""
+"""ducky benchmarks for ``benchmarks/run_vs_duckdb.py``."""
 
 from __future__ import annotations
 
@@ -100,12 +96,7 @@ def bench_arrow_scan_agg(state: mew.State, n: int) -> None:
 
 @mew.parametrize(_PARAMS, ids=_IDS, tags=(*_TAGS, "udf"), min_time=0.2)
 def bench_udf_scalar(state: mew.State, n: int) -> None:
-    """Vectorized scalar UDF: each engine's fastest flavor.
-
-    ducky passes zero-copy ndarrays to create_function; the duckdb counterpart
-    uses type='arrow' (its vectorized path — the default 'native' type is
-    row-at-a-time and not comparable).
-    """
+    """Vectorized NumPy scalar UDF."""
     con = _populate(n)
     con.create_function("add_one", lambda b: b + 1, ["BIGINT"], "BIGINT")
     for _ in state:
@@ -129,11 +120,7 @@ def bench_select_to_numpy(state: mew.State, n: int) -> None:
 
 @mew.parametrize(_PARAMS, ids=_IDS, tags=(*_TAGS, "ml"), min_time=0.2)
 def bench_select_iter_batches(state: mew.State, n: int) -> None:
-    """iter_batches: streaming per-chunk dict[str, ndarray] (no concat).
-
-    duckdb-python has no numpy-batch streaming API; its to_arrow_reader(2048)
-    is the closest counterpart, so this row compares different products.
-    """
+    """Stream chunk-sized NumPy batches."""
     con = _populate(n)
     for _ in state:
         for _batch in con.execute("SELECT * FROM t").iter_batches():
@@ -142,12 +129,7 @@ def bench_select_iter_batches(state: mew.State, n: int) -> None:
 
 @mew.parametrize(_PARAMS, ids=_IDS, tags=(*_TAGS, "ml"), min_time=0.2)
 def bench_select_arrow_reader(state: mew.State, n: int) -> None:
-    """arrow_reader: born-as-Arrow, DuckDB's Arrow collector builds batches
-    during execution.
-
-    The like-for-like counterpart of duckdb's to_arrow_reader(2048) in
-    bench_duckdb.py — both born-as-Arrow readers at the same batch size.
-    """
+    """Stream collected Arrow batches."""
     con = _populate(n)
     for _ in state:
         for _batch in con.arrow_reader("SELECT * FROM t", rows_per_batch=2048):
@@ -156,12 +138,7 @@ def bench_select_arrow_reader(state: mew.State, n: int) -> None:
 
 @mew.parametrize(_PARAMS, ids=_IDS, tags=(*_TAGS, "ml"), min_time=0.2)
 def bench_select_arrow_batches(state: mew.State, n: int) -> None:
-    """arrow_batches: per-chunk pyarrow RecordBatchReader (one batch per chunk).
-
-    ducky-only A/B against bench_select_arrow_reader: same product, but
-    memory-bounded chunk-by-chunk conversion after a materialized execute
-    instead of collecting Arrow during execution.
-    """
+    """Convert and stream one Arrow batch per DuckDB chunk."""
     con = _populate(n)
     for _ in state:
         for _batch in con.execute("SELECT * FROM t").arrow_batches():
@@ -206,12 +183,7 @@ def bench_bulk_insert_arrow(state: mew.State, n: int) -> None:
 
 @mew.parametrize(_PARAMS, ids=_IDS, tags=(*_TAGS, "insert"), min_time=0.2)
 def bench_bulk_append_arrow(state: mew.State, n: int) -> None:
-    """Appender Arrow ingest (single-threaded arrow→chunk→table).
-
-    ducky-only: duckdb-python exposes no appender, so the side-by-side table
-    shows no duckdb column for this workload. Compare against
-    bulk_insert_arrow to see the appender's overhead.
-    """
+    """Append an Arrow table."""
     tbl = arrow_table(n)
     for _ in state:
         with state.pause():

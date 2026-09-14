@@ -1,8 +1,4 @@
-"""duckdb-side workloads. Run with `mew run benchmarks/bench_duckdb.py`.
-
-Pair with bench_ducky.py (run in a separate process) for cross-engine
-comparison — see benchmarks/run_vs_duckdb.py.
-"""
+"""duckdb-python benchmarks for ``benchmarks/run_vs_duckdb.py``."""
 
 from __future__ import annotations
 
@@ -97,12 +93,7 @@ def bench_arrow_scan_agg(state: mew.State, n: int) -> None:
 
 @mew.parametrize(_PARAMS, ids=_IDS, tags=(*_TAGS, "udf"), min_time=0.2)
 def bench_udf_scalar(state: mew.State, n: int) -> None:
-    """Vectorized scalar UDF: each engine's fastest flavor.
-
-    type='arrow' is duckdb's vectorized path (pyarrow arrays in/out); the
-    default 'native' type is row-at-a-time and not comparable to ducky's
-    ndarray-vectorized create_function.
-    """
+    """Vectorized Arrow scalar UDF."""
     import pyarrow.compute as pc
     from duckdb.sqltypes import BIGINT
 
@@ -119,8 +110,7 @@ def bench_connect(state: mew.State) -> None:
         duckdb.connect().close()
 
 
-# Map the ducky-specific `to_numpy` (chunk-direct concat) to duckdb's fetchnumpy
-# so the side-by-side table shows both engines' fastest column-major path.
+# Match ducky's to_numpy benchmark with duckdb-python's fetchnumpy.
 @mew.parametrize(_PARAMS, ids=_IDS, tags=(*_TAGS, "ml"), min_time=0.2)
 def bench_select_to_numpy(state: mew.State, n: int) -> None:
     con = _populate(n)
@@ -130,14 +120,7 @@ def bench_select_to_numpy(state: mew.State, n: int) -> None:
 
 @mew.parametrize(_PARAMS, ids=_IDS, tags=(*_TAGS, "ml"), min_time=0.2)
 def bench_select_iter_batches(state: mew.State, n: int) -> None:
-    """duckdb's chunked path: to_arrow_reader at 2048 rows per batch.
-
-    2048 matches DuckDB's vector size, which is the granularity ducky's
-    iter_batches streams at — the default (1M rows/batch) would compare one
-    giant batch against ducky's ~489 chunks. duckdb-python has no numpy-batch
-    streaming API, so this Arrow reader is the closest counterpart to ducky's
-    iter_batches (different products: Arrow batches vs ndarray dicts).
-    """
+    """Stream 2048-row Arrow batches as the closest iter_batches counterpart."""
     con = _populate(n)
     for _ in state:
         reader = con.execute("SELECT * FROM t").to_arrow_reader(2048)
@@ -147,8 +130,7 @@ def bench_select_iter_batches(state: mew.State, n: int) -> None:
 
 @mew.parametrize(_PARAMS, ids=_IDS, tags=(*_TAGS, "ml"), min_time=0.2)
 def bench_select_arrow_reader(state: mew.State, n: int) -> None:
-    """Same 2048-row Arrow reader; pairs with ducky's arrow_reader (Arrow
-    collector) — both born-as-Arrow at the same batch size."""
+    """Stream collected 2048-row Arrow batches."""
     con = _populate(n)
     for _ in state:
         reader = con.execute("SELECT * FROM t").to_arrow_reader(2048)
