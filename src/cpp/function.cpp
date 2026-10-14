@@ -190,6 +190,34 @@ void set_udf_error(duckdb_function_info info, const char* what) {
     duckdb_scalar_function_set_error(info, msg.c_str());
 }
 
+// Default NULL handling: DuckDB only short-circuits constant NULL inputs, so a
+// UDF without special handling sees NULL rows of a flat chunk too. Collects
+// the rows where every input is valid into `keep`; returns false when there is
+// no NULL among the first `n` rows (the caller then passes the chunk as is).
+bool collect_valid_rows(duckdb_data_chunk input, idx_t n_params, idx_t n,
+                        std::vector<idx_t>& keep) {
+    std::vector<uint64_t*> masks;
+    for (idx_t i = 0; i < n_params; ++i) {
+        if (uint64_t* m = duckdb_vector_get_validity(duckdb_data_chunk_get_vector(input, i))) {
+            masks.push_back(m);
+        }
+    }
+    if (masks.empty()) return false;
+    keep.clear();
+    keep.reserve(n);
+    for (idx_t r = 0; r < n; ++r) {
+        bool valid = true;
+        for (uint64_t* m : masks) {
+            if (!duckdb_validity_row_is_valid(m, r)) {
+                valid = false;
+                break;
+            }
+        }
+        if (valid) keep.push_back(r);
+    }
+    return keep.size() != n;
+}
+
 void udf_trampoline(duckdb_function_info info, duckdb_data_chunk input, duckdb_vector output) {
     auto* ctx = (UDFContext*)duckdb_scalar_function_get_extra_info(info);
     nb::gil_scoped_acquire gil;
@@ -197,19 +225,50 @@ void udf_trampoline(duckdb_function_info info, duckdb_data_chunk input, duckdb_v
     idx_t n = duckdb_data_chunk_get_size(input);
     idx_t n_params =
         ctx->varargs_type ? duckdb_data_chunk_get_column_count(input) : ctx->param_types.size();
-    size_t shape[1] = {(size_t)n};
     // Per-arg mask scratch (only with special_handling). The (values, mask)
     // ndarrays view this storage; it must live until the callable returns.
     std::vector<std::vector<uint8_t>> mask_bufs(ctx->special_handling ? n_params : 0);
+    // Without special handling, rows with a NULL input are left out of the
+    // call (their output is NULL), so the callable never sees the arbitrary
+    // values DuckDB leaves in NULL slots.
+    std::vector<idx_t> keep;
+    bool compact = !ctx->special_handling && collect_valid_rows(input, n_params, n, keep);
+    idx_t m = compact ? (idx_t)keep.size() : n;
+    std::vector<std::vector<char>> gathered(compact ? n_params : 0);
+    size_t shape[1] = {(size_t)m};
 
     guard(
         [&] {
-            // Input ndarray views over the chunk's vectors. Owner is empty;
-            // arrays are valid only for this call, like Chunk.column views.
+            if (compact) {
+                duckdb_vector_ensure_validity_writable(output);
+                uint64_t* validity = duckdb_vector_get_validity(output);
+                size_t k = 0;
+                for (idx_t r = 0; r < n; ++r) {
+                    if (k < keep.size() && keep[k] == r) {
+                        ++k;
+                    } else {
+                        duckdb_validity_set_row_invalid(validity, r);
+                    }
+                }
+                if (m == 0) return;  // every row has a NULL input
+            }
+
+            // Input ndarray views over the chunk's vectors (or over the
+            // gathered valid rows). Owner is empty; arrays are valid only for
+            // this call, like Chunk.column views.
             auto build_values = [&](idx_t i) {
                 duckdb_vector v = duckdb_data_chunk_get_vector(input, i);
                 void* data = duckdb_vector_get_data(v);
                 const TypeSpec* t = ctx->varargs_type ? ctx->varargs_type : ctx->param_types[i];
+                if (compact) {
+                    std::vector<char>& buf = gathered[i];
+                    buf.resize(m * t->size);
+                    for (idx_t j = 0; j < m; ++j) {
+                        std::memcpy(buf.data() + j * t->size, (char*)data + keep[j] * t->size,
+                                    t->size);
+                    }
+                    data = buf.data();
+                }
                 nb::object values = nb::cast(nb::ndarray<nb::numpy, nb::ro>(
                     data, 1, shape, nb::handle(), nullptr, t->dtype()));
                 if (!ctx->special_handling) return values;
@@ -254,8 +313,8 @@ void udf_trampoline(duckdb_function_info info, duckdb_data_chunk input, duckdb_v
             // `big[::2]`) would otherwise be copied out wrong. nanobind
             // materializes a contiguous copy for us when needed.
             auto arr = nb::cast<nb::ndarray<nb::numpy, nb::c_contig>>(values_obj);
-            if (arr.ndim() != 1 || arr.shape(0) != n) {
-                throw DuckyError("ducky: UDF returned an array of shape != (" + std::to_string(n) +
+            if (arr.ndim() != 1 || arr.shape(0) != m) {
+                throw DuckyError("ducky: UDF returned an array of shape != (" + std::to_string(m) +
                                  ",)");
             }
             nb::dlpack::dtype want = ctx->return_type->dtype();
@@ -264,13 +323,21 @@ void udf_trampoline(duckdb_function_info info, duckdb_data_chunk input, duckdb_v
                 throw DuckyError("ducky: UDF returned an array of the wrong dtype for " +
                                  std::string(ctx->return_type->name));
             }
-            void* out_data = duckdb_vector_get_data(output);
-            std::memcpy(out_data, arr.data(), n * ctx->return_type->size);
+            char* out_data = (char*)duckdb_vector_get_data(output);
+            size_t width = ctx->return_type->size;
+            if (compact) {
+                for (idx_t j = 0; j < m; ++j) {
+                    std::memcpy(out_data + keep[j] * width, (const char*)arr.data() + j * width,
+                                width);
+                }
+            } else {
+                std::memcpy(out_data, arr.data(), n * width);
+            }
 
             if (mask_obj) {
                 auto mask = nb::cast<nb::ndarray<nb::numpy, nb::c_contig>>(mask_obj);
-                if (mask.ndim() != 1 || mask.shape(0) != n) {
-                    throw DuckyError("ducky: UDF mask shape != (" + std::to_string(n) + ",)");
+                if (mask.ndim() != 1 || mask.shape(0) != m) {
+                    throw DuckyError("ducky: UDF mask shape != (" + std::to_string(m) + ",)");
                 }
                 nb::dlpack::dtype mdt = mask.dtype();
                 // uint8 or bool — both 8-bit unsigned in DLPack (code=1, bits=8).
@@ -280,9 +347,9 @@ void udf_trampoline(duckdb_function_info info, duckdb_data_chunk input, duckdb_v
                 }
                 duckdb_vector_ensure_validity_writable(output);
                 uint64_t* validity = duckdb_vector_get_validity(output);
-                const uint8_t* m = (const uint8_t*)mask.data();
-                for (idx_t i = 0; i < n; ++i) {
-                    if (!m[i]) duckdb_validity_set_row_invalid(validity, i);
+                const uint8_t* valid = (const uint8_t*)mask.data();
+                for (idx_t j = 0; j < m; ++j) {
+                    if (!valid[j]) duckdb_validity_set_row_invalid(validity, compact ? keep[j] : j);
                 }
             }
         },
@@ -455,6 +522,17 @@ void arrow_udf_trampoline(duckdb_function_info info, duckdb_data_chunk input,
         [&](const char* what) { set_udf_error(info, what); });
 }
 
+// Register and destroy `f`. Registration takes the client context lock, which
+// a query running Python callbacks on another thread may hold while it waits
+// for the GIL; a failed registration runs the extra-info destructor, which
+// takes the GIL itself.
+duckdb_state register_scalar(duckdb_connection con, duckdb_scalar_function& f) {
+    release_gil_if_held release;
+    duckdb_state state = duckdb_register_scalar_function(con, f);
+    duckdb_destroy_scalar_function(&f);
+    return state;
+}
+
 }  // namespace
 
 const TypeSpec& lookup_typespec(const std::string& name) { return lookup(name); }
@@ -477,7 +555,17 @@ const StructDtypes& struct_dtypes() {
     });
 }
 
-duckdb_logical_type parse_logical_type(duckdb_connection con, const std::string& type_str) {
+TypeParser::TypeParser(duckdb_database database, duckdb_connection fallback)
+    : database_(database), fallback_(fallback) {}
+
+TypeParser::~TypeParser() {
+    if (private_) {
+        release_gil_if_held release;
+        duckdb_disconnect(&private_);
+    }
+}
+
+duckdb_logical_type TypeParser::parse(const std::string& type_str) {
     if (type_str.empty()) {
         throw DuckyError("ducky: empty type string");
     }
@@ -491,7 +579,17 @@ duckdb_logical_type parse_logical_type(duckdb_connection con, const std::string&
     }
     std::string q = "SELECT CAST(NULL AS " + type_str + ")";
     duckdb_result r;
-    if (duckdb_query(con, q.c_str(), &r) == DuckDBError) {
+    duckdb_state state;
+    {
+        // Queries take the client context lock; Python callbacks of a query
+        // running elsewhere may need the GIL meanwhile.
+        release_gil_if_held release;
+        if (!private_ && duckdb_connect(database_, &private_) == DuckDBError) private_ = nullptr;
+        state = private_ ? duckdb_query(private_, q.c_str(), &r) : DuckDBError;
+        if (state == DuckDBError && private_) duckdb_destroy_result(&r);
+        if (state == DuckDBError) state = duckdb_query(fallback_, q.c_str(), &r);
+    }
+    if (state == DuckDBError) {
         std::string err = duckdb_message(duckdb_result_error(&r));
         duckdb_destroy_result(&r);
         throw DuckyError("ducky: invalid DuckDB type '" + type_str + "': " + err);
@@ -511,7 +609,8 @@ const TypeSpec* typespec_for(duckdb_type type) {
 void create_scalar_function(Connection& con, const std::string& name, nb::callable fn,
                             nb::object parameters, nb::object return_type, nb::object varargs,
                             nb::object init, bool is_volatile, bool special_handling) {
-    duckdb_connection raw = con.raw_connection();
+    std::shared_ptr<DuckDBHandle> handle = con.open_handle();
+    duckdb_connection raw = handle->connection;
     auto ctx = std::make_unique<UDFContext>();
     bool has_varargs = !varargs.is_none();
     if (has_varargs && !parameters.is_none()) {
@@ -576,8 +675,7 @@ void create_scalar_function(Connection& con, const std::string& name, nb::callab
     // NOLINTNEXTLINE(bugprone-unused-return-value)
     (void)ctx.release();
 
-    duckdb_state state = duckdb_register_scalar_function(raw, f);
-    duckdb_destroy_scalar_function(&f);
+    duckdb_state state = register_scalar(raw, f);
     if (state == DuckDBError) {
         throw DuckyError("ducky: failed to register UDF '" + name +
                          "' (name in use, or invalid types?)");
@@ -587,7 +685,9 @@ void create_scalar_function(Connection& con, const std::string& name, nb::callab
 void create_arrow_scalar_function(Connection& con, const std::string& name, nb::callable fn,
                                   nb::object parameters, const std::string& return_type,
                                   bool record_batch) {
-    duckdb_connection raw = con.raw_connection();
+    std::shared_ptr<DuckDBHandle> handle = con.open_handle();
+    duckdb_connection raw = handle->connection;
+    TypeParser types(handle->database, raw);
     auto ctx = std::make_unique<ArrowUDFContext>();
     ctx->callable = std::move(fn);
     ctx->con = raw;
@@ -602,20 +702,20 @@ void create_arrow_scalar_function(Connection& con, const std::string& name, nb::
         nb::dict d = nb::cast<nb::dict>(parameters);
         for (auto item : d) {
             ctx->param_names.emplace_back(nb::cast<std::string>(item.first));
-            ctx->param_types.push_back(parse_logical_type(raw, nb::cast<std::string>(item.second)));
+            ctx->param_types.push_back(types.parse(nb::cast<std::string>(item.second)));
         }
     } else {
         nb::sequence seq = nb::cast<nb::sequence>(parameters);
         idx_t i = 0;
         for (auto item : seq) {
             ctx->param_names.emplace_back("arg" + std::to_string(i++));
-            ctx->param_types.push_back(parse_logical_type(raw, nb::cast<std::string>(item)));
+            ctx->param_types.push_back(types.parse(nb::cast<std::string>(item)));
         }
     }
     if (ctx->param_types.empty()) {
         throw DuckyError("ducky: arrow UDF '" + name + "' must declare at least one parameter");
     }
-    ctx->return_type = parse_logical_type(raw, return_type);
+    ctx->return_type = types.parse(return_type);
 
     // Pre-compute stable const char* pointers into param_names for zero-alloc
     // trampoline calls. param_names is never modified after this point.
@@ -635,8 +735,7 @@ void create_arrow_scalar_function(Connection& con, const std::string& name, nb::
     // NOLINTNEXTLINE(bugprone-unused-return-value)
     (void)ctx.release();
 
-    duckdb_state state = duckdb_register_scalar_function(raw, f);
-    duckdb_destroy_scalar_function(&f);
+    duckdb_state state = register_scalar(raw, f);
     if (state == DuckDBError) {
         throw DuckyError("ducky: failed to register arrow UDF '" + name +
                          "' (name in use, or invalid types?)");

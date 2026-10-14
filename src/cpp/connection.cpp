@@ -4,6 +4,7 @@
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/vector.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -55,6 +56,11 @@ const BindTypes& bind_types() {
     });
 }
 
+nb::object steal_or_throw(PyObject* obj) {
+    if (!obj) throw nb::python_error();
+    return nb::steal(obj);
+}
+
 // Split a Python int into a 128-bit (lo, hi) pair.
 //   is_signed=true  → [-2^127, 2^127 - 1]
 //   is_signed=false → [0,      2^128 - 1]
@@ -98,6 +104,39 @@ void bind_check(duckdb_state state, idx_t idx) {
     if (state == DuckDBError) {
         throw DuckyError("ducky: failed to bind parameter " + std::to_string(idx));
     }
+}
+
+// Bind a decimal.Decimal as an exact DECIMAL(width, scale). NaN and infinities
+// have no DECIMAL form and bind as DOUBLE.
+void bind_decimal(duckdb_prepared_statement stmt, idx_t idx, nb::handle value) {
+    nb::object parts = value.attr("as_tuple")();
+    nb::object exponent = parts.attr("exponent");
+    if (!nb::isinstance<nb::int_>(exponent)) {  // 'n', 'N' or 'F'
+        bind_check(duckdb_bind_double(stmt, idx, nb::cast<double>(nb::float_(value))), idx);
+        return;
+    }
+    // Build the unscaled integer from the exact digit tuple; Decimal
+    // arithmetic would round to the context precision (28 digits by default).
+    int64_t exp = nb::cast<int64_t>(exponent);
+    std::string digits;
+    for (nb::handle d : parts.attr("digits")) digits.push_back((char)('0' + nb::cast<int>(d)));
+    if (exp > 0) digits.append((size_t)exp, '0');
+    size_t first = digits.find_first_not_of('0');
+    int64_t significant = first == std::string::npos ? 1 : (int64_t)(digits.size() - first);
+    int64_t scale = exp < 0 ? -exp : 0;
+    int64_t width = significant > scale ? significant : (scale > 0 ? scale : 1);
+    nb::object unscaled = steal_or_throw(PyLong_FromString(digits.c_str(), nullptr, 10));
+    if (nb::cast<int>(parts.attr("sign"))) {
+        unscaled = steal_or_throw(PyNumber_Negative(unscaled.ptr()));
+    }
+    if (width > 38) {
+        throw DuckyError("ducky: Decimal parameter at position " + std::to_string(idx) + " needs " +
+                         std::to_string(width) + " digits; DuckDB DECIMAL holds at most 38");
+    }
+    uint64_t lo = 0, hi = 0;
+    py_long_to_int128(unscaled, /*is_signed=*/true, lo, hi);
+    duckdb_decimal d{(uint8_t)width, (uint8_t)scale, duckdb_hugeint{lo, (int64_t)hi}};
+    bind_check(duckdb_bind_decimal(stmt, idx, d), idx);
 }
 
 // Match the planned width to avoid DuckDB replanning on each execute.
@@ -265,10 +304,18 @@ void bind_one(duckdb_prepared_statement stmt, idx_t idx, nb::handle value) {
         bind_check(duckdb_bind_interval(stmt, idx, iv), idx);
         return;
     }
-    if (nb::isinstance(value, T.decimal) || nb::isinstance(value, T.uuid)) {
-        // Bind as VARCHAR; DuckDB implicitly casts to DECIMAL / UUID on execute.
-        nb::str s = nb::str(value);
-        bind_check(duckdb_bind_varchar(stmt, idx, s.c_str()), idx);
+    if (nb::isinstance(value, T.decimal)) {
+        bind_decimal(stmt, idx, value);
+        return;
+    }
+    if (nb::isinstance(value, T.uuid)) {
+        // UUID.int is the natural unsigned 128-bit value duckdb_create_uuid takes.
+        uint64_t lo = 0, hi = 0;
+        py_long_to_int128(value.attr("int"), /*is_signed=*/false, lo, hi);
+        duckdb_value uuid = duckdb_create_uuid(duckdb_uhugeint{lo, hi});
+        duckdb_state state = duckdb_bind_value(stmt, idx, uuid);
+        duckdb_destroy_value(&uuid);
+        bind_check(state, idx);
         return;
     }
     // Unbox NumPy scalars.
@@ -333,7 +380,13 @@ void executemany_loop(duckdb_prepared_statement stmt, nb::handle seq) {
         }
         bind_parameters(stmt, params);
         duckdb_result result;
-        if (duckdb_execute_prepared(stmt, &result) == DuckDBError) {
+        duckdb_state state;
+        {
+            // Execution may run Python UDFs on DuckDB workers.
+            nb::gil_scoped_release release;
+            state = duckdb_execute_prepared(stmt, &result);
+        }
+        if (state == DuckDBError) {
             std::string message = duckdb_message(duckdb_result_error(&result));
             duckdb_destroy_result(&result);
             throw DuckyError(message);
@@ -355,7 +408,13 @@ duckdb_result drive_pending(duckdb_connection con, duckdb_pending_result pending
         throw DuckyError(message);
     }
 
+    // While DuckDB's workers finish the last tasks of a pipeline there is
+    // nothing to execute here: yield, then sleep briefly. Short sleeps keep the
+    // wake-up latency well below a typical query's runtime.
+    constexpr int yield_ticks = 64;
+    constexpr std::chrono::microseconds min_sleep(20), max_sleep(100);
     int no_tasks_streak = 0;
+    std::chrono::microseconds backoff(0);
     for (;;) {
         duckdb_pending_state state;
         {
@@ -365,15 +424,16 @@ duckdb_result drive_pending(duckdb_connection con, duckdb_pending_result pending
             for (;;) {
                 state = duckdb_pending_execute_task(pending);
                 if (state == DUCKDB_PENDING_RESULT_READY || state == DUCKDB_PENDING_ERROR) break;
-                // Yield first, then sleep after repeated no-op ticks.
                 if (state == DUCKDB_PENDING_NO_TASKS_AVAILABLE) {
-                    if (++no_tasks_streak > 256) {
-                        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                    if (++no_tasks_streak > yield_ticks) {
+                        backoff = std::min(std::max(backoff * 2, min_sleep), max_sleep);
+                        std::this_thread::sleep_for(backoff);
                     } else {
                         std::this_thread::yield();
                     }
                 } else {
                     no_tasks_streak = 0;
+                    backoff = std::chrono::microseconds(0);
                 }
                 if (std::chrono::steady_clock::now() >= deadline) break;
             }
@@ -385,11 +445,16 @@ duckdb_result drive_pending(duckdb_connection con, duckdb_pending_result pending
         }
         if (PyErr_CheckSignals() != 0) {
             // Typically KeyboardInterrupt. Interrupt, drain, discard, re-raise.
-            duckdb_interrupt(con);
-            duckdb_result drain;
-            duckdb_execute_pending(pending, &drain);
-            duckdb_destroy_result(&drain);
-            duckdb_destroy_pending(&pending);
+            {
+                // The drain waits for workers, which may need the GIL for
+                // Python callbacks; the signal's exception stays set meanwhile.
+                nb::gil_scoped_release release;
+                duckdb_interrupt(con);
+                duckdb_result drain;
+                duckdb_execute_pending(pending, &drain);
+                duckdb_destroy_result(&drain);
+                duckdb_destroy_pending(&pending);
+            }
             throw nb::python_error();
         }
         if (state == DUCKDB_PENDING_RESULT_READY) break;
@@ -492,17 +557,26 @@ Connection::Connection(const std::string& database, nb::object config) {
     profile_sink_ = nb::none();
 }
 
+std::shared_ptr<DuckDBHandle> Connection::handle() const {
+    nb::ft_lock_guard lock(handle_mu_);
+    return handle_;
+}
+
+std::shared_ptr<DuckDBHandle> Connection::open_handle() const {
+    std::shared_ptr<DuckDBHandle> handle = this->handle();
+    if (!handle || !handle->connection) throw DuckyError("ducky: connection is closed");
+    return handle;
+}
+
 void Connection::interrupt() {
-    duckdb_connection con = nullptr;
-    {
-        nb::ft_lock_guard lock(handle_mu_);
-        if (handle_ && handle_->connection) con = handle_->connection;
+    // The snapshot keeps the connection alive across the call.
+    if (std::shared_ptr<DuckDBHandle> handle = this->handle()) {
+        if (handle->connection) duckdb_interrupt(handle->connection);
     }
-    if (con) duckdb_interrupt(con);
 }
 
 void Connection::load_extension(const std::string& name) {
-    ensure_open();
+    std::shared_ptr<DuckDBHandle> handle = open_handle();
 
     // Build `LOAD '<name>'`, doubling single quotes for the SQL string literal.
     std::string literal;
@@ -519,7 +593,7 @@ void Connection::load_extension(const std::string& name) {
         // dlopen + metadata/signature checks touch the filesystem; release the
         // GIL so other threads run during the load.
         nb::gil_scoped_release release;
-        state = duckdb_query(handle_->connection, sql.c_str(), &result);
+        state = duckdb_query(handle->connection, sql.c_str(), &result);
     }
     if (state == DuckDBError) {
         const char* err = duckdb_result_error(&result);
@@ -535,15 +609,8 @@ void Connection::load_extension(const std::string& name) {
 }
 
 nb::tuple Connection::progress() const {
-    duckdb_connection con = nullptr;
-    {
-        nb::ft_lock_guard lock(handle_mu_);
-        if (handle_ && handle_->connection) con = handle_->connection;
-    }
-    if (!con) {
-        throw DuckyError("ducky: connection is closed");
-    }
-    duckdb_query_progress_type p = duckdb_query_progress(con);
+    std::shared_ptr<DuckDBHandle> handle = open_handle();
+    duckdb_query_progress_type p = duckdb_query_progress(handle->connection);
     return nb::make_tuple(p.percentage, p.rows_processed, p.total_rows_to_process);
 }
 
@@ -585,10 +652,8 @@ nb::dict walk_profiling_node(duckdb_profiling_info info) {
 }  // namespace
 
 nb::object Connection::get_profiling_info() const {
-    if (!handle_ || !handle_->connection) {
-        throw DuckyError("ducky: connection is closed");
-    }
-    duckdb_profiling_info info = duckdb_get_profiling_info(handle_->connection);
+    std::shared_ptr<DuckDBHandle> handle = open_handle();
+    duckdb_profiling_info info = duckdb_get_profiling_info(handle->connection);
     if (!info) return nb::none();
     return walk_profiling_node(info);
 }
@@ -599,7 +664,14 @@ namespace {
 // reach the profile sink.
 void exec_no_result(duckdb_connection con, const char* sql) {
     duckdb_result r;
-    if (duckdb_query(con, sql, &r) == DuckDBError) {
+    duckdb_state state;
+    {
+        // Takes the client context lock, which a query running Python
+        // callbacks on another thread may hold while it waits for the GIL.
+        nb::gil_scoped_release release;
+        state = duckdb_query(con, sql, &r);
+    }
+    if (state == DuckDBError) {
         std::string message = duckdb_message(duckdb_result_error(&r));
         duckdb_destroy_result(&r);
         throw DuckyError("ducky: " + std::string(sql) + " failed: " + message);
@@ -610,7 +682,7 @@ void exec_no_result(duckdb_connection con, const char* sql) {
 }  // namespace
 
 void Connection::set_profile_sink(nb::object sink, int64_t sample, const std::string& mode) {
-    ensure_open();
+    std::shared_ptr<DuckDBHandle> handle = open_handle();
     if (sample < 1) sample = 1;
     if (mode != "standard" && mode != "detailed") {
         throw DuckyError("ducky: profile mode must be 'standard' or 'detailed', got '" + mode +
@@ -625,7 +697,7 @@ void Connection::set_profile_sink(nb::object sink, int64_t sample, const std::st
     if (!PyCallable_Check(sink.ptr())) {
         throw DuckyError("ducky: profile sink must be callable or None");
     }
-    duckdb_connection con = handle_->connection;
+    duckdb_connection con = handle->connection;
     exec_no_result(con, "SET enable_profiling='no_output'");
     // profiling_mode persists, so always set it.
     exec_no_result(con, ("SET profiling_mode='" + mode + "'").c_str());
@@ -634,12 +706,12 @@ void Connection::set_profile_sink(nb::object sink, int64_t sample, const std::st
     profile_counter_ = 0;
 }
 
-void Connection::maybe_emit_profile(const std::string& query) {
+void Connection::maybe_emit_profile(duckdb_connection connection, const std::string& query) {
     // Fast path: no sink installed.
     if (profile_sink_.is_none()) return;
     int64_t n = profile_counter_++;
     if (n % profile_sample_ != 0) return;
-    duckdb_profiling_info info = duckdb_get_profiling_info(handle_->connection);
+    duckdb_profiling_info info = duckdb_get_profiling_info(connection);
     if (!info) return;
     nb::object tree = walk_profiling_node(info);
     // Report sink errors without failing the query.
@@ -652,7 +724,7 @@ void Connection::maybe_emit_profile(const std::string& query) {
 }
 
 void Connection::register_arrow(const std::string& name, nb::object obj) {
-    ensure_open();
+    open_handle();
     // Keep a strict identifier shape so `SELECT * FROM name` resolves unquoted:
     // [A-Za-z][A-Za-z0-9_]*.
     if (name.empty()) {
@@ -679,14 +751,22 @@ void Connection::register_arrow(const std::string& name, nb::object obj) {
     if (!arrow_registry_) arrow_registry_ = install_arrow_scan(*this);
     // Re-registering may change the schema.
     statement_cache_clear();
-    std::lock_guard<std::mutex> lock(arrow_registry_->mu);
-    arrow_registry_->sources[name] = std::move(obj);  // insert / overwrite (GIL held)
+    register_arrow_source(*arrow_registry_, name, std::move(obj));
 }
 
 Connection::~Connection() { close(); }
 
 void Connection::close() {
-    // Results retain shared ownership of the database.
+    std::shared_ptr<DuckDBHandle> handle;
+    {
+        nb::ft_lock_guard lock(handle_mu_);
+        handle = std::move(handle_);
+    }
+    // Stop a query another thread is running; it holds its own reference to
+    // the handle, so the connection stays valid until that call returns.
+    // DuckDB clears the interrupt flag when the next query starts, so results
+    // and prepared statements that outlive the Connection are unaffected.
+    if (handle && handle->connection) duckdb_interrupt(handle->connection);
     statement_cache_clear();
     last_result_.reset();
     if (arrow_registry_) {
@@ -694,17 +774,18 @@ void Connection::close() {
         arrow_registry_->sources.clear();
     }
     profile_sink_ = nb::none();
-    {
-        nb::ft_lock_guard lock(handle_mu_);
-        handle_.reset();
-    }
+    // Results, prepared statements and appenders retain shared ownership of
+    // the database; the last owner closes it.
 }
 
 int Connection::gc_traverse(visitproc visit, void* arg) const {
     Py_VISIT(profile_sink_.ptr());
     // GC holds the GIL or stops all threads; taking mu could deadlock.
     if (arrow_registry_) {
-        for (const auto& [name, obj] : arrow_registry_->sources) Py_VISIT(obj.ptr());
+        for (const auto& [name, source] : arrow_registry_->sources) {
+            Py_VISIT(source.object.ptr());
+            Py_VISIT(source.stream.ptr());
+        }
     }
     return 0;
 }
@@ -739,31 +820,30 @@ bool caches_statement(duckdb_statement_type type) {
     }
 }
 
-// Writes invalidate plans that may contain folded statistics.
-bool invalidates_statement_cache(duckdb_statement_type type) {
-    switch (type) {
-        case DUCKDB_STATEMENT_TYPE_INSERT:
-        case DUCKDB_STATEMENT_TYPE_UPDATE:
-        case DUCKDB_STATEMENT_TYPE_DELETE:
-        case DUCKDB_STATEMENT_TYPE_COPY:
-        case DUCKDB_STATEMENT_TYPE_TRANSACTION:
-            return true;
-        default:
-            return false;
-    }
+// Destroy a prepared statement. Takes the client context lock, which a query
+// running Python callbacks on another thread may hold while it waits for the
+// GIL.
+void destroy_prepared(duckdb_prepared_statement& stmt) {
+    if (!stmt) return;
+    release_gil_if_held release;
+    duckdb_destroy_prepare(&stmt);
 }
 
 }  // namespace
 
-// Retire a successfully executed statement under the cache policy.
+// Retire a successfully executed statement under the cache policy. Writes do
+// not flush the cache: DuckDB re-binds cached plans that read base tables, so
+// they see the new data and statistics. Statements that change settings,
+// schemas or loaded extensions (everything caches_statement rejects) do.
 void Connection::statement_cache_retire(const std::string& query, duckdb_prepared_statement stmt) {
     duckdb_statement_type type = duckdb_prepared_statement_type(stmt);
-    if (invalidates_statement_cache(type)) statement_cache_clear();
-    if (caches_statement(type)) {
+    if (caches_statement(type) && handle()) {
         statement_cache_checkin(query, stmt);
     } else {
-        statement_cache_clear();
-        duckdb_destroy_prepare(&stmt);
+        // Also taken when close() ran during the execution: never cache
+        // statements of a closed connection.
+        if (!caches_statement(type)) statement_cache_clear();
+        destroy_prepared(stmt);
     }
 }
 
@@ -780,7 +860,7 @@ void Connection::statement_cache_checkin(const std::string& query, duckdb_prepar
     auto it = statement_cache_.find(query);
     if (it != statement_cache_.end()) {
         // Replace a concurrently returned copy.
-        duckdb_destroy_prepare(&it->second->stmt);
+        destroy_prepared(it->second->stmt);
         statement_lru_.erase(it->second);
         statement_cache_.erase(it);
     }
@@ -788,40 +868,53 @@ void Connection::statement_cache_checkin(const std::string& query, duckdb_prepar
     statement_cache_.emplace(query, statement_lru_.begin());
     if (statement_lru_.size() > kStatementCacheCapacity) {
         CachedStatement& victim = statement_lru_.back();
-        duckdb_destroy_prepare(&victim.stmt);
+        destroy_prepared(victim.stmt);
         statement_cache_.erase(victim.query);
         statement_lru_.pop_back();
     }
 }
 
 void Connection::statement_cache_clear() {
-    for (CachedStatement& entry : statement_lru_) duckdb_destroy_prepare(&entry.stmt);
+    std::list<CachedStatement> entries = std::move(statement_lru_);
     statement_lru_.clear();
     statement_cache_.clear();
+    for (CachedStatement& entry : entries) destroy_prepared(entry.stmt);
 }
 
-void Connection::ensure_open() const {
-    if (!handle_ || !handle_->connection) throw DuckyError("ducky: connection is closed");
+namespace {
+
+// Prepare `query`, raising DuckDB's message on failure. Runs without the GIL:
+// preparing takes the client context lock.
+duckdb_prepared_statement prepare_statement(duckdb_connection connection,
+                                            const std::string& query) {
+    duckdb_prepared_statement stmt = nullptr;
+    duckdb_state state;
+    {
+        release_gil_if_held release;
+        state = duckdb_prepare(connection, query.c_str(), &stmt);
+    }
+    if (state == DuckDBError) {
+        std::string message = duckdb_message(duckdb_prepare_error(stmt));
+        destroy_prepared(stmt);
+        throw DuckyError(message);
+    }
+    return stmt;
 }
 
-Connection::StatementLease::StatementLease(Connection& con, const std::string& query)
+}  // namespace
+
+Connection::StatementLease::StatementLease(Connection& con, duckdb_connection connection,
+                                           const std::string& query)
     : con_(con), query_(query) {
     stmt_ = con_.statement_cache_checkout(query);
     // Cached statements must start unbound.
-    if (stmt_ && duckdb_clear_bindings(stmt_) == DuckDBError) {
-        duckdb_destroy_prepare(&stmt_);
-        stmt_ = nullptr;
-    }
-    if (!stmt_ && duckdb_prepare(con_.handle_->connection, query.c_str(), &stmt_) == DuckDBError) {
-        std::string message = duckdb_message(duckdb_prepare_error(stmt_));
-        duckdb_destroy_prepare(&stmt_);
-        throw DuckyError(message);
-    }
+    if (stmt_ && duckdb_clear_bindings(stmt_) == DuckDBError) destroy_prepared(stmt_);
+    if (!stmt_) stmt_ = prepare_statement(connection, query);
 }
 
 Connection::StatementLease::~StatementLease() {
     // Do not cache statements whose execution threw.
-    if (stmt_) duckdb_destroy_prepare(&stmt_);
+    destroy_prepared(stmt_);
 }
 
 void Connection::StatementLease::retire() {
@@ -830,47 +923,64 @@ void Connection::StatementLease::retire() {
 }
 
 duckdb_result Connection::run(const std::string& query, nb::object parameters, bool streaming) {
-    ensure_open();
-    duckdb_connection con = handle_->connection;
+    // Held for the whole execution: a concurrent close() must not disconnect
+    // underneath the running query.
+    std::shared_ptr<DuckDBHandle> handle = open_handle();
+    duckdb_connection con = handle->connection;
 
-    StatementLease stmt(*this, query);
+    StatementLease stmt(*this, con, query);
     if (!parameters.is_none()) bind_parameters(stmt.get(), parameters);
     duckdb_result result = run_pending(con, stmt.get(), streaming);
     stmt.retire();
     // Skip streaming: chunks haven't been pulled when run_pending returns,
     // so the profile would reflect the previous query.
     if (!streaming) {
-        maybe_emit_profile(query);
+        try {
+            maybe_emit_profile(con, query);
+        } catch (...) {
+            duckdb_destroy_result(&result);
+            throw;
+        }
     }
     return result;
 }
 
 std::shared_ptr<Result> Connection::make_result(duckdb_result result) {
-    return std::make_shared<Result>(result, handle_);
+    std::shared_ptr<DuckDBHandle> handle = this->handle();
+    if (!handle) {
+        // close() ran while the query executed.
+        duckdb_destroy_result(&result);
+        throw DuckyError("ducky: connection was closed while the query ran");
+    }
+    return std::make_shared<Result>(result, std::move(handle));
 }
 
 Connection& Connection::execute(const std::string& query, nb::object parameters, bool streaming) {
+    // Release the result this one replaces first: DuckDB refuses a new query
+    // while a streaming result holds the connection.
+    last_result_.reset();
     last_result_ = make_result(run(query, parameters, streaming));
     return *this;
 }
 
-std::shared_ptr<Result> Connection::sql(const std::string& query, bool streaming) {
-    return make_result(run(query, nb::none(), streaming));
+std::shared_ptr<Result> Connection::sql(const std::string& query, nb::object parameters,
+                                        bool streaming) {
+    return make_result(run(query, parameters, streaming));
 }
 
 void Connection::executemany(const std::string& query, nb::object seq) {
-    ensure_open();
-    StatementLease stmt(*this, query);
+    std::shared_ptr<DuckDBHandle> handle = open_handle();
+    StatementLease stmt(*this, handle->connection, query);
     executemany_loop(stmt.get(), seq);
     stmt.retire();
 }
 
 nb::object Connection::arrow_collected_stream(const std::string& query, nb::object parameters,
                                               uint64_t rows_per_batch) {
-    ensure_open();
-    duckdb_connection con = handle_->connection;
+    std::shared_ptr<DuckDBHandle> handle = open_handle();
+    duckdb_connection con = handle->connection;
 
-    StatementLease stmt(*this, query);
+    StatementLease stmt(*this, con, query);
     if (!parameters.is_none()) bind_parameters(stmt.get(), parameters);
 
     // duckdb_pending_prepared_arrow plans the query with DuckDB's Arrow result
@@ -901,8 +1011,10 @@ void PendingResult::cleanup_locked() {
 }
 
 PendingResult::~PendingResult() {
-    // Cancel an abandoned coroutine.
+    // Cancel an abandoned coroutine. The drain waits for workers, which may
+    // need the GIL for Python callbacks.
     if (pending_) {
+        release_gil_if_held release;
         if (con_) duckdb_interrupt(con_);
         duckdb_result drained;
         duckdb_execute_pending(pending_, &drained);
@@ -955,44 +1067,38 @@ void PendingResult::drain() {
 
 PendingResult* Connection::make_pending(const std::string& query, nb::object parameters,
                                         bool streaming) {
-    ensure_open();
-    duckdb_connection con = handle_->connection;
+    std::shared_ptr<DuckDBHandle> handle = open_handle();
+    duckdb_connection con = handle->connection;
 
-    duckdb_prepared_statement stmt = nullptr;
-    if (duckdb_prepare(con, query.c_str(), &stmt) == DuckDBError) {
-        std::string message = duckdb_message(duckdb_prepare_error(stmt));
-        duckdb_destroy_prepare(&stmt);
-        throw DuckyError(message);
-    }
+    duckdb_prepared_statement stmt = prepare_statement(con, query);
     if (!parameters.is_none()) {
         try {
             bind_parameters(stmt, parameters);
         } catch (...) {
-            duckdb_destroy_prepare(&stmt);
+            destroy_prepared(stmt);
             throw;
         }
     }
     duckdb_pending_result pending = nullptr;
-    duckdb_state init = streaming ? duckdb_pending_prepared_streaming(stmt, &pending)
-                                  : duckdb_pending_prepared(stmt, &pending);
+    duckdb_state init;
+    {
+        release_gil_if_held release;
+        init = streaming ? duckdb_pending_prepared_streaming(stmt, &pending)
+                         : duckdb_pending_prepared(stmt, &pending);
+    }
     if (init == DuckDBError) {
         std::string message = duckdb_message(duckdb_pending_error(pending));
         duckdb_destroy_pending(&pending);
-        duckdb_destroy_prepare(&stmt);
+        destroy_prepared(stmt);
         throw DuckyError(message);
     }
-    return new PendingResult(pending, stmt, /*owns_stmt=*/true, con, handle_);
+    return new PendingResult(pending, stmt, /*owns_stmt=*/true, con, std::move(handle));
 }
 
 PreparedStatement* Connection::prepare(const std::string& query) {
-    ensure_open();
-    duckdb_prepared_statement stmt = nullptr;
-    if (duckdb_prepare(handle_->connection, query.c_str(), &stmt) == DuckDBError) {
-        std::string message = duckdb_message(duckdb_prepare_error(stmt));
-        duckdb_destroy_prepare(&stmt);
-        throw DuckyError(message);
-    }
-    return new PreparedStatement(stmt, handle_);
+    std::shared_ptr<DuckDBHandle> handle = open_handle();
+    duckdb_prepared_statement stmt = prepare_statement(handle->connection, query);
+    return new PreparedStatement(stmt, std::move(handle));
 }
 
 std::shared_ptr<Result> Connection::current_result() {
@@ -1019,9 +1125,7 @@ PreparedStatement::PreparedStatement(duckdb_prepared_statement stmt,
                                      std::shared_ptr<DuckDBHandle> handle)
     : stmt_(stmt), handle_(std::move(handle)) {}
 
-PreparedStatement::~PreparedStatement() {
-    if (stmt_) duckdb_destroy_prepare(&stmt_);
-}
+PreparedStatement::~PreparedStatement() { destroy_prepared(stmt_); }
 
 void PreparedStatement::ensure_valid() const {
     if (!stmt_) throw DuckyError("ducky: prepared statement is closed");
@@ -1089,7 +1193,6 @@ std::string PreparedStatement::statement_type() const {
 }
 
 void PreparedStatement::close() {
-    if (stmt_) duckdb_destroy_prepare(&stmt_);
-    stmt_ = nullptr;
+    destroy_prepared(stmt_);
     handle_.reset();
 }

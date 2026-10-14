@@ -7,6 +7,7 @@
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <memory>
 
 #include "arrow_abi.h"
@@ -20,11 +21,17 @@ namespace {
 
 // Cached Python conversion types.
 struct PyTypes {
-    nb::type_object datetime;  // datetime.datetime (tz-aware branch only)
-    nb::object timezone_utc;   // datetime.timezone.utc
-    nb::type_object decimal;   // decimal.Decimal
-    nb::object decimal_ctx;    // decimal.Context(prec=40)
-    nb::type_object uuid;      // uuid.UUID
+    nb::object timezone_utc;    // datetime.timezone.utc
+    nb::type_object timezone;   // datetime.timezone
+    nb::type_object decimal;    // decimal.Decimal
+    nb::object decimal_ctx;     // decimal.Context(prec=40)
+    nb::type_object uuid;       // uuid.UUID
+    nb::object int_from_bytes;  // int.from_bytes
+    // ±infinity dates and timestamps map to the representable extremes, as in
+    // duckdb-python.
+    nb::object date_min, date_max;
+    nb::object datetime_min, datetime_max;
+    nb::object datetime_min_utc, datetime_max_utc;
 };
 
 const PyTypes& py_types() {
@@ -34,12 +41,21 @@ const PyTypes& py_types() {
         if (!PyDateTimeAPI) PyDateTime_IMPORT;
         PyTypes t;
         nb::module_ datetime = nb::module_::import_("datetime");
-        t.datetime = datetime.attr("datetime");
-        t.timezone_utc = datetime.attr("timezone").attr("utc");
+        t.timezone = datetime.attr("timezone");
+        t.timezone_utc = t.timezone.attr("utc");
         nb::module_ decimal = nb::module_::import_("decimal");
         t.decimal = decimal.attr("Decimal");
         t.decimal_ctx = decimal.attr("Context")("prec"_a = 40);
         t.uuid = nb::module_::import_("uuid").attr("UUID");
+        t.int_from_bytes = nb::module_::import_("builtins").attr("int").attr("from_bytes");
+        nb::object date = datetime.attr("date");
+        nb::object dt = datetime.attr("datetime");
+        t.date_min = date.attr("min");
+        t.date_max = date.attr("max");
+        t.datetime_min = dt.attr("min");
+        t.datetime_max = dt.attr("max");
+        t.datetime_min_utc = t.datetime_min.attr("replace")("tzinfo"_a = t.timezone_utc);
+        t.datetime_max_utc = t.datetime_max.attr("replace")("tzinfo"_a = t.timezone_utc);
         return t;
     });
 }
@@ -66,8 +82,17 @@ nb::object uhugeint_to_py(duckdb_uhugeint value) {
     return combine_128(steal_checked(PyLong_FromUnsignedLongLong(value.upper)), value.lower);
 }
 
-// Surface temporal constructor errors from DuckDB values outside Python's range.
+int64_t floor_div(int64_t a, int64_t b) {
+    int64_t q = a / b;
+    return (a % b != 0 && (a < 0) != (b < 0)) ? q - 1 : q;
+}
+
+// Finite dates outside Python's range raise ValueError; ±infinity maps to
+// date.min / date.max.
 nb::object date_to_py(int32_t days) {
+    if (!duckdb_is_finite_date(duckdb_date{days})) {
+        return days > 0 ? py_types().date_max : py_types().date_min;
+    }
     duckdb_date_struct s = duckdb_from_date(duckdb_date{days});
     return steal_checked(PyDate_FromDate(s.year, s.month, s.day));
 }
@@ -77,15 +102,53 @@ nb::object time_to_py(int64_t micros) {
     return steal_checked(PyTime_FromTime(s.hour, s.min, s.sec, s.micros));
 }
 
-nb::object timestamp_to_py(int64_t micros, bool utc) {
+nb::object time_tz_to_py(uint64_t bits) {
+    duckdb_time_tz_struct s = duckdb_from_time_tz(duckdb_time_tz{bits});
+    nb::object delta = steal_checked(PyDelta_FromDSU(0, s.offset, 0));
+    nb::object tz = py_types().timezone(delta);
+    return steal_checked(PyDateTimeAPI->Time_FromTime(
+        s.time.hour, s.time.min, s.time.sec, s.time.micros, tz.ptr(), PyDateTimeAPI->TimeType));
+}
+
+// `micros` must be finite.
+nb::object timestamp_micros_to_py(int64_t micros, bool utc) {
     duckdb_timestamp_struct s = duckdb_from_timestamp(duckdb_timestamp{micros});
-    if (utc) {
-        // No CAPI overload takes tzinfo; route through the Python constructor.
-        return py_types().datetime(s.date.year, s.date.month, s.date.day, s.time.hour, s.time.min,
-                                   s.time.sec, s.time.micros, py_types().timezone_utc);
+    PyObject* tz = utc ? py_types().timezone_utc.ptr() : Py_None;
+    return steal_checked(PyDateTimeAPI->DateTime_FromDateAndTime(
+        s.date.year, s.date.month, s.date.day, s.time.hour, s.time.min, s.time.sec, s.time.micros,
+        tz, PyDateTimeAPI->DateTimeType));
+}
+
+nb::object infinite_timestamp(int64_t raw, bool utc) {
+    const PyTypes& t = py_types();
+    if (raw > 0) return utc ? t.datetime_max_utc : t.datetime_max;
+    return utc ? t.datetime_min_utc : t.datetime_min;
+}
+
+nb::object timestamp_to_py(int64_t micros, bool utc) {
+    if (!duckdb_is_finite_timestamp(duckdb_timestamp{micros})) {
+        return infinite_timestamp(micros, utc);
     }
-    return steal_checked(PyDateTime_FromDateAndTime(
-        s.date.year, s.date.month, s.date.day, s.time.hour, s.time.min, s.time.sec, s.time.micros));
+    return timestamp_micros_to_py(micros, utc);
+}
+
+// TIMESTAMP_S / TIMESTAMP_MS: scale to microseconds without overflowing.
+nb::object scaled_timestamp_to_py(int64_t value, int64_t micros_per_unit, bool finite) {
+    if (!finite) return infinite_timestamp(value, false);
+    if (value > std::numeric_limits<int64_t>::max() / micros_per_unit ||
+        value < std::numeric_limits<int64_t>::min() / micros_per_unit) {
+        throw nb::value_error("ducky: timestamp is out of the range of datetime.datetime");
+    }
+    return timestamp_micros_to_py(value * micros_per_unit, false);
+}
+
+nb::object timestamp_ns_to_py(int64_t nanos) {
+    if (!duckdb_is_finite_timestamp_ns(duckdb_timestamp_ns{nanos})) {
+        return infinite_timestamp(nanos, false);
+    }
+    // datetime has microsecond resolution: round towards negative infinity so
+    // instants before the epoch don't move forward.
+    return timestamp_micros_to_py(floor_div(nanos, 1000), false);
 }
 
 // DuckDB stores UUIDs as int128 with the high bit flipped (so signed ordering
@@ -120,10 +183,12 @@ nb::object decimal_to_py(void* data, idx_t row, duckdb_type internal, uint8_t sc
 
 nb::object interval_to_py(duckdb_interval value) {
     // timedelta approximates one month as 30 days; Arrow preserves components.
-    int64_t seconds = value.micros / 1000000;
+    // Normalize in 64 bits: PyDelta_FromDSU takes ints, so seconds and
+    // microseconds must already be in range.
+    int64_t seconds = floor_div(value.micros, 1000000);
     int64_t micros = value.micros - seconds * 1000000;
-    int64_t days = (int64_t)value.days + (int64_t)value.months * 30 + seconds / 86400;
-    seconds %= 86400;
+    int64_t days = (int64_t)value.days + (int64_t)value.months * 30 + floor_div(seconds, 86400);
+    seconds -= floor_div(seconds, 86400) * 86400;
     if (days < -999999999 || days > 999999999) {
         throw DuckyError("ducky: INTERVAL value overflows datetime.timedelta");
     }
@@ -141,6 +206,39 @@ idx_t enum_index(void* data, idx_t row, duckdb_type internal) {
         default:
             return 0;
     }
+}
+
+// BIT: one byte of padding-bit count, then the bits MSB first. Rendered as a
+// '0'/'1' string, as DuckDB prints it.
+nb::object bit_to_py(const duckdb_string_t& value) {
+    const uint8_t* bytes = (const uint8_t*)duckdb_string_t_data((duckdb_string_t*)&value);
+    idx_t length = duckdb_string_t_length(value);
+    if (length < 1) return nb::str("");
+    idx_t padding = bytes[0];
+    std::string out;
+    out.reserve((length - 1) * 8);
+    for (idx_t byte = 1; byte < length; ++byte) {
+        for (idx_t bit = (byte == 1 ? padding : 0); bit < 8; ++bit) {
+            out.push_back((bytes[byte] >> (7 - bit)) & 1 ? '1' : '0');
+        }
+    }
+    return nb::str(out.data(), out.size());
+}
+
+// BIGNUM: a 3-byte header whose top bit is set for non-negative values, then
+// the big-endian magnitude (bytes inverted for negative values).
+nb::object bignum_to_py(const duckdb_string_t& value) {
+    const uint8_t* bytes = (const uint8_t*)duckdb_string_t_data((duckdb_string_t*)&value);
+    idx_t length = duckdb_string_t_length(value);
+    if (length < 4) throw DuckyError("ducky: malformed BIGNUM value");
+    bool negative = (bytes[0] & 0x80) == 0;
+    std::string magnitude((const char*)bytes + 3, length - 3);
+    if (negative) {
+        for (char& b : magnitude) b = (char)~(uint8_t)b;
+    }
+    nb::object result =
+        py_types().int_from_bytes(nb::bytes(magnitude.data(), magnitude.size()), "big");
+    return negative ? steal_checked(PyNumber_Negative(result.ptr())) : result;
 }
 
 nb::object convert_value(duckdb_vector vector, duckdb_logical_type logical, idx_t row);
@@ -184,28 +282,45 @@ nb::object convert_cell(duckdb_type tid, duckdb_vector vector, duckdb_logical_ty
             auto* s = (duckdb_string_t*)data;
             return nb::str(duckdb_string_t_data(&s[row]), duckdb_string_t_length(s[row]));
         }
-        case DUCKDB_TYPE_BLOB: {
+        case DUCKDB_TYPE_BLOB:
+        case DUCKDB_TYPE_GEOMETRY: {  // GEOMETRY is stored as WKB
             auto* s = (duckdb_string_t*)data;
             return nb::bytes(duckdb_string_t_data(&s[row]), duckdb_string_t_length(s[row]));
         }
+        case DUCKDB_TYPE_BIT:
+            return bit_to_py(((duckdb_string_t*)data)[row]);
+        case DUCKDB_TYPE_BIGNUM:
+            return bignum_to_py(((duckdb_string_t*)data)[row]);
         case DUCKDB_TYPE_DATE:
             return date_to_py(((int32_t*)data)[row]);
         case DUCKDB_TYPE_TIME:
             return time_to_py(((int64_t*)data)[row]);
+        case DUCKDB_TYPE_TIME_NS:
+            return time_to_py(floor_div(((int64_t*)data)[row], 1000));
+        case DUCKDB_TYPE_TIME_TZ:
+            return time_tz_to_py(((uint64_t*)data)[row]);
         case DUCKDB_TYPE_TIMESTAMP:
             return timestamp_to_py(((int64_t*)data)[row], false);
         case DUCKDB_TYPE_TIMESTAMP_TZ:
             return timestamp_to_py(((int64_t*)data)[row], true);
-        case DUCKDB_TYPE_TIMESTAMP_S:
-            return timestamp_to_py(((int64_t*)data)[row] * 1000000, false);
-        case DUCKDB_TYPE_TIMESTAMP_MS:
-            return timestamp_to_py(((int64_t*)data)[row] * 1000, false);
+        case DUCKDB_TYPE_TIMESTAMP_S: {
+            int64_t v = ((int64_t*)data)[row];
+            return scaled_timestamp_to_py(v, 1000000,
+                                          duckdb_is_finite_timestamp_s(duckdb_timestamp_s{v}));
+        }
+        case DUCKDB_TYPE_TIMESTAMP_MS: {
+            int64_t v = ((int64_t*)data)[row];
+            return scaled_timestamp_to_py(v, 1000,
+                                          duckdb_is_finite_timestamp_ms(duckdb_timestamp_ms{v}));
+        }
         case DUCKDB_TYPE_TIMESTAMP_NS:
-            return timestamp_to_py(((int64_t*)data)[row] / 1000, false);
+            return timestamp_ns_to_py(((int64_t*)data)[row]);
         case DUCKDB_TYPE_UUID:
             return uuid_to_py(((duckdb_hugeint*)data)[row]);
         case DUCKDB_TYPE_INTERVAL:
             return interval_to_py(((duckdb_interval*)data)[row]);
+        case DUCKDB_TYPE_SQLNULL:
+            return nb::none();
         case DUCKDB_TYPE_ENUM: {
             idx_t index = enum_index(data, row, duckdb_enum_internal_type(logical));
             char* value = duckdb_enum_dictionary_value(logical, index);
@@ -248,6 +363,17 @@ nb::object convert_cell(duckdb_type tid, duckdb_vector vector, duckdb_logical_ty
             }
             return fields;
         }
+        case DUCKDB_TYPE_UNION: {
+            // Physical layout: STRUCT(tag UTINYINT, member_0, member_1, ...);
+            // the value is the member the tag selects.
+            duckdb_vector tags = duckdb_struct_vector_get_child(vector, 0);
+            uint8_t tag = ((uint8_t*)duckdb_vector_get_data(tags))[row];
+            duckdb_vector member = duckdb_struct_vector_get_child(vector, (idx_t)tag + 1);
+            duckdb_logical_type member_type = duckdb_union_type_member_type(logical, tag);
+            nb::object out = convert_value(member, member_type, row);
+            duckdb_destroy_logical_type(&member_type);
+            return out;
+        }
         case DUCKDB_TYPE_MAP: {
             // Physical layout: LIST(STRUCT(key, value)).
             duckdb_list_entry entry = ((duckdb_list_entry*)data)[row];
@@ -265,6 +391,10 @@ nb::object convert_cell(duckdb_type tid, duckdb_vector vector, duckdb_logical_ty
             duckdb_destroy_logical_type(&value_type);
             return mapping;
         }
+        case DUCKDB_TYPE_VARIANT:
+            throw DuckyError(
+                "ducky: VARIANT values are not decoded to Python; cast the column (e.g. "
+                "CAST(v AS JSON) or v::VARCHAR) or use .arrow()");
         default:
             throw DuckyError(std::string("ducky: column type ") + duckdb_type_name(tid) +
                              " is not decoded yet");
@@ -306,35 +436,23 @@ size_t fast_arrow_width(duckdb_type t) {
     }
 }
 
-// Arrow stream state for a duckdb_result.
+// Arrow stream state for a Result. Callbacks may run on any thread, with or
+// without the GIL; they only touch the Result through its cursor lock.
 struct ArrowStreamState {
-    nb::object owner;              // keeps the Result (and its duckdb_result) alive
-    duckdb_result* result;         // borrowed from owner
-    duckdb_arrow_options options;  // owned by the stream, destroyed on release
-    bool fast;                     // all columns eligible -> one hand-built batch
-    bool done;                     // fast path emits exactly one combined batch
-    // Exact remaining rows, or 0 when unknown.
-    idx_t known_total = 0;
+    nb::object owner;                     // keeps the Result (and its duckdb_result) alive
+    Result* result;                       // borrowed from owner
+    duckdb_arrow_options options;         // owned by the stream, destroyed on release
+    bool fast;                            // all columns eligible -> one hand-built batch
+    bool done;                            // fast path emits exactly one combined batch
     duckdb_data_chunk scratch = nullptr;  // reused across get_next calls
     std::vector<size_t> widths;           // per-column element width (fast path only)
     std::string last_error;
 };
 
-// Make a reusable chunk matching the result schema.
-duckdb_data_chunk make_scratch_chunk(duckdb_result* result) {
-    idx_t n = duckdb_column_count(result);
-    if (n == 0) return nullptr;
-    std::vector<duckdb_logical_type> types(n);
-    for (idx_t i = 0; i < n; ++i) types[i] = duckdb_column_logical_type(result, i);
-    duckdb_data_chunk chunk = duckdb_create_data_chunk(types.data(), n);
-    for (idx_t i = 0; i < n; ++i) duckdb_destroy_logical_type(&types[i]);
-    return chunk;
-}
-
-// Scope owner for a scratch chunk.
+// Scope owner for a result-shaped chunk.
 struct ScratchChunk {
     duckdb_data_chunk chunk;
-    explicit ScratchChunk(duckdb_result* result) : chunk(make_scratch_chunk(result)) {}
+    explicit ScratchChunk(duckdb_result* result) : chunk(make_result_chunk(result)) {}
     ~ScratchChunk() {
         if (chunk) duckdb_destroy_data_chunk(&chunk);
     }
@@ -342,19 +460,29 @@ struct ScratchChunk {
     ScratchChunk& operator=(const ScratchChunk&) = delete;
 };
 
-// Remaining chunks retained when the row count is unknown.
+// The unconsumed chunks of a result, retained when the row count is unknown.
 struct ChunkList {
     std::vector<duckdb_data_chunk> chunks;
     std::vector<idx_t> sizes;
     idx_t total = 0;
 
-    explicit ChunkList(duckdb_result& result) {
-        while (duckdb_data_chunk ch = duckdb_fetch_chunk(result)) {
-            idx_t sz = duckdb_data_chunk_get_size(ch);
-            if (sz == 0) {
+    // Requires `result`'s cursor lock.
+    explicit ChunkList(Result& result) {
+        for (;;) {
+            duckdb_data_chunk ch = make_result_chunk(result.raw_result());
+            if (!ch) return;
+            bool fetched;
+            try {
+                fetched = result.next_chunk_locked(ch);
+            } catch (...) {
                 duckdb_destroy_data_chunk(&ch);
-                continue;
+                throw;
             }
+            if (!fetched) {
+                duckdb_destroy_data_chunk(&ch);
+                return;
+            }
+            idx_t sz = duckdb_data_chunk_get_size(ch);
             chunks.push_back(ch);
             sizes.push_back(sz);
             total += sz;
@@ -455,12 +583,13 @@ void finish_fast_batch(std::unique_ptr<FastBatch> b, ArrowArray* out, idx_t tota
 
 int stream_get_schema(ArrowArrayStream* stream, ArrowSchema* out) {
     auto* state = (ArrowStreamState*)stream->private_data;
-    idx_t n = duckdb_column_count(state->result);
+    duckdb_result* result = state->result->raw_result();
+    idx_t n = duckdb_column_count(result);
     std::vector<duckdb_logical_type> types(n);
     std::vector<const char*> names(n);
     for (idx_t i = 0; i < n; ++i) {
-        types[i] = duckdb_column_logical_type(state->result, i);
-        names[i] = duckdb_column_name(state->result, i);
+        types[i] = duckdb_column_logical_type(result, i);
+        names[i] = duckdb_column_name(result, i);
     }
     duckdb_error_data error =
         duckdb_to_arrow_schema(state->options, types.data(), names.data(), n, out);
@@ -468,9 +597,10 @@ int stream_get_schema(ArrowArrayStream* stream, ArrowSchema* out) {
     return consume_error(state, error) ? EIO : 0;
 }
 
-// Build a combined batch in one pass when the row count is exact.
+// Build one combined batch from exactly `total` remaining rows.
 void build_fast_batch_known_total(ArrowStreamState* state, ArrowArray* out, idx_t total) {
-    idx_t ncols = duckdb_column_count(state->result);
+    Result& result = *state->result;
+    idx_t ncols = duckdb_column_count(result.raw_result());
     size_t valid_bytes = (total + 7) / 8;
 
     auto b = std::make_unique<FastBatch>(ncols);
@@ -479,13 +609,13 @@ void build_fast_batch_known_total(ArrowStreamState* state, ArrowArray* out, idx_
         b->child_bufs[c] = {nullptr, b->alloc(total * state->widths[c])};
     }
 
-    ScratchChunk scratch(state->result);
+    ScratchChunk scratch(result.raw_result());
     if (!scratch.chunk) throw std::bad_alloc();
     size_t row_off = 0;
-    while (duckdb_fetch_chunk_into(*state->result, scratch.chunk)) {
+    while (result.next_chunk_locked(scratch.chunk)) {
         idx_t sz = duckdb_data_chunk_get_size(scratch.chunk);
         if (row_off + sz > total) {
-            throw std::runtime_error("result produced more rows than duckdb_row_count");
+            throw DuckyError("ducky: result produced more rows than expected");
         }
         for (idx_t c = 0; c < ncols; ++c) {
             size_t width = state->widths[c];
@@ -499,22 +629,25 @@ void build_fast_batch_known_total(ArrowStreamState* state, ArrowArray* out, idx_
         row_off += sz;
     }
     if (row_off != total) {
-        throw std::runtime_error("result produced fewer rows than duckdb_row_count");
+        throw DuckyError("ducky: result produced fewer rows than expected");
     }
 
     finish_fast_batch(std::move(b), out, total, ncols, validities);
 }
 
-// Drain layout-compatible columns into one Arrow batch.
+// Drain layout-compatible columns into one Arrow batch. Requires the cursor lock.
 void build_fast_batch(ArrowStreamState* state, ArrowArray* out) {
-    if (state->known_total > 0) {
-        build_fast_batch_known_total(state, out, state->known_total);
+    // The remaining count is taken now, under the cursor lock, so rows other
+    // consumers pulled since the capsule was created are accounted for.
+    if (std::optional<idx_t> remaining = state->result->remaining_rows_locked()) {
+        if (*remaining == 0) return;  // no rows -> emit no batch (out->release stays nullptr)
+        build_fast_batch_known_total(state, out, *remaining);
         return;
     }
-    idx_t ncols = duckdb_column_count(state->result);
+    idx_t ncols = duckdb_column_count(state->result->raw_result());
 
     ChunkList pulled(*state->result);
-    if (pulled.total == 0) return;  // no rows -> emit no batch (out->release stays nullptr)
+    if (pulled.total == 0) return;
     idx_t total = pulled.total;
     size_t valid_bytes = (total + 7) / 8;
 
@@ -543,25 +676,31 @@ void build_fast_batch(ArrowStreamState* state, ArrowArray* out) {
 int stream_get_next(ArrowArrayStream* stream, ArrowArray* out) {
     auto* state = (ArrowStreamState*)stream->private_data;
     out->release = nullptr;  // Arrow signals end-of-stream with a released array.
-    if (state->fast) {
-        if (state->done) return 0;  // the single combined batch was already emitted
-        state->done = true;
-        try {
+    // Nothing below touches Python objects; drop the GIL (if the consumer
+    // holds it) before waiting on the cursor, and keep it dropped while DuckDB
+    // executes, so workers running Python callbacks can take it.
+    release_gil_if_held release;
+    try {
+        std::unique_lock<std::mutex> lock = state->result->lock_cursor();
+        if (state->fast) {
+            if (state->done) return 0;  // the single combined batch was already emitted
+            state->done = true;
             build_fast_batch(state, out);
-        } catch (const std::exception& e) {
-            state->last_error = e.what();
-            return EIO;
+            return 0;
         }
-        return 0;
+        // Convert one reusable DuckDB chunk into Arrow-owned buffers.
+        if (!state->scratch) {
+            state->scratch = make_result_chunk(state->result->raw_result());
+            if (!state->scratch) return 0;
+        }
+        if (!state->result->next_chunk_locked(state->scratch)) return 0;  // exhausted
+        duckdb_error_data error = duckdb_data_chunk_to_arrow(state->options, state->scratch, out);
+        return consume_error(state, error) ? EIO : 0;
+    } catch (const std::exception& e) {
+        if (out->release) out->release(out);
+        state->last_error = e.what();
+        return EIO;
     }
-    // Convert one reusable DuckDB chunk into Arrow-owned buffers.
-    if (!state->scratch) {
-        state->scratch = make_scratch_chunk(state->result);
-        if (!state->scratch) return 0;
-    }
-    if (!duckdb_fetch_chunk_into(*state->result, state->scratch)) return 0;  // exhausted
-    duckdb_error_data error = duckdb_data_chunk_to_arrow(state->options, state->scratch, out);
-    return consume_error(state, error) ? EIO : 0;
 }
 
 const char* stream_get_last_error(ArrowArrayStream* stream) {
@@ -591,6 +730,16 @@ void stream_capsule_destructor(PyObject* capsule) {
 
 }  // namespace
 
+duckdb_data_chunk make_result_chunk(duckdb_result* result) {
+    idx_t n = duckdb_column_count(result);
+    if (n == 0) return nullptr;
+    std::vector<duckdb_logical_type> types(n);
+    for (idx_t i = 0; i < n; ++i) types[i] = duckdb_column_logical_type(result, i);
+    duckdb_data_chunk chunk = duckdb_create_data_chunk(types.data(), n);
+    for (idx_t i = 0; i < n; ++i) duckdb_destroy_logical_type(&types[i]);
+    return chunk;
+}
+
 nb::object Result::arrow_c_stream(nb::object self, bool allow_fast) {
     if (!handle_ || !handle_->connection) {
         throw DuckyError("ducky: Arrow export is unavailable; the connection is closed");
@@ -613,14 +762,10 @@ nb::object Result::arrow_c_stream(nb::object self, bool allow_fast) {
     }
     auto* state = new ArrowStreamState{};
     state->owner = self;
-    state->result = &result_;
+    state->result = this;
     state->options = options;
     state->fast = fast;
     state->done = false;
-    // Only untouched materialized results have an exact remaining count.
-    state->known_total = (rows_returned_ == 0 && !chunk_ && !duckdb_result_is_streaming(result_))
-                             ? duckdb_row_count(&result_)
-                             : 0;
     state->widths = std::move(widths);
     stream->get_schema = stream_get_schema;
     stream->get_next = stream_get_next;
@@ -643,6 +788,7 @@ Result::Result(duckdb_result result, std::shared_ptr<DuckDBHandle> handle)
     // use PyDate_FromDate / PyTime_FromTime / etc. unconditionally.
     if (!PyDateTimeAPI) PyDateTime_IMPORT;
     column_count_ = duckdb_column_count(&result_);
+    streaming_ = duckdb_result_is_streaming(result_);
     auto schema = std::make_shared<ChunkSchema>();
     schema->names.reserve(column_count_);
     schema->name_to_idx.reserve(column_count_);
@@ -663,6 +809,10 @@ Result::~Result() {
     for (duckdb_logical_type& logical : column_types_) {
         if (logical) duckdb_destroy_logical_type(&logical);
     }
+    // Destroying an unfinished streaming result cleans up its query under the
+    // client context lock, which a query running Python callbacks on another
+    // thread may hold while it waits for the GIL.
+    release_gil_if_held release;
     duckdb_destroy_result(&result_);
 }
 
@@ -673,6 +823,68 @@ void Result::release_chunk() {
     }
     chunk_size_ = 0;
     cursor_ = 0;
+}
+
+std::unique_lock<std::mutex> Result::lock_cursor() {
+    std::unique_lock<std::mutex> lock(mu_, std::try_to_lock);
+    if (!lock.owns_lock()) {
+        release_gil_if_held release;
+        lock.lock();
+    }
+    return lock;
+}
+
+bool Result::fetch_into_locked(duckdb_data_chunk dst) {
+    // The end is sticky: fetching past it would fail on a closed stream.
+    if (exhausted_) return false;
+    bool fetched;
+    {
+        // A fetch can drive query execution (streaming results); DuckDB workers
+        // running Python UDFs or Arrow scans need the GIL meanwhile.
+        release_gil_if_held release;
+        fetched = duckdb_fetch_chunk_into(result_, dst);
+    }
+    if (fetched) return true;
+    // A false return is either the end of the result or a failure that DuckDB
+    // records on the result (execution errors, interrupts).
+    if (const char* error = duckdb_result_error(&result_)) throw DuckyError(error);
+    exhausted_ = true;
+    return false;
+}
+
+bool Result::next_chunk_locked(duckdb_data_chunk dst) {
+    if (chunk_ && cursor_ < chunk_size_) {
+        // Hand out the rows the row cursor buffered but has not returned yet.
+        idx_t count = chunk_size_ - cursor_;
+        duckdb_data_chunk_reset(dst);
+        duckdb_selection_vector sel = duckdb_create_selection_vector(chunk_size_);
+        sel_t* index = duckdb_selection_vector_get_data_ptr(sel);
+        for (idx_t i = 0; i < chunk_size_; ++i) index[i] = (sel_t)i;
+        for (idx_t c = 0; c < column_count_; ++c) {
+            duckdb_vector_copy_sel(duckdb_data_chunk_get_vector(chunk_, c),
+                                   duckdb_data_chunk_get_vector(dst, c), sel, chunk_size_, cursor_,
+                                   0);
+        }
+        duckdb_destroy_selection_vector(sel);
+        duckdb_data_chunk_set_size(dst, count);
+        release_chunk();
+        rows_returned_ += count;
+        return true;
+    }
+    release_chunk();
+    for (;;) {
+        if (!fetch_into_locked(dst)) return false;
+        idx_t size = duckdb_data_chunk_get_size(dst);
+        if (size == 0) continue;
+        rows_returned_ += size;
+        return true;
+    }
+}
+
+std::optional<idx_t> Result::remaining_rows_locked() {
+    if (streaming_) return std::nullopt;
+    idx_t total = duckdb_row_count(&result_);
+    return total > rows_returned_ ? total - rows_returned_ : 0;
 }
 
 std::vector<std::string> Result::column_types() const {
@@ -693,14 +905,15 @@ nb::object Result::description() const {
     return out;
 }
 
+// Requires the cursor lock.
 bool Result::ensure_row() {
     while (!chunk_ || cursor_ >= chunk_size_) {
         // Refill the cursor's scratch chunk in place.
         if (!chunk_) {
-            chunk_ = make_scratch_chunk(&result_);
+            chunk_ = make_result_chunk(&result_);
             if (!chunk_) return false;  // zero-column result
         }
-        if (!duckdb_fetch_chunk_into(result_, chunk_)) {
+        if (!fetch_into_locked(chunk_)) {
             release_chunk();
             return false;  // no more chunks
         }
@@ -718,6 +931,7 @@ bool Result::ensure_row() {
     return true;
 }
 
+// Requires the cursor lock.
 nb::object Result::build_row() {
     idx_t row = cursor_++;
     rows_returned_++;
@@ -732,29 +946,30 @@ nb::object Result::build_row() {
     return tuple;
 }
 
-// Binding-level locks serialize cursor mutation.
 nb::object Result::fetchone() {
+    auto lock = lock_cursor();
     if (!ensure_row()) return nb::none();
     return build_row();
 }
 
 nb::list Result::fetchmany(int64_t size) {
+    auto lock = lock_cursor();
     nb::list out;
     for (int64_t i = 0; i < size && ensure_row(); ++i) out.append(build_row());
     return out;
 }
 
 nb::list Result::fetchall() {
+    auto lock = lock_cursor();
     // Pre-size for the known unconsumed materialized rows.
-    idx_t total = duckdb_result_is_streaming(result_) ? 0 : duckdb_row_count(&result_);
-    if (total > rows_returned_) {
-        idx_t remaining = total - rows_returned_;
-        PyObject* list = PyList_New((Py_ssize_t)remaining);
+    std::optional<idx_t> remaining = remaining_rows_locked();
+    if (remaining && *remaining > 0) {
+        PyObject* list = PyList_New((Py_ssize_t)*remaining);
         if (!list) throw nb::python_error();
         nb::list out = nb::steal<nb::list>(list);
-        for (idx_t i = 0; i < remaining; ++i) {
+        for (idx_t i = 0; i < *remaining; ++i) {
             if (!ensure_row()) {  // defensive; a materialized count is exact
-                if (PyList_SetSlice(list, (Py_ssize_t)i, (Py_ssize_t)remaining, nullptr) < 0) {
+                if (PyList_SetSlice(list, (Py_ssize_t)i, (Py_ssize_t)*remaining, nullptr) < 0) {
                     throw nb::python_error();
                 }
                 return out;
@@ -773,6 +988,7 @@ nb::object Result::fetchitem() {
         throw DuckyError("ducky: fetchitem() requires a result with exactly 1 column; got " +
                          std::to_string(column_count_));
     }
+    auto lock = lock_cursor();
     if (!ensure_row()) {
         throw DuckyError("ducky: fetchitem() requires exactly 1 row; the result is empty");
     }
@@ -790,40 +1006,112 @@ nb::object Result::fetchitem() {
 }
 
 int64_t Result::rows_changed() {
-    // duckdb_rows_changed reinterprets the result as a MaterializedQueryResult
-    // internally; guard the streaming case rather than hand it a stream.
-    if (duckdb_result_is_streaming(result_)) return 0;
+    // Streaming results can't report the count without materializing.
+    if (streaming_) return 0;
     return (int64_t)duckdb_rows_changed(&result_);
 }
 
-duckdb_data_chunk Result::fetch_raw_chunk() {
-    duckdb_data_chunk chunk = pull_raw_chunk();
-    // Track consumption for later row-count decisions.
-    if (chunk) rows_returned_ += duckdb_data_chunk_get_size(chunk);
+duckdb_data_chunk Result::fetch_raw_chunk_locked() {
+    duckdb_data_chunk chunk = chunk_pool_->take();
+    if (!chunk) chunk = make_result_chunk(&result_);
+    if (!chunk) return nullptr;  // zero-column result
+    bool fetched;
+    try {
+        fetched = next_chunk_locked(chunk);
+    } catch (...) {
+        duckdb_destroy_data_chunk(&chunk);
+        throw;
+    }
+    if (!fetched) {
+        duckdb_destroy_data_chunk(&chunk);
+        return nullptr;
+    }
     return chunk;
 }
 
-duckdb_data_chunk Result::pull_raw_chunk() {
-    if (duckdb_data_chunk reused = chunk_pool_->take()) {
-        // Refill a pooled buffer; false means exhausted.
-        if (!duckdb_fetch_chunk_into(result_, reused)) {
-            duckdb_destroy_data_chunk(&reused);
-            return nullptr;
-        }
-        return reused;
-    }
-    return duckdb_fetch_chunk(result_);
-}
-
 nb::object Result::fetch_chunk() {
-    duckdb_data_chunk chunk = fetch_raw_chunk();
+    auto lock = lock_cursor();
+    duckdb_data_chunk chunk = fetch_raw_chunk_locked();
     if (!chunk) return nb::none();
     // The Python wrapper owns the allocated Chunk.
     return nb::cast(new Chunk(chunk, schema_, handle_, chunk_pool_), nb::rv_policy::take_ownership);
 }
 
+namespace {
+
+// NumPy output layout resolved before scanning.
+struct NumpyColumnPlan {
+    size_t elem_size;
+    nb::dlpack::dtype dtype;
+    nb::object struct_view;  // non-null → reinterpret via .view()
+    duckdb_type type;
+};
+
+NumpyColumnPlan plan_column(duckdb_type tid, duckdb_logical_type logical, const std::string& name) {
+    if (const TypeSpec* spec = typespec_for(tid)) {
+        return NumpyColumnPlan{spec->size, spec->dtype(), nb::object(), tid};
+    }
+    const StructDtypes& sd = struct_dtypes();
+    switch (tid) {
+        case DUCKDB_TYPE_HUGEINT:
+            return NumpyColumnPlan{sizeof(duckdb_hugeint), nb::dtype<uint8_t>(), sd.hugeint, tid};
+        case DUCKDB_TYPE_UHUGEINT:
+            return NumpyColumnPlan{sizeof(duckdb_uhugeint), nb::dtype<uint8_t>(), sd.uhugeint, tid};
+        case DUCKDB_TYPE_INTERVAL:
+            return NumpyColumnPlan{sizeof(duckdb_interval), nb::dtype<uint8_t>(), sd.interval, tid};
+        case DUCKDB_TYPE_DECIMAL: {
+            duckdb_type internal = duckdb_decimal_internal_type(logical);
+            if (internal == DUCKDB_TYPE_HUGEINT) {
+                return NumpyColumnPlan{sizeof(duckdb_hugeint), nb::dtype<uint8_t>(), sd.hugeint,
+                                       tid};
+            }
+            const TypeSpec* spec = typespec_for(internal);  // always primitive here
+            return NumpyColumnPlan{spec->size, spec->dtype(), nb::object(), tid};
+        }
+        default:
+            throw DuckyError(std::string("ducky: to_numpy: column '") + name + "' has type " +
+                             duckdb_type_name(tid) +
+                             " (no flat ndarray representation; "
+                             "use .arrow() for VARCHAR, LIST, STRUCT, MAP, ...)");
+    }
+}
+
+// Copy `count` values of one column into `dst`. NULLs become NaN in FLOAT /
+// DOUBLE columns; other dtypes have no missing-value representation, so NULLs
+// raise rather than surfacing whatever bytes DuckDB left in the slot.
+void copy_numpy_values(char* dst, duckdb_vector v, idx_t count, const NumpyColumnPlan& plan,
+                       const std::string& name) {
+    std::memcpy(dst, duckdb_vector_get_data(v), count * plan.elem_size);
+    uint64_t* validity = duckdb_vector_get_validity(v);
+    if (!validity) return;
+    for (idx_t r = 0; r < count; ++r) {
+        if (duckdb_validity_row_is_valid(validity, r)) continue;
+        if (plan.type == DUCKDB_TYPE_DOUBLE) {
+            ((double*)dst)[r] = std::numeric_limits<double>::quiet_NaN();
+        } else if (plan.type == DUCKDB_TYPE_FLOAT) {
+            ((float*)dst)[r] = std::numeric_limits<float>::quiet_NaN();
+        } else {
+            throw DuckyError(std::string("ducky: to_numpy: column '") + name + "' (" +
+                             duckdb_type_name(plan.type) +
+                             ") contains NULLs, which its NumPy dtype cannot represent; use "
+                             "iter_batches(with_validity=True), .arrow(), or COALESCE in SQL");
+        }
+    }
+}
+
+}  // namespace
+
 nb::object Result::fetch_numpy_chunk() {
-    duckdb_data_chunk chunk = fetch_raw_chunk();
+    // Validate every column before pulling, so an unsupported type doesn't
+    // consume (and lose) a chunk.
+    for (idx_t i = 0; i < column_count_; ++i) {
+        plan_column(types_[i], column_types_[i], schema_->names[i]);
+    }
+    duckdb_data_chunk chunk;
+    {
+        auto lock = lock_cursor();
+        chunk = fetch_raw_chunk_locked();
+    }
     if (!chunk) return nb::none();
     // Column views keep their owning Chunk alive.
     nb::object chunk_obj =
@@ -836,45 +1124,6 @@ nb::object Result::fetch_numpy_chunk() {
     }
     return out;
 }
-
-namespace {
-
-// NumPy output layout resolved before scanning.
-struct NumpyColumnPlan {
-    size_t elem_size;
-    nb::dlpack::dtype dtype;
-    nb::object struct_view;  // non-null → reinterpret via .view()
-};
-
-NumpyColumnPlan plan_column(duckdb_type tid, duckdb_logical_type logical, const std::string& name) {
-    if (const TypeSpec* spec = typespec_for(tid)) {
-        return NumpyColumnPlan{spec->size, spec->dtype(), nb::object()};
-    }
-    const StructDtypes& sd = struct_dtypes();
-    switch (tid) {
-        case DUCKDB_TYPE_HUGEINT:
-            return NumpyColumnPlan{sizeof(duckdb_hugeint), nb::dtype<uint8_t>(), sd.hugeint};
-        case DUCKDB_TYPE_UHUGEINT:
-            return NumpyColumnPlan{sizeof(duckdb_uhugeint), nb::dtype<uint8_t>(), sd.uhugeint};
-        case DUCKDB_TYPE_INTERVAL:
-            return NumpyColumnPlan{sizeof(duckdb_interval), nb::dtype<uint8_t>(), sd.interval};
-        case DUCKDB_TYPE_DECIMAL: {
-            duckdb_type internal = duckdb_decimal_internal_type(logical);
-            if (internal == DUCKDB_TYPE_HUGEINT) {
-                return NumpyColumnPlan{sizeof(duckdb_hugeint), nb::dtype<uint8_t>(), sd.hugeint};
-            }
-            const TypeSpec* spec = typespec_for(internal);  // always primitive here
-            return NumpyColumnPlan{spec->size, spec->dtype(), nb::object()};
-        }
-        default:
-            throw DuckyError(std::string("ducky: to_numpy: column '") + name + "' has type " +
-                             duckdb_type_name(tid) +
-                             " (no flat ndarray representation; "
-                             "use .arrow() for VARCHAR, LIST, STRUCT, MAP, ...)");
-    }
-}
-
-}  // namespace
 
 nb::object Result::to_numpy(nb::object columns) {
     // Validate selected columns and layouts before scanning.
@@ -897,10 +1146,25 @@ nb::object Result::to_numpy(nb::object columns) {
         plans[c] = plan_column(types_[c], column_types_[c], schema_->names[c]);
     }
 
+    // Wrap a filled buffer as the column's ndarray.
+    auto wrap = [&](idx_t c, char* buf, idx_t total, nb::object owner) -> nb::object {
+        const NumpyColumnPlan& p = plans[c];
+        if (p.struct_view) {
+            // Wrap as a flat uint8 buffer (total * elem_size bytes) and let
+            // numpy reinterpret it as a structured array of `total` items.
+            size_t byte_shape[1] = {total * p.elem_size};
+            nb::ndarray<nb::numpy> raw(buf, 1, byte_shape, owner, nullptr, p.dtype);
+            return nb::cast(raw).attr("view")(p.struct_view);
+        }
+        size_t shape[1] = {(size_t)total};
+        return nb::cast(nb::ndarray<nb::numpy>(buf, 1, shape, owner, nullptr, p.dtype));
+    };
+
+    auto lock = lock_cursor();
+
     // Allocate upfront when the exact remaining row count is known.
-    if (rows_returned_ == 0 && !chunk_ && !duckdb_result_is_streaming(result_)) {
-        idx_t total = duckdb_row_count(&result_);
-        nb::dict out;
+    if (std::optional<idx_t> remaining = remaining_rows_locked()) {
+        idx_t total = *remaining;
         std::vector<char*> bufs(column_count_, nullptr);
         std::vector<nb::object> owners(column_count_);
         for (idx_t c = 0; c < column_count_; ++c) {
@@ -918,42 +1182,34 @@ nb::object Result::to_numpy(nb::object columns) {
             ScratchChunk scratch(&result_);
             if (!scratch.chunk) throw std::bad_alloc();
             idx_t offset = 0;
-            while (duckdb_fetch_chunk_into(result_, scratch.chunk)) {
+            while (next_chunk_locked(scratch.chunk)) {
                 idx_t sz = duckdb_data_chunk_get_size(scratch.chunk);
-                if (offset + sz > total) break;  // caught by the != check below
+                if (offset + sz > total) {
+                    throw DuckyError("ducky: to_numpy: result produced more rows than expected");
+                }
                 for (idx_t c = 0; c < column_count_; ++c) {
                     if (!selected[c]) continue;
-                    duckdb_vector v = duckdb_data_chunk_get_vector(scratch.chunk, c);
-                    std::memcpy(bufs[c] + offset * plans[c].elem_size, duckdb_vector_get_data(v),
-                                sz * plans[c].elem_size);
+                    copy_numpy_values(bufs[c] + offset * plans[c].elem_size,
+                                      duckdb_data_chunk_get_vector(scratch.chunk, c), sz, plans[c],
+                                      schema_->names[c]);
                 }
                 offset += sz;
             }
             if (offset != total) {
-                throw DuckyError("ducky: to_numpy: result row count changed during the scan");
+                throw DuckyError("ducky: to_numpy: result produced fewer rows than expected");
             }
         }
 
+        nb::dict out;
         for (idx_t c = 0; c < column_count_; ++c) {
             if (!selected[c]) continue;
-            const NumpyColumnPlan& p = plans[c];
-            nb::object arr;
-            if (p.struct_view) {
-                size_t byte_shape[1] = {total * p.elem_size};
-                nb::ndarray<nb::numpy> raw(bufs[c], 1, byte_shape, owners[c], nullptr, p.dtype);
-                arr = nb::cast(raw).attr("view")(p.struct_view);
-            } else {
-                size_t shape[1] = {(size_t)total};
-                arr = nb::cast(
-                    nb::ndarray<nb::numpy>(bufs[c], 1, shape, owners[c], nullptr, p.dtype));
-            }
-            out[schema_->names[c].c_str()] = arr;
+            out[schema_->names[c].c_str()] = wrap(c, bufs[c], total, owners[c]);
         }
         return out;
     }
 
     // Retain chunks when the total must be discovered first.
-    ChunkList pulled(result_);
+    ChunkList pulled(*this);
     idx_t total = pulled.total;
 
     nb::dict out;
@@ -968,23 +1224,11 @@ nb::object Result::to_numpy(nb::object columns) {
 
         size_t offset = 0;
         for (size_t i = 0; i < pulled.size(); ++i) {
-            const void* src = duckdb_vector_get_data(pulled.vector(i, c));
-            std::memcpy((char*)buf + offset, src, pulled.sizes[i] * p.elem_size);
+            copy_numpy_values((char*)buf + offset, pulled.vector(i, c), pulled.sizes[i], p,
+                              schema_->names[c]);
             offset += pulled.sizes[i] * p.elem_size;
         }
-
-        nb::object arr;
-        if (p.struct_view) {
-            // Wrap as a flat uint8 buffer (total * elem_size bytes) and let
-            // numpy reinterpret it as a structured array of `total` items.
-            size_t byte_shape[1] = {bytes};
-            nb::ndarray<nb::numpy> raw(buf, 1, byte_shape, owner, nullptr, p.dtype);
-            arr = nb::cast(raw).attr("view")(p.struct_view);
-        } else {
-            size_t shape[1] = {(size_t)total};
-            arr = nb::cast(nb::ndarray<nb::numpy>(buf, 1, shape, owner, nullptr, p.dtype));
-        }
-        out[schema_->names[c].c_str()] = arr;
+        out[schema_->names[c].c_str()] = wrap(c, (char*)buf, total, owner);
     }
     return out;
 }

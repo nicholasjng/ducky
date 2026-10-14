@@ -15,7 +15,6 @@ struct AggregateUDFContext {
     nb::callable cls;
     std::vector<const TypeSpec*> param_types;
     const TypeSpec* return_type;
-    bool has_combine;
 };
 
 void create_aggregate_function(Connection& con, const std::string& name, nb::object cls,

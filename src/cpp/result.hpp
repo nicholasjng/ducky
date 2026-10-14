@@ -4,6 +4,8 @@
 
 #include <cstdint>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -54,6 +56,24 @@ class Result {
     // Export the remaining rows as an Arrow C stream.
     nb::object arrow_c_stream(nb::object self, bool allow_fast = true);
 
+    // Cursor primitives shared with the Arrow stream callbacks, which DuckDB
+    // consumers may call from any thread, with or without the GIL.
+    //
+    // Locks the cursor. Waits with the GIL released, so a holder that is
+    // waiting for the GIL (or for DuckDB workers that need it) cannot deadlock
+    // with the waiter.
+    std::unique_lock<std::mutex> lock_cursor();
+    // Fills `dst` (a chunk of the result's column types, see
+    // make_result_chunk) with the next unconsumed rows: first the rows the row
+    // cursor buffered but has not returned, then a fresh fetch. Counts them as
+    // returned. Returns false at the end; raises DuckyError when the query
+    // failed or the result was invalidated. Requires the cursor lock.
+    bool next_chunk_locked(duckdb_data_chunk dst);
+    // Exact number of unconsumed rows, or nullopt when unknown (streaming).
+    // Requires the cursor lock.
+    std::optional<idx_t> remaining_rows_locked();
+    duckdb_result* raw_result() { return &result_; }
+
    private:
     // Ensures a row is available at the cursor, advancing to the next chunk as
     // needed. Returns false once the result is fully consumed.
@@ -61,12 +81,13 @@ class Result {
     // Builds the tuple at the cursor and advances the cursor by one row.
     nb::object build_row();
     void release_chunk();
-    // Backs fetch_chunk()/fetch_numpy_chunk(): returns the next data chunk,
-    // or nullptr when exhausted, and accounts its rows against rows_returned_.
-    duckdb_data_chunk fetch_raw_chunk();
-    // Reuses a buffer from chunk_pool_ via duckdb_fetch_chunk_into when one is
-    // available (no allocation); otherwise a fresh duckdb_fetch_chunk.
-    duckdb_data_chunk pull_raw_chunk();
+    // Backs fetch_chunk()/fetch_numpy_chunk(): returns the next data chunk
+    // (reusing a buffer from chunk_pool_ when one is free), or nullptr when
+    // exhausted. Requires the cursor lock.
+    duckdb_data_chunk fetch_raw_chunk_locked();
+    // Fetches the next chunk from DuckDB into `dst` with the GIL released.
+    // Returns false at the end; raises when the result reports an error.
+    bool fetch_into_locked(duckdb_data_chunk dst);
 
     duckdb_result result_;
     std::shared_ptr<DuckDBHandle> handle_;
@@ -91,7 +112,19 @@ class Result {
     idx_t cursor_ = 0;
     // Buffer pool for chunk-returning APIs.
     std::shared_ptr<ChunkPool> chunk_pool_ = std::make_shared<ChunkPool>();
-    // Rows consumed through any cursor.
+    // Rows handed out through any consumer (rows, chunks, arrays, Arrow).
     idx_t rows_returned_ = 0;
+    // Set once DuckDB reported the end of the result.
+    bool exhausted_ = false;
+    // Whether the result streams. Captured at construction: DuckDB reports a
+    // failed streaming result as non-streaming.
+    bool streaming_ = false;
     std::vector<ColumnCursor> cursors_;
+    // Guards the cursor state above and all fetches from result_. Blocking
+    // fetches run with the GIL released, so binding-level locks (nb::lock_self)
+    // alone don't serialize consumers.
+    std::mutex mu_;
 };
+
+// A chunk with `result`'s column types, or nullptr for a zero-column result.
+duckdb_data_chunk make_result_chunk(duckdb_result* result);

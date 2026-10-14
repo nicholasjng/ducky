@@ -15,32 +15,22 @@ namespace nb = nanobind;
 
 namespace {
 
+// Each state slot holds a strong reference to the class instance, or nullptr
+// while the state has received no rows. Instances are created lazily, on the
+// state's first update, merge or finalize, so states DuckDB initializes but
+// never fills (and empty merge sources) cost no Python call.
 idx_t agg_state_size(duckdb_function_info /*info*/) { return sizeof(PyObject*); }
 
-// Marks `inst` as having received a real update() call, so agg_combine_copy
-// can tell "this state holds real partial data" from "still fresh from
-// __init__". Deliberately a Python-visible attribute (not C++-side
-// bookkeeping) so it rides along for free when __dict__ is copied wholesale.
-constexpr const char* kTouchedAttr = "_ducky_agg_touched";
-
-void mark_touched(nb::object& inst) { inst.attr(kTouchedAttr) = true; }
-
-bool is_touched(const nb::object& inst) { return nb::hasattr(inst, kTouchedAttr); }
-
-void agg_init(duckdb_function_info info, duckdb_aggregate_state state) {
-    auto* ctx = (AggregateUDFContext*)duckdb_aggregate_function_get_extra_info(info);
-    nb::gil_scoped_acquire gil;
-    // State memory isn't zero-initialized by DuckDB, so a throwing cls()
-    // constructor must not leave internal_ptr holding garbage: agg_destroy
-    // unconditionally Py_XDECREFs it later.
+void agg_init(duckdb_function_info /*info*/, duckdb_aggregate_state state) {
+    // State memory isn't zero-initialized by DuckDB, and agg_destroy
+    // unconditionally Py_XDECREFs the slot.
     state->internal_ptr = nullptr;
-    guard(
-        [&] {
-            nb::object inst = ctx->cls();
-            PyObject* raw = inst.release().ptr();
-            state->internal_ptr = (void*)raw;
-        },
-        [&](const char* what) { duckdb_aggregate_function_set_error(info, what); });
+}
+
+// The instance in `state`, created on first use.
+nb::handle instance(AggregateUDFContext* ctx, duckdb_aggregate_state state) {
+    if (!state->internal_ptr) state->internal_ptr = (void*)ctx->cls().release().ptr();
+    return nb::handle((PyObject*)state->internal_ptr);
 }
 
 void agg_destroy(duckdb_aggregate_state* states, idx_t count) {
@@ -55,59 +45,51 @@ void agg_destroy(duckdb_aggregate_state* states, idx_t count) {
 void agg_update(duckdb_function_info info, duckdb_data_chunk input,
                 duckdb_aggregate_state* states) {
     auto* ctx = (AggregateUDFContext*)duckdb_aggregate_function_get_extra_info(info);
-    nb::gil_scoped_acquire gil;
-
     idx_t n = duckdb_data_chunk_get_size(input);
     if (n == 0) return;
-
     idx_t n_cols = (idx_t)ctx->param_types.size();
 
-    guard(
-        [&] {
-            // Fast path: all rows share one state (common for non-GROUP-BY queries).
-            bool single_state = true;
-            duckdb_aggregate_state first_state = states[0];
-            for (idx_t i = 1; i < n; ++i) {
-                if (states[i] != first_state) {
-                    single_state = false;
+    // SQL aggregates ignore rows with a NULL argument; DuckDB passes them in,
+    // so leave them out here. `rows` stays empty when every row is valid.
+    std::vector<uint64_t*> masks;
+    for (idx_t c = 0; c < n_cols; ++c) {
+        if (uint64_t* m = duckdb_vector_get_validity(duckdb_data_chunk_get_vector(input, c))) {
+            masks.push_back(m);
+        }
+    }
+    std::vector<idx_t> rows;
+    if (!masks.empty()) {
+        rows.reserve(n);
+        for (idx_t r = 0; r < n; ++r) {
+            bool valid = true;
+            for (uint64_t* m : masks) {
+                if (!duckdb_validity_row_is_valid(m, r)) {
+                    valid = false;
                     break;
                 }
             }
+            if (valid) rows.push_back(r);
+        }
+        if (rows.empty()) return;
+        if (rows.size() == n) rows.clear();
+    }
+    bool all_rows = rows.empty();
 
-            if (single_state) {
-                size_t shape[1] = {(size_t)n};
-                nb::list args;
-                for (idx_t c = 0; c < n_cols; ++c) {
-                    duckdb_vector v = duckdb_data_chunk_get_vector(input, c);
-                    void* data = duckdb_vector_get_data(v);
-                    args.append(nb::ndarray<nb::numpy, nb::ro>(
-                        data, 1, shape, nb::handle(), nullptr, ctx->param_types[c]->dtype()));
-                }
-                nb::object inst = nb::borrow((PyObject*)first_state->internal_ptr);
-                inst.attr("update")(*nb::tuple(args));
-                mark_touched(inst);
-                return;
-            }
-
-            // Slow path: group row indices by state address.
-            tsl::robin_map<duckdb_aggregate_state, std::vector<idx_t>> groups;
-            groups.reserve(n);
-            for (idx_t i = 0; i < n; ++i) {
-                groups[states[i]].push_back(i);
-            }
-
-            for (auto& [state, rows] : groups) {
-                idx_t group_n = (idx_t)rows.size();
-                size_t shape[1] = {(size_t)group_n};
+    nb::gil_scoped_acquire gil;
+    guard(
+        [&] {
+            // Input arrays for the rows `selection` lists, gathered into
+            // owned buffers (the caller may keep the arrays).
+            auto gather_args = [&](const std::vector<idx_t>& selection) {
+                size_t shape[1] = {selection.size()};
                 nb::list args;
                 for (idx_t c = 0; c < n_cols; ++c) {
                     duckdb_vector v = duckdb_data_chunk_get_vector(input, c);
                     const uint8_t* src = (const uint8_t*)duckdb_vector_get_data(v);
                     size_t elem_size = ctx->param_types[c]->size;
-                    // Gather non-contiguous rows into a contiguous buffer.
-                    auto buf = std::make_unique<uint8_t[]>(group_n * elem_size);
-                    for (idx_t r = 0; r < group_n; ++r) {
-                        std::memcpy(buf.get() + r * elem_size, src + rows[r] * elem_size,
+                    auto buf = std::make_unique<uint8_t[]>(selection.size() * elem_size);
+                    for (size_t r = 0; r < selection.size(); ++r) {
+                        std::memcpy(buf.get() + r * elem_size, src + selection[r] * elem_size,
                                     elem_size);
                     }
                     uint8_t* raw = buf.get();
@@ -116,47 +98,42 @@ void agg_update(duckdb_function_info info, duckdb_data_chunk input,
                     args.append(nb::ndarray<nb::numpy, nb::ro>(raw, 1, shape, owner, nullptr,
                                                                ctx->param_types[c]->dtype()));
                 }
-                nb::object inst = nb::borrow((PyObject*)state->internal_ptr);
-                inst.attr("update")(*nb::tuple(args));
-                mark_touched(inst);
-            }
-        },
-        [&](const char* what) { duckdb_aggregate_function_set_error(info, what); });
-}
+                return nb::tuple(args);
+            };
 
-// Fallback for aggregates without a Python combine(). DuckDB calls this
-// whenever it needs to merge two partial states -- including the routine
-// "merge this thread's local state into the group's final state" step every
-// query goes through, even single-threaded ones, where `target` is still
-// fresh from __init__ and a __dict__ copy is exactly correct. It's only
-// unsafe when *both* sides already hold real accumulated data (true
-// parallel/repartitioned merges) -- there a __dict__ copy would silently
-// discard target's prior state, so that specific case is a hard error
-// instead of a wrong answer.
-void agg_combine_copy(duckdb_function_info info, duckdb_aggregate_state* source,
-                      duckdb_aggregate_state* target, idx_t count) {
-    nb::gil_scoped_acquire gil;
-    guard(
-        [&] {
-            for (idx_t i = 0; i < count; ++i) {
-                nb::object src_inst = nb::borrow((PyObject*)source[i]->internal_ptr);
-                nb::object tgt_inst = nb::borrow((PyObject*)target[i]->internal_ptr);
-                bool src_touched = is_touched(src_inst);
-                bool tgt_touched = is_touched(tgt_inst);
-                if (src_touched && tgt_touched) {
-                    throw DuckyError(
-                        "ducky: this aggregate function must define a combine(self, other) "
-                        "method -- DuckDB is merging two partial states that both received "
-                        "real update() calls (parallel execution or hash-table repartitioning "
-                        "under a large GROUP BY), and there is no safe generic way to merge "
-                        "arbitrary accumulator state without it");
+            // Fast path: all rows share one state (common for non-GROUP-BY queries).
+            duckdb_aggregate_state first_state = states[all_rows ? 0 : rows[0]];
+            bool single_state = true;
+            for (idx_t i = 0; i < n && single_state; ++i) {
+                single_state = states[i] == first_state;
+            }
+            if (single_state && all_rows) {
+                size_t shape[1] = {(size_t)n};
+                nb::list args;
+                for (idx_t c = 0; c < n_cols; ++c) {
+                    duckdb_vector v = duckdb_data_chunk_get_vector(input, c);
+                    void* data = duckdb_vector_get_data(v);
+                    args.append(nb::ndarray<nb::numpy, nb::ro>(
+                        data, 1, shape, nb::handle(), nullptr, ctx->param_types[c]->dtype()));
                 }
-                if (src_touched) {
-                    // target is still untouched: a plain copy is exactly correct.
-                    tgt_inst.attr("__dict__").attr("update")(src_inst.attr("__dict__"));
-                }
-                // else: source never received real data (e.g. an empty partition) --
-                // leave target as-is, touched or not.
+                instance(ctx, first_state).attr("update")(*nb::tuple(args));
+                return;
+            }
+            if (single_state) {
+                instance(ctx, first_state).attr("update")(*gather_args(rows));
+                return;
+            }
+
+            // Slow path: group row indices by state address.
+            tsl::robin_map<duckdb_aggregate_state, std::vector<idx_t>> groups;
+            groups.reserve(n);
+            if (all_rows) {
+                for (idx_t i = 0; i < n; ++i) groups[states[i]].push_back(i);
+            } else {
+                for (idx_t i : rows) groups[states[i]].push_back(i);
+            }
+            for (auto& [state, group_rows] : groups) {
+                instance(ctx, state).attr("update")(*gather_args(group_rows));
             }
         },
         [&](const char* what) { duckdb_aggregate_function_set_error(info, what); });
@@ -164,13 +141,17 @@ void agg_combine_copy(duckdb_function_info info, duckdb_aggregate_state* source,
 
 void agg_combine(duckdb_function_info info, duckdb_aggregate_state* source,
                  duckdb_aggregate_state* target, idx_t count) {
+    auto* ctx = (AggregateUDFContext*)duckdb_aggregate_function_get_extra_info(info);
     nb::gil_scoped_acquire gil;
     guard(
         [&] {
             for (idx_t i = 0; i < count; ++i) {
-                nb::object src_inst = nb::borrow((PyObject*)source[i]->internal_ptr);
-                nb::object tgt_inst = nb::borrow((PyObject*)target[i]->internal_ptr);
-                tgt_inst.attr("combine")(src_inst);
+                // A source without rows has nothing to merge. Sources must stay
+                // intact: window segment trees combine the same state into
+                // several frames.
+                auto* src = (PyObject*)source[i]->internal_ptr;
+                if (!src) continue;
+                instance(ctx, target[i]).attr("combine")(nb::handle(src));
             }
         },
         [&](const char* what) { duckdb_aggregate_function_set_error(info, what); });
@@ -188,8 +169,9 @@ void agg_finalize(duckdb_function_info info, duckdb_aggregate_state* source, duc
     guard(
         [&] {
             for (idx_t i = 0; i < count; ++i) {
-                nb::object inst = nb::borrow((PyObject*)source[i]->internal_ptr);
-                nb::object val = inst.attr("finalize")();
+                // A state without rows finalizes a fresh instance (e.g. an
+                // empty group or an aggregate over no rows).
+                nb::object val = instance(ctx, source[i]).attr("finalize")();
 
                 if (val.is_none()) {
                     duckdb_vector_ensure_validity_writable(result);
@@ -201,8 +183,10 @@ void agg_finalize(duckdb_function_info info, duckdb_aggregate_state* source, duc
                 // Cast the returned scalar to the right C type and write it.
                 uint8_t* slot = out + (offset + i) * elem_size;
                 if (want.code == (uint8_t)nb::dlpack::dtype_code::Bool && want.bits == 8) {
-                    bool v = nb::cast<bool>(val);
-                    *slot = v ? 1 : 0;
+                    // Truthiness, so numpy.bool_ and other bool-like scalars work.
+                    int truth = PyObject_IsTrue(val.ptr());
+                    if (truth < 0) throw nb::python_error();
+                    *slot = truth ? 1 : 0;
                 } else if (want.code == (uint8_t)nb::dlpack::dtype_code::Int) {
                     int64_t v = nb::cast<int64_t>(val);
                     // elem_size < 8 (TINYINT/SMALLINT/INTEGER/DATE): range-check
@@ -246,11 +230,20 @@ void agg_finalize(duckdb_function_info info, duckdb_aggregate_state* source, duc
 
 void create_aggregate_function(Connection& con, const std::string& name, nb::object cls,
                                nb::object parameters, const std::string& return_type) {
-    duckdb_connection raw = con.raw_connection();
+    std::shared_ptr<DuckDBHandle> handle = con.open_handle();
+    duckdb_connection raw = handle->connection;
+    if (!nb::hasattr(cls, "combine")) {
+        // DuckDB merges partial states not only across threads but also for
+        // DISTINCT, window frames and large GROUP BYs, even single-threaded;
+        // arbitrary Python state has no generic merge.
+        throw DuckyError("ducky: aggregate UDF '" + name +
+                         "' must define combine(self, other), which merges another partial state "
+                         "into self; DuckDB merges states for parallel scans, DISTINCT, window "
+                         "frames and large GROUP BYs");
+    }
     auto ctx = std::make_unique<AggregateUDFContext>();
     ctx->cls = nb::cast<nb::callable>(cls);
     ctx->return_type = &lookup_typespec(return_type);
-    ctx->has_combine = nb::hasattr(cls, "combine");
 
     if (nb::isinstance<nb::dict>(parameters)) {
         nb::dict d = nb::cast<nb::dict>(parameters);
@@ -282,8 +275,7 @@ void create_aggregate_function(Connection& con, const std::string& name, nb::obj
     }
 
     duckdb_aggregate_function_set_functions(f, &agg_state_size, &agg_init, &agg_update,
-                                            ctx->has_combine ? &agg_combine : &agg_combine_copy,
-                                            &agg_finalize);
+                                            &agg_combine, &agg_finalize);
     duckdb_aggregate_function_set_destructor(f, &agg_destroy);
     // Ownership of ctx passes to the function object here: its destroy callback
     // runs whether or not registration succeeds (a failed registration's
@@ -292,8 +284,15 @@ void create_aggregate_function(Connection& con, const std::string& name, nb::obj
     // NOLINTNEXTLINE(bugprone-unused-return-value)
     (void)ctx.release();
 
-    duckdb_state state = duckdb_register_aggregate_function(raw, f);
-    duckdb_destroy_aggregate_function(&f);
+    duckdb_state state;
+    {
+        // Registration takes the client context lock, which a query running
+        // Python callbacks on another thread may hold while it waits for the
+        // GIL; a failed registration's destructor takes the GIL itself.
+        release_gil_if_held release;
+        state = duckdb_register_aggregate_function(raw, f);
+        duckdb_destroy_aggregate_function(&f);
+    }
     if (state == DuckDBError) {
         throw DuckyError("ducky: failed to register aggregate function '" + name + "'");
     }

@@ -17,6 +17,7 @@ namespace {
 
 // Convert a duckdb_value (bound SQL parameter) to a Python object.
 nb::object duckdb_value_to_python(duckdb_value val) {
+    if (duckdb_is_null_value(val)) return nb::none();
     // duckdb_get_value_type returns a borrowed pointer — do not destroy.
     duckdb_type tid = duckdb_get_type_id(duckdb_get_value_type(val));
 
@@ -96,6 +97,19 @@ uint64_t checked_unsigned(nb::handle val, uint64_t hi, const char* type) {
         throw DuckyError("ducky: value " + std::to_string(v) + " out of range for " + type);
     }
     return v;
+}
+
+// Floor division, so instants before the epoch round towards the past.
+int64_t floor_div(int64_t a, int64_t b) {
+    int64_t q = a / b;
+    return (a % b != 0 && (a < 0) != (b < 0)) ? q - 1 : q;
+}
+
+int64_t micros_to_nanos(int64_t micros) {
+    if (micros > INT64_MAX / 1000 || micros < INT64_MIN / 1000) {
+        throw DuckyError("ducky: datetime is out of the range of TIMESTAMP_NS");
+    }
+    return micros * 1000;
 }
 
 // Write a Python scalar value into a duckdb_vector at position `row`.
@@ -191,17 +205,17 @@ void write_column_value(duckdb_vector vec, idx_t row, nb::object val, duckdb_typ
             break;
         case DUCKDB_TYPE_TIMESTAMP_S:
             ((int64_t*)data)[row] = PyDateTime_Check(val.ptr())
-                                        ? pydt::datetime_to_micros(val) / 1000000
+                                        ? floor_div(pydt::datetime_to_micros(val), 1000000)
                                         : nb::cast<int64_t>(val);
             break;
         case DUCKDB_TYPE_TIMESTAMP_MS:
             ((int64_t*)data)[row] = PyDateTime_Check(val.ptr())
-                                        ? pydt::datetime_to_micros(val) / 1000
+                                        ? floor_div(pydt::datetime_to_micros(val), 1000)
                                         : nb::cast<int64_t>(val);
             break;
         case DUCKDB_TYPE_TIMESTAMP_NS:
             ((int64_t*)data)[row] = PyDateTime_Check(val.ptr())
-                                        ? pydt::datetime_to_micros(val) * 1000
+                                        ? micros_to_nanos(pydt::datetime_to_micros(val))
                                         : nb::cast<int64_t>(val);
             break;
         default:
@@ -323,7 +337,9 @@ void create_table_function(Connection& con, const std::string& name, nb::callabl
     // write_column_value / pydt:: helpers work when the trampolines run.
     // Registration always precedes execution, so priming here suffices.
     if (!PyDateTimeAPI) PyDateTime_IMPORT;
-    duckdb_connection raw = con.raw_connection();
+    std::shared_ptr<DuckDBHandle> handle = con.open_handle();
+    duckdb_connection raw = handle->connection;
+    TypeParser types(handle->database, raw);
     auto ctx = std::make_unique<TableUDFContext>();
     ctx->factory = factory;
 
@@ -333,7 +349,7 @@ void create_table_function(Connection& con, const std::string& name, nb::callabl
     }
     nb::sequence pseq = nb::cast<nb::sequence>(parameters);
     for (auto item : pseq) {
-        ctx->param_types.push_back(parse_logical_type(raw, nb::cast<std::string>(item)));
+        ctx->param_types.push_back(types.parse(nb::cast<std::string>(item)));
     }
 
     // Parse output columns from dict {name: type}.
@@ -347,7 +363,7 @@ void create_table_function(Connection& con, const std::string& name, nb::callabl
     for (auto item : cols) {
         std::string col_name = nb::cast<std::string>(item.first);
         std::string type_str = nb::cast<std::string>(item.second);
-        duckdb_logical_type lt = parse_logical_type(raw, type_str);
+        duckdb_logical_type lt = types.parse(type_str);
         // Push before validating so ~TableUDFContext owns (and frees) lt on throw.
         ctx->col_names.push_back(col_name);
         ctx->col_types.push_back(lt);
@@ -377,8 +393,15 @@ void create_table_function(Connection& con, const std::string& name, nb::callabl
     duckdb_table_function_set_function(f, &table_main);
     duckdb_table_function_supports_projection_pushdown(f, false);
 
-    duckdb_state state = duckdb_register_table_function(raw, f);
-    duckdb_destroy_table_function(&f);
+    duckdb_state state;
+    {
+        // Registration takes the client context lock, which a query running
+        // Python callbacks on another thread may hold while it waits for the
+        // GIL; a failed registration's destructor takes the GIL itself.
+        release_gil_if_held release;
+        state = duckdb_register_table_function(raw, f);
+        duckdb_destroy_table_function(&f);
+    }
     if (state == DuckDBError) {
         throw DuckyError("ducky: failed to register table function '" + name + "'");
     }

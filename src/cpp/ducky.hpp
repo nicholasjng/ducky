@@ -45,6 +45,23 @@ const T& cached_singleton(std::atomic<T*>& cached, nb::ft_mutex& mu, Init&& init
     return *built;
 }
 
+// Releases the GIL (detaches the thread state) for the scope if this thread
+// holds it. For blocking DuckDB calls reachable both from Python and from
+// threads that don't hold the GIL (e.g. Arrow stream callbacks): DuckDB
+// workers running Python callbacks need the GIL while the caller waits.
+class release_gil_if_held {
+   public:
+    release_gil_if_held() : state_(PyGILState_Check() ? PyEval_SaveThread() : nullptr) {}
+    ~release_gil_if_held() {
+        if (state_) PyEval_RestoreThread(state_);
+    }
+    release_gil_if_held(const release_gil_if_held&) = delete;
+    release_gil_if_held& operator=(const release_gil_if_held&) = delete;
+
+   private:
+    PyThreadState* state_;
+};
+
 // Report callback exceptions through DuckDB instead of crossing the C ABI.
 template <typename Body, typename SetError>
 bool guard(Body&& body, SetError&& set_error) {
@@ -122,6 +139,24 @@ inline const char* duckdb_type_name(duckdb_type type) {
             return "MAP";
         case DUCKDB_TYPE_ARRAY:
             return "ARRAY";
+        case DUCKDB_TYPE_UNION:
+            return "UNION";
+        case DUCKDB_TYPE_BIT:
+            return "BIT";
+        case DUCKDB_TYPE_TIME_TZ:
+            return "TIME_TZ";
+        case DUCKDB_TYPE_TIME_NS:
+            return "TIME_NS";
+        case DUCKDB_TYPE_BIGNUM:
+            return "BIGNUM";
+        case DUCKDB_TYPE_SQLNULL:
+            return "NULL";
+        case DUCKDB_TYPE_GEOMETRY:
+            return "GEOMETRY";
+        case DUCKDB_TYPE_VARIANT:
+            return "VARIANT";
+        case DUCKDB_TYPE_TIMESTAMP_TZ_NS:
+            return "TIMESTAMP_TZ_NS";
         default:
             return "UNKNOWN";
     }

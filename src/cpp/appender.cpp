@@ -47,10 +47,11 @@ std::string quote_ident(const std::string& s) {
     return out;
 }
 
-// Column names + per-column DEFAULT-ness for the target table, read from
-// DuckDB's `table_description` introspection API. Called once at construction
-// so callers can use append_columns({name: ndarray}) and append_row's
-// `ducky.DEFAULT` sentinel.
+// Names + per-column DEFAULT-ness of the target table's stored columns, read
+// from DuckDB's `table_description` introspection API. Generated columns are
+// skipped: the appender takes no values for them, so the remaining columns line
+// up with the appender's. Called once at construction so callers can use
+// append_columns({name: ndarray}) and append_row's `ducky.DEFAULT` sentinel.
 struct TableIntrospection {
     std::vector<std::string> names;
     std::vector<bool> has_default;
@@ -62,12 +63,16 @@ TableIntrospection introspect_table(duckdb_connection con,
                                     const std::string& table) {
     duckdb_table_description desc = nullptr;
     duckdb_state state;
-    if (catalog) {
-        state = duckdb_table_description_create_ext(
-            con, catalog->c_str(), schema ? schema->c_str() : nullptr, table.c_str(), &desc);
-    } else {
-        state = duckdb_table_description_create(con, schema ? schema->c_str() : nullptr,
-                                                table.c_str(), &desc);
+    {
+        // Takes the client context lock (see Appender::Appender).
+        release_gil_if_held release;
+        if (catalog) {
+            state = duckdb_table_description_create_ext(
+                con, catalog->c_str(), schema ? schema->c_str() : nullptr, table.c_str(), &desc);
+        } else {
+            state = duckdb_table_description_create(con, schema ? schema->c_str() : nullptr,
+                                                    table.c_str(), &desc);
+        }
     }
     // desc must be destroyed even on error (per the C API contract).
     if (state == DuckDBError) {
@@ -85,6 +90,9 @@ TableIntrospection introspect_table(duckdb_connection con,
     out.names.reserve(n);
     out.has_default.reserve(n);
     for (idx_t i = 0; i < n; ++i) {
+        bool generated = false;
+        duckdb_column_is_generated(desc, i, &generated);
+        if (generated) continue;
         char* name = duckdb_table_description_get_column_name(desc, i);
         out.names.emplace_back(name ? name : "");
         duckdb_free(name);
@@ -108,18 +116,25 @@ bool dtype_eq(nb::dlpack::dtype a, nb::dlpack::dtype b) {
 
 Appender::Appender(Connection& connection, std::string table, std::optional<std::string> schema,
                    std::optional<std::string> catalog) {
-    // PyDateTimeAPI is static per TU; prime ours so append_one's temporal
+    // PyDateTimeAPI is static per TU; prime ours so append_row's temporal
     // branches (pydt:: helpers) work. Construction precedes every append.
     if (!PyDateTimeAPI) PyDateTime_IMPORT;
-    duckdb_connection con = connection.raw_connection();
+    connection_ = connection.open_handle();
+    duckdb_connection con = connection_->connection;
 
     duckdb_state state;
-    if (catalog) {
-        state = duckdb_appender_create_ext(
-            con, catalog->c_str(), schema ? schema->c_str() : nullptr, table.c_str(), &handle_);
-    } else {
-        state = duckdb_appender_create(con, schema ? schema->c_str() : nullptr, table.c_str(),
-                                       &handle_);
+    {
+        // Creating, flushing and closing an appender take the client context
+        // lock, which a query running Python callbacks on another thread may
+        // hold while it waits for the GIL.
+        release_gil_if_held release;
+        if (catalog) {
+            state = duckdb_appender_create_ext(
+                con, catalog->c_str(), schema ? schema->c_str() : nullptr, table.c_str(), &handle_);
+        } else {
+            state = duckdb_appender_create(con, schema ? schema->c_str() : nullptr, table.c_str(),
+                                           &handle_);
+        }
     }
     if (state == DuckDBError) {
         std::string message = "ducky: failed to create appender for " + quote_ident(table);
@@ -149,11 +164,17 @@ Appender::Appender(Connection& connection, std::string table, std::optional<std:
     // neither. table_description gives both directly.
     try {
         TableIntrospection info = introspect_table(con, catalog, schema, table);
+        if (info.names.size() != n_cols) {
+            throw DuckyError("ducky: appender for " + quote_ident(table) + " takes " +
+                             std::to_string(n_cols) + " columns, but the table describes " +
+                             std::to_string(info.names.size()) + " stored columns");
+        }
         names_ = std::move(info.names);
         has_default_ = std::move(info.has_default);
     } catch (...) {
         for (auto& lt : types_) duckdb_destroy_logical_type(&lt);
         types_.clear();
+        release_gil_if_held release;
         duckdb_appender_destroy(&handle_);
         throw;
     }
@@ -162,8 +183,6 @@ Appender::Appender(Connection& connection, std::string table, std::optional<std:
     for (idx_t i = 0; i < (idx_t)names_.size(); ++i) {
         name_to_idx_.emplace(names_[i], i);
     }
-
-    connection_ = connection.handle();
 }
 
 Appender::~Appender() {
@@ -172,6 +191,7 @@ Appender::~Appender() {
     // internally; its error state is dropped here. Call close() (or use a
     // `with` block) to observe flush errors.
     if (handle_) {
+        release_gil_if_held release;
         duckdb_appender_destroy(&handle_);
         handle_ = nullptr;
     }
@@ -218,12 +238,18 @@ idx_t Appender::resolve(const std::string& name) const {
 
 void Appender::flush() {
     ensure_open();
-    check_state(duckdb_appender_flush(handle_), "appender flush failed");
+    duckdb_state state;
+    {
+        release_gil_if_held release;
+        state = duckdb_appender_flush(handle_);
+    }
+    check_state(state, "appender flush failed");
 }
 
 void Appender::close() {
     if (!handle_) return;
     // Best-effort: surface the close error, but always destroy.
+    release_gil_if_held release;
     duckdb_state state = duckdb_appender_close(handle_);
     std::string error_message;
     if (state == DuckDBError) {
@@ -243,121 +269,266 @@ void Appender::close() {
 
 namespace {
 
-void append_one(duckdb_appender app, duckdb_type t, nb::handle value, idx_t col) {
-    if (value.is_none()) {
-        if (duckdb_append_null(app) == DuckDBError) {
-            throw DuckyError("ducky: append_null failed at column " + std::to_string(col));
-        }
-        return;
+// One append_row value, converted to its column's exact C type before any of
+// the row is handed to DuckDB.
+struct Staged {
+    enum class Kind : uint8_t {
+        Null,
+        Default,
+        Bool,
+        Int8,
+        Int16,
+        Int32,
+        Int64,
+        UInt8,
+        UInt16,
+        UInt32,
+        UInt64,
+        Float,
+        Double,
+        Varchar,
+        Blob,
+        Date,
+        Time,
+        Timestamp,
+        Interval,
+    };
+    Kind kind = Kind::Null;
+    union {
+        bool b;
+        int64_t i;
+        uint64_t u;
+        double d;
+        duckdb_interval interval;
+    };
+    // Varchar / Blob: borrowed from the Python object, which append_row's
+    // arguments keep alive.
+    const char* data = nullptr;
+    idx_t size = 0;
+};
+
+[[noreturn]] void throw_value_error(const std::string& what, duckdb_type t, idx_t col,
+                                    const std::string& name) {
+    throw DuckyError("ducky: append_row: column " + std::to_string(col) + " ('" + name + "', " +
+                     duckdb_type_name(t) + "): " + what);
+}
+
+std::string type_name_of(nb::handle value) {
+    return nb::cast<std::string>(nb::str(value.type().attr("__name__")));
+}
+
+// Integer via __index__ (int, numpy integers), range-checked for the column.
+int64_t staged_signed(nb::handle value, int64_t lo, int64_t hi, duckdb_type t, idx_t col,
+                      const std::string& name) {
+    int overflow = 0;
+    long long v = PyLong_AsLongLongAndOverflow(value.ptr(), &overflow);
+    if (v == -1 && PyErr_Occurred()) {
+        PyErr_Clear();
+        throw_value_error("expected an integer, got " + type_name_of(value), t, col, name);
     }
-    duckdb_state state = DuckDBSuccess;
+    if (overflow || v < lo || v > hi) {
+        throw_value_error("value " + nb::cast<std::string>(nb::str(value)) + " is out of range", t,
+                          col, name);
+    }
+    return (int64_t)v;
+}
+
+uint64_t staged_unsigned(nb::handle value, uint64_t hi, duckdb_type t, idx_t col,
+                         const std::string& name) {
+    nb::object index = nb::steal(PyNumber_Index(value.ptr()));
+    if (!index) {
+        PyErr_Clear();
+        throw_value_error("expected an integer, got " + type_name_of(value), t, col, name);
+    }
+    unsigned long long v = PyLong_AsUnsignedLongLong(index.ptr());
+    if (PyErr_Occurred()) {
+        PyErr_Clear();
+        throw_value_error("value " + nb::cast<std::string>(nb::str(value)) + " is out of range", t,
+                          col, name);
+    }
+    if (v > hi) {
+        throw_value_error("value " + std::to_string(v) + " is out of range", t, col, name);
+    }
+    return (uint64_t)v;
+}
+
+Staged stage_value(duckdb_type t, nb::handle value, idx_t col, const std::string& name) {
+    Staged out;
+    if (value.is_none()) return out;  // Kind::Null
+    PyObject* raw = value.ptr();
     switch (t) {
-        case DUCKDB_TYPE_BOOLEAN:
-            state = duckdb_append_bool(app, nb::cast<bool>(value));
-            break;
-        case DUCKDB_TYPE_TINYINT:
-            state = duckdb_append_int8(app, nb::cast<int8_t>(value));
-            break;
-        case DUCKDB_TYPE_SMALLINT:
-            state = duckdb_append_int16(app, nb::cast<int16_t>(value));
-            break;
-        case DUCKDB_TYPE_INTEGER:
-            state = duckdb_append_int32(app, nb::cast<int32_t>(value));
-            break;
-        case DUCKDB_TYPE_BIGINT:
-            state = duckdb_append_int64(app, nb::cast<int64_t>(value));
-            break;
-        case DUCKDB_TYPE_UTINYINT:
-            state = duckdb_append_uint8(app, nb::cast<uint8_t>(value));
-            break;
-        case DUCKDB_TYPE_USMALLINT:
-            state = duckdb_append_uint16(app, nb::cast<uint16_t>(value));
-            break;
-        case DUCKDB_TYPE_UINTEGER:
-            state = duckdb_append_uint32(app, nb::cast<uint32_t>(value));
-            break;
-        case DUCKDB_TYPE_UBIGINT:
-            state = duckdb_append_uint64(app, nb::cast<uint64_t>(value));
-            break;
-        case DUCKDB_TYPE_FLOAT:
-            state = duckdb_append_float(app, nb::cast<float>(value));
-            break;
-        case DUCKDB_TYPE_DOUBLE:
-            state = duckdb_append_double(app, nb::cast<double>(value));
-            break;
-        case DUCKDB_TYPE_VARCHAR: {
-            // Borrow PyUnicode's cached UTF-8 buffer; no std::string copy.
-            if (!nb::isinstance<nb::str>(value)) {
-                throw DuckyError("ducky: expected str for VARCHAR at column " +
-                                 std::to_string(col));
+        case DUCKDB_TYPE_BOOLEAN: {
+            // bool and numpy.bool_ (named bool_ before NumPy 2); integers are
+            // rejected rather than coerced.
+            std::string type = PyBool_Check(raw) ? "bool" : type_name_of(value);
+            if (type != "bool" && type != "bool_") {
+                throw_value_error("expected bool, got " + type_name_of(value), t, col, name);
             }
+            int truth = PyObject_IsTrue(raw);
+            if (truth < 0) throw nb::python_error();
+            out.kind = Staged::Kind::Bool;
+            out.b = truth != 0;
+            return out;
+        }
+        case DUCKDB_TYPE_TINYINT:
+            out.kind = Staged::Kind::Int8;
+            out.i = staged_signed(value, INT8_MIN, INT8_MAX, t, col, name);
+            return out;
+        case DUCKDB_TYPE_SMALLINT:
+            out.kind = Staged::Kind::Int16;
+            out.i = staged_signed(value, INT16_MIN, INT16_MAX, t, col, name);
+            return out;
+        case DUCKDB_TYPE_INTEGER:
+            out.kind = Staged::Kind::Int32;
+            out.i = staged_signed(value, INT32_MIN, INT32_MAX, t, col, name);
+            return out;
+        case DUCKDB_TYPE_BIGINT:
+            out.kind = Staged::Kind::Int64;
+            out.i = staged_signed(value, INT64_MIN, INT64_MAX, t, col, name);
+            return out;
+        case DUCKDB_TYPE_UTINYINT:
+            out.kind = Staged::Kind::UInt8;
+            out.u = staged_unsigned(value, UINT8_MAX, t, col, name);
+            return out;
+        case DUCKDB_TYPE_USMALLINT:
+            out.kind = Staged::Kind::UInt16;
+            out.u = staged_unsigned(value, UINT16_MAX, t, col, name);
+            return out;
+        case DUCKDB_TYPE_UINTEGER:
+            out.kind = Staged::Kind::UInt32;
+            out.u = staged_unsigned(value, UINT32_MAX, t, col, name);
+            return out;
+        case DUCKDB_TYPE_UBIGINT:
+            out.kind = Staged::Kind::UInt64;
+            out.u = staged_unsigned(value, UINT64_MAX, t, col, name);
+            return out;
+        case DUCKDB_TYPE_FLOAT:
+        case DUCKDB_TYPE_DOUBLE: {
+            double v = PyFloat_AsDouble(raw);  // float, int, numpy scalars
+            if (v == -1.0 && PyErr_Occurred()) {
+                PyErr_Clear();
+                throw_value_error("expected a number, got " + type_name_of(value), t, col, name);
+            }
+            out.kind = t == DUCKDB_TYPE_FLOAT ? Staged::Kind::Float : Staged::Kind::Double;
+            out.d = v;
+            return out;
+        }
+        case DUCKDB_TYPE_VARCHAR: {
+            if (!PyUnicode_Check(raw)) {
+                throw_value_error("expected str, got " + type_name_of(value), t, col, name);
+            }
+            // Borrow PyUnicode's cached UTF-8 buffer; no std::string copy.
             Py_ssize_t size = 0;
-            const char* s = PyUnicode_AsUTF8AndSize(value.ptr(), &size);
-            if (!s) throw nb::python_error();
-            state = duckdb_append_varchar_length(app, s, (idx_t)size);
-            break;
+            const char* data = PyUnicode_AsUTF8AndSize(raw, &size);
+            if (!data) throw nb::python_error();
+            out.kind = Staged::Kind::Varchar;
+            out.data = data;
+            out.size = (idx_t)size;
+            return out;
         }
         case DUCKDB_TYPE_BLOB: {
-            nb::bytes b = nb::cast<nb::bytes>(value);
-            state = duckdb_append_blob(app, b.c_str(), b.size());
-            break;
+            char* data = nullptr;
+            Py_ssize_t size = 0;
+            if (!PyBytes_Check(raw) || PyBytes_AsStringAndSize(raw, &data, &size) != 0) {
+                PyErr_Clear();
+                throw_value_error("expected bytes, got " + type_name_of(value), t, col, name);
+            }
+            out.kind = Staged::Kind::Blob;
+            out.data = data;
+            out.size = (idx_t)size;
+            return out;
         }
         // Temporal columns take the matching datetime object, mirroring what
         // bind_parameters accepts for `INSERT ... VALUES (?)`.
-        case DUCKDB_TYPE_DATE: {
-            PyObject* raw = value.ptr();
+        case DUCKDB_TYPE_DATE:
             // datetime.datetime is a date subclass; reject it rather than
             // silently truncating the time part.
             if (!PyDate_Check(raw) || PyDateTime_Check(raw)) {
-                throw DuckyError("ducky: expected datetime.date for DATE at column " +
-                                 std::to_string(col));
+                throw_value_error("expected datetime.date, got " + type_name_of(value), t, col,
+                                  name);
             }
-            state = duckdb_append_date(app, pydt::date_to_duckdb(raw));
-            break;
-        }
-        case DUCKDB_TYPE_TIME: {
-            PyObject* raw = value.ptr();
+            out.kind = Staged::Kind::Date;
+            out.i = pydt::date_to_duckdb(raw).days;
+            return out;
+        case DUCKDB_TYPE_TIME:
             if (!PyTime_Check(raw)) {
-                throw DuckyError("ducky: expected datetime.time for TIME at column " +
-                                 std::to_string(col));
+                throw_value_error("expected datetime.time, got " + type_name_of(value), t, col,
+                                  name);
             }
-            state = duckdb_append_time(app, pydt::time_to_duckdb(raw));
-            break;
-        }
+            out.kind = Staged::Kind::Time;
+            out.i = pydt::time_to_duckdb(raw).micros;
+            return out;
         case DUCKDB_TYPE_TIMESTAMP:
-        case DUCKDB_TYPE_TIMESTAMP_TZ: {
-            if (!PyDateTime_Check(value.ptr())) {
-                throw DuckyError("ducky: expected datetime.datetime for " +
-                                 std::string(duckdb_type_name(t)) + " at column " +
-                                 std::to_string(col));
+        case DUCKDB_TYPE_TIMESTAMP_TZ:
+            if (!PyDateTime_Check(raw)) {
+                throw_value_error("expected datetime.datetime, got " + type_name_of(value), t, col,
+                                  name);
             }
             // Aware values land in UTC micros; naive values are taken as-is.
-            state = duckdb_append_timestamp(app, duckdb_timestamp{pydt::datetime_to_micros(value)});
-            break;
-        }
-        case DUCKDB_TYPE_INTERVAL: {
-            PyObject* raw = value.ptr();
+            out.kind = Staged::Kind::Timestamp;
+            out.i = pydt::datetime_to_micros(value);
+            return out;
+        case DUCKDB_TYPE_INTERVAL:
             if (!PyDelta_Check(raw)) {
-                throw DuckyError("ducky: expected datetime.timedelta for INTERVAL at column " +
-                                 std::to_string(col));
+                throw_value_error("expected datetime.timedelta, got " + type_name_of(value), t, col,
+                                  name);
             }
-            duckdb_interval iv{};
-            iv.months = 0;
-            iv.days = PyDateTime_DELTA_GET_DAYS(raw);
-            iv.micros = (int64_t)PyDateTime_DELTA_GET_SECONDS(raw) * 1000000 +
-                        PyDateTime_DELTA_GET_MICROSECONDS(raw);
-            state = duckdb_append_interval(app, iv);
-            break;
-        }
+            out.kind = Staged::Kind::Interval;
+            out.interval = duckdb_interval{};
+            out.interval.days = PyDateTime_DELTA_GET_DAYS(raw);
+            out.interval.micros = (int64_t)PyDateTime_DELTA_GET_SECONDS(raw) * 1000000 +
+                                  PyDateTime_DELTA_GET_MICROSECONDS(raw);
+            return out;
         default:
-            throw DuckyError(std::string("ducky: row-API append for type ") + duckdb_type_name(t) +
-                             " not yet supported at column " + std::to_string(col) +
-                             "; use append_columns or append_arrow");
+            throw_value_error(
+                "row-API append is not supported for this type; use "
+                "append_columns or append_arrow",
+                t, col, name);
     }
-    if (state == DuckDBError) {
-        throw DuckyError(std::string("ducky: append failed at column ") + std::to_string(col) +
-                         " (" + duckdb_type_name(t) + ")");
+}
+
+duckdb_state append_staged(duckdb_appender app, const Staged& v) {
+    switch (v.kind) {
+        case Staged::Kind::Null:
+            return duckdb_append_null(app);
+        case Staged::Kind::Default:
+            return duckdb_append_default(app);
+        case Staged::Kind::Bool:
+            return duckdb_append_bool(app, v.b);
+        case Staged::Kind::Int8:
+            return duckdb_append_int8(app, (int8_t)v.i);
+        case Staged::Kind::Int16:
+            return duckdb_append_int16(app, (int16_t)v.i);
+        case Staged::Kind::Int32:
+            return duckdb_append_int32(app, (int32_t)v.i);
+        case Staged::Kind::Int64:
+            return duckdb_append_int64(app, v.i);
+        case Staged::Kind::UInt8:
+            return duckdb_append_uint8(app, (uint8_t)v.u);
+        case Staged::Kind::UInt16:
+            return duckdb_append_uint16(app, (uint16_t)v.u);
+        case Staged::Kind::UInt32:
+            return duckdb_append_uint32(app, (uint32_t)v.u);
+        case Staged::Kind::UInt64:
+            return duckdb_append_uint64(app, v.u);
+        case Staged::Kind::Float:
+            return duckdb_append_float(app, (float)v.d);
+        case Staged::Kind::Double:
+            return duckdb_append_double(app, v.d);
+        case Staged::Kind::Varchar:
+            return duckdb_append_varchar_length(app, v.data, v.size);
+        case Staged::Kind::Blob:
+            return duckdb_append_blob(app, v.data, v.size);
+        case Staged::Kind::Date:
+            return duckdb_append_date(app, duckdb_date{(int32_t)v.i});
+        case Staged::Kind::Time:
+            return duckdb_append_time(app, duckdb_time{v.i});
+        case Staged::Kind::Timestamp:
+            return duckdb_append_timestamp(app, duckdb_timestamp{v.i});
+        case Staged::Kind::Interval:
+            return duckdb_append_interval(app, v.interval);
     }
+    return DuckDBError;
 }
 
 }  // namespace
@@ -369,27 +540,32 @@ void Appender::append_row(nb::args values) {
         throw DuckyError("ducky: append_row expected " + std::to_string(n_cols) + " values, got " +
                          std::to_string(values.size()));
     }
-    // A conversion failure partway through a row leaves DuckDB's internal
-    // appender column cursor stuck mid-row (nothing else resets it), silently
-    // misaligning every column write on the next append_row call. Reset via
-    // duckdb_appender_clear before propagating; this also drops any prior rows
-    // buffered since the last flush(), which is the price of recovering.
-    try {
-        for (idx_t i = 0; i < n_cols; ++i) {
-            if (nb::isinstance<DefaultSentinel>(values[i])) {
-                if (i < has_default_.size() && !has_default_[i]) {
-                    throw DuckyError("ducky: column '" + names_[i] +
-                                     "' has no DEFAULT value; pass an explicit value");
-                }
-                check_state(duckdb_append_default(handle_),
-                            ("append_default failed at column " + std::to_string(i)).c_str());
-                continue;
+    // Convert and check every value before appending any: a failure partway
+    // through a row would leave DuckDB's appender mid-row, and the only reset
+    // (duckdb_appender_clear) also drops every row buffered since the last
+    // flush.
+    std::vector<Staged> row(n_cols);
+    for (idx_t i = 0; i < n_cols; ++i) {
+        if (nb::isinstance<DefaultSentinel>(values[i])) {
+            if (!has_default_[i]) {
+                throw DuckyError("ducky: column '" + names_[i] +
+                                 "' has no DEFAULT value; pass an explicit value");
             }
-            append_one(handle_, type_ids_[i], values[i], i);
+            row[i].kind = Staged::Kind::Default;
+            continue;
         }
-    } catch (...) {
-        duckdb_appender_clear(handle_);
-        throw;
+        row[i] = stage_value(type_ids_[i], values[i], i, names_[i]);
+    }
+    // Staged values match their columns' types exactly, so these appends don't
+    // cast and cannot fail on the values. Appending can flush a full buffer,
+    // which takes the client context lock (see the constructor).
+    release_gil_if_held release;
+    for (idx_t i = 0; i < n_cols; ++i) {
+        if (append_staged(handle_, row[i]) == DuckDBError) {
+            // Unexpected; reset the half-written row so the appender stays usable.
+            duckdb_appender_clear(handle_);
+            check_state(DuckDBError, ("append failed at column " + std::to_string(i)).c_str());
+        }
     }
     check_state(duckdb_appender_end_row(handle_), "end_row failed");
 }
@@ -510,7 +686,12 @@ void Appender::append_columns(nb::dict columns, nb::object masks) {
             }
         }
 
-        duckdb_state state = duckdb_append_data_chunk(handle_, chunk);
+        duckdb_state state;
+        {
+            // Appending can flush a full buffer (see the constructor).
+            release_gil_if_held release;
+            state = duckdb_append_data_chunk(handle_, chunk);
+        }
         if (state == DuckDBError) {
             duckdb_destroy_data_chunk(&chunk);
             check_state(state, "append_data_chunk failed");
@@ -536,8 +717,44 @@ void Appender::append_arrow(nb::object source) {
             throw DuckyError("ducky: failed to convert Arrow data to a DuckDB chunk: " + err);
         }
         array->release = nullptr;
-        duckdb_state st = duckdb_append_data_chunk(handle_, chunk);
-        duckdb_destroy_data_chunk(&chunk);
+        // A batch converts to one chunk of the batch's length, but appending
+        // a chunk that needs a cast goes through a vector-size buffer: append
+        // in windows of at most duckdb_vector_size() rows.
+        duckdb_state st = DuckDBSuccess;
+        {
+            release_gil_if_held release;
+            idx_t rows = duckdb_data_chunk_get_size(chunk);
+            idx_t window = duckdb_vector_size();
+            if (rows <= window) {
+                st = duckdb_append_data_chunk(handle_, chunk);
+            } else {
+                idx_t n_cols = duckdb_data_chunk_get_column_count(chunk);
+                std::vector<duckdb_logical_type> types(n_cols);
+                for (idx_t c = 0; c < n_cols; ++c) {
+                    types[c] =
+                        duckdb_vector_get_column_type(duckdb_data_chunk_get_vector(chunk, c));
+                }
+                duckdb_data_chunk slice = duckdb_create_data_chunk(types.data(), n_cols);
+                for (duckdb_logical_type& t : types) duckdb_destroy_logical_type(&t);
+                duckdb_selection_vector sel = duckdb_create_selection_vector(rows);
+                sel_t* index = duckdb_selection_vector_get_data_ptr(sel);
+                for (idx_t r = 0; r < rows; ++r) index[r] = (sel_t)r;
+                for (idx_t offset = 0; offset < rows && st == DuckDBSuccess; offset += window) {
+                    idx_t count = std::min(window, rows - offset);
+                    duckdb_data_chunk_reset(slice);
+                    for (idx_t c = 0; c < n_cols; ++c) {
+                        duckdb_vector_copy_sel(duckdb_data_chunk_get_vector(chunk, c),
+                                               duckdb_data_chunk_get_vector(slice, c), sel,
+                                               offset + count, offset, 0);
+                    }
+                    duckdb_data_chunk_set_size(slice, count);
+                    st = duckdb_append_data_chunk(handle_, slice);
+                }
+                duckdb_destroy_selection_vector(sel);
+                duckdb_destroy_data_chunk(&slice);
+            }
+            duckdb_destroy_data_chunk(&chunk);
+        }
         check_state(st, "appending an Arrow batch failed");
     };
 

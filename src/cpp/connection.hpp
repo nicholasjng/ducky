@@ -63,8 +63,9 @@ class Connection {
     // Run a query and retain its result for fetch methods.
     Connection& execute(const std::string& query, nb::object parameters, bool streaming);
 
-    // Run a query and return its Result directly.
-    std::shared_ptr<Result> sql(const std::string& query, bool streaming);
+    // Run a query and return its Result directly, leaving the retained result
+    // in place.
+    std::shared_ptr<Result> sql(const std::string& query, nb::object parameters, bool streaming);
 
     // Run once per parameter set and discard the results.
     void executemany(const std::string& query, nb::object seq);
@@ -91,13 +92,14 @@ class Connection {
     std::shared_ptr<Result> current_result();
 
     // Raw C API handle.
-    duckdb_connection raw_connection() {
-        ensure_open();
-        return handle_->connection;
-    }
+    duckdb_connection raw_connection() { return open_handle()->connection; }
 
-    // Shared database and connection owner.
-    std::shared_ptr<DuckDBHandle> handle() const { return handle_; }
+    // Shared database and connection owner, or nullptr after close(). Callers
+    // that run DuckDB work hold the returned reference for the whole call, so
+    // a concurrent close() cannot tear the connection down underneath them.
+    std::shared_ptr<DuckDBHandle> handle() const;
+    // Same, but raises when the connection is closed.
+    std::shared_ptr<DuckDBHandle> open_handle() const;
 
     // Thread-safe; no-op if no query is in flight.
     void interrupt();
@@ -125,7 +127,6 @@ class Connection {
     void gc_clear();
 
    private:
-    void ensure_open() const;
     duckdb_result run(const std::string& query, nb::object parameters, bool streaming);
 
     // Prepared-statement LRU keyed by exact query text.
@@ -148,8 +149,8 @@ class Connection {
     // One execution's checked-out or freshly prepared statement.
     class StatementLease {
        public:
-        // Check out an unbound cached statement or prepare one.
-        StatementLease(Connection& con, const std::string& query);
+        // Check out an unbound cached statement or prepare one on `connection`.
+        StatementLease(Connection& con, duckdb_connection connection, const std::string& query);
         ~StatementLease();
 
         StatementLease(const StatementLease&) = delete;
@@ -168,13 +169,14 @@ class Connection {
     // Make a result sharing the database handle.
     std::shared_ptr<Result> make_result(duckdb_result result);
     // Fire the sink for sampled materialized queries.
-    void maybe_emit_profile(const std::string& query);
+    void maybe_emit_profile(duckdb_connection connection, const std::string& query);
 
     // Front is most recently used.
     std::list<CachedStatement> statement_lru_;
     tsl::robin_map<std::string, std::list<CachedStatement>::iterator> statement_cache_;
 
-    // Guards handle_ reads and reset; never held across DuckDB calls.
+    // Guards handle_ reads and reset; never held across DuckDB calls. Read
+    // handle_ only through handle() / open_handle().
     mutable nb::ft_mutex handle_mu_;
     std::shared_ptr<DuckDBHandle> handle_;
     std::shared_ptr<Result> last_result_;

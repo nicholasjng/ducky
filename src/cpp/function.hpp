@@ -34,8 +34,26 @@ struct StructDtypes {
 };
 const StructDtypes& struct_dtypes();
 
-// Parse a type expression; the caller owns the result.
-duckdb_logical_type parse_logical_type(duckdb_connection con, const std::string& type_str);
+// Resolves DuckDB type expressions (e.g. "DECIMAL(18,3)", "STRUCT(a INT)") by
+// planning `SELECT CAST(NULL AS <type>)`. Runs without the GIL on a private
+// connection to the database, so it never closes a streaming result open on
+// the caller's connection; types only the caller's connection can see (created
+// in its open transaction) fall back to that connection.
+class TypeParser {
+   public:
+    TypeParser(duckdb_database database, duckdb_connection fallback);
+    ~TypeParser();
+    TypeParser(const TypeParser&) = delete;
+    TypeParser& operator=(const TypeParser&) = delete;
+
+    // Parse a type expression; the caller owns the result.
+    duckdb_logical_type parse(const std::string& type_str);
+
+   private:
+    duckdb_database database_;
+    duckdb_connection fallback_;
+    duckdb_connection private_ = nullptr;
+};
 
 // Register a chunk-wise NumPy scalar UDF.
 void create_scalar_function(Connection& con, const std::string& name, nb::callable fn,

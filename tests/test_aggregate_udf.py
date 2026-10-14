@@ -58,6 +58,9 @@ class NullFinalize:
     def update(self, values: np.ndarray):
         pass
 
+    def combine(self, other: "NullFinalize"):
+        pass
+
     def finalize(self):
         return None
 
@@ -68,6 +71,9 @@ class ErrorOnUpdate:
 
     def update(self, values: np.ndarray):
         raise ValueError("intentional update error")
+
+    def combine(self, other: "ErrorOnUpdate"):
+        pass
 
     def finalize(self) -> float:
         return 0.0
@@ -105,27 +111,15 @@ def test_rmse(con):
     assert abs(result - expected) < 1e-9
 
 
-def test_combine_optional(con):
-    # This only exercises the routine merge DuckDB does for *every* aggregate
-    # query, even single-threaded ones: a touched (real-data) state merged
-    # into a still-fresh target, which the __dict__-copy fallback handles by
-    # a plain copy. It does NOT exercise aggregate.cpp's hard-error branch
-    # (two states that *both* received real update() calls, requiring a
-    # user-defined combine()) -- that path needs DuckDB to actually merge two
-    # independently-accumulated partial states, which requires genuine
-    # parallel/repartitioned execution. Repeated attempts to force it
-    # deterministically from Python (threads=2..8, few groups, high-cardinality
-    # GROUP BY up to 50k groups over 20M rows, single- and multi-threaded, a
-    # materialized table instead of range()) never triggered it -- DuckDB's
-    # actual merge scheduling doesn't line up with the "repartitioning can
-    # combine two touched states" assumption behind that branch closely
-    # enough to hit it via black-box SQL. Left undone rather than shipping a
-    # test that doesn't reliably exercise what it claims to.
-    con.create_aggregate_function(
-        "no_comb_sum", NoCombineSum, parameters=["DOUBLE"], return_type="DOUBLE"
-    )
-    result: float = con.sql("SELECT no_comb_sum(v) FROM (VALUES (4.0), (6.0)) t(v)").fetchitem()
-    assert abs(result - 10.0) < 1e-9
+def test_combine_is_required(con):
+    # DuckDB merges partial states for parallel scans, DISTINCT, window frames
+    # and large GROUP BYs, even single-threaded, and arbitrary Python state has
+    # no generic merge: registration rejects a class without combine() rather
+    # than failing (or answering wrongly) depending on data size.
+    with pytest.raises(ducky.Error, match="must define combine"):
+        con.create_aggregate_function(
+            "no_comb_sum", NoCombineSum, parameters=["DOUBLE"], return_type="DOUBLE"
+        )
 
 
 def test_finalize_returns_none_produces_null(con):
@@ -159,6 +153,9 @@ def test_integer_return_type(con):
 
         def update(self, values: np.ndarray):
             self.total += int(values.sum())
+
+        def combine(self, other: "IntSum"):
+            self.total += other.total
 
         def finalize(self) -> int:
             return self.total
