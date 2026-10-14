@@ -45,24 +45,18 @@ pl:
 # Import mlx.core under its conventional alias so the annotation never needs
 # the bare `mlx` token.
 \.mlx$:
-    \import mlx.core as mx  # ty: ignore[unresolved-import]
+    \import mlx.core as mx
     def mlx(self, key: int | str) -> mx.array:
         \doc
 
-# iter_batches_mlx / to_mlx: mlx ships a `py.typed` marker but `mlx.core`
-# itself (a compiled extension) has no accompanying .pyi anywhere in the
-# package, so `import mlx.core` is permanently unresolvable to a type
-# checker regardless of spelling -- torch/jax don't have this gap, only mlx.
-# Route through the same aliased-and-ignored import as Chunk.mlx above so
-# every mlx reference in this generated file uses one consistent, already-
-# suppressed import instead of leaving a second, differently-spelled
-# unresolved-import for the same underlying issue.
+# iter_batches_mlx / to_mlx: use the same alias as Chunk.mlx, so the stub
+# imports mlx.core once, under one name.
 \.iter_batches_mlx$:
-    \import mlx.core as mx  # ty: ignore[unresolved-import]
+    \import mlx.core as mx
     def iter_batches_mlx(self, columns: Iterable[str] | None = None) -> Iterator[dict[str, mx.array]]:
         \doc
 
 \.to_mlx$:
-    \import mlx.core as mx  # ty: ignore[unresolved-import]
+    \import mlx.core as mx
     def to_mlx(self, columns: Iterable[str] | None = None) -> dict[str, mx.array]:
         \doc

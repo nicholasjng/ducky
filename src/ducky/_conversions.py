@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 if TYPE_CHECKING:
     import jax
-    import mlx.core as mx  # ty: ignore[unresolved-import]
+    import mlx.core as mx
     import numpy as np
     import pandas as pd
     import polars
@@ -58,12 +58,7 @@ class _CollectedArrowSource(Protocol):
 class _StreamingQuerySource(Protocol):
     """A ducky :class:`Connection` that can execute a query as a lazily-pulled Result."""
 
-    def execute(
-        self, query: str, parameters: Any = ..., streaming: bool = ...
-    ) -> _StreamingQuerySource: ...
-
-    @property
-    def current_result(self) -> ArrowSource: ...
+    def _query(self, query: str, parameters: Any = ..., streaming: bool = ...) -> ArrowSource: ...
 
 
 def arrow_reader(
@@ -77,7 +72,10 @@ def arrow_reader(
         raise ValueError("rows_per_batch must be positive")
     import pyarrow as pa
 
-    result = con.execute(query, parameters, streaming=True).current_result
+    # _query runs the cached statement without replacing the connection's
+    # current result (what con.fetchall() reads). The reader streams: a later
+    # statement on the connection closes it, and reading it then raises.
+    result = con._query(query, parameters, streaming=True)
     chunk_reader = pa.RecordBatchReader._import_from_c_capsule(result._arrow_chunk_stream())
 
     def coalesced() -> Iterator[pyarrow.RecordBatch]:
@@ -270,7 +268,7 @@ def to_mlx(
     columns: Iterable[str] | None = None,
 ) -> dict[str, mx.array]:
     """Return selected columns as MLX arrays; ``DOUBLE`` becomes float32."""
-    import mlx.core as mx  # ty: ignore[unresolved-import]
+    import mlx.core as mx
 
     arrays = source.to_numpy(columns)
     return {name: mx.array(arr) for name, arr in arrays.items()}

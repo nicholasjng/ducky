@@ -6,7 +6,7 @@ import contextlib
 import json
 import os
 import threading
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Generator
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import IO, TYPE_CHECKING, Any, Literal, NamedTuple
@@ -45,25 +45,27 @@ class ProfileResult:
         return f"ProfileResult(info={'set' if self.info is not None else 'None'})"
 
 
+# Settings go through con.sql(), which leaves the connection's current result
+# (what con.fetchall() reads) alone.
 def _current_setting(con: Connection, name: str) -> str | None:
-    return con.execute(f"SELECT current_setting('{name}')").fetchitem()
+    return con.sql(f"SELECT current_setting('{name}')").fetchitem()
 
 
 def _restore(con: Connection, name: str, prev: str | None) -> None:
     if prev is None:
-        con.execute(f"RESET {name}")
+        con.sql(f"RESET {name}")
     else:
-        con.execute(f"SET {name}='{prev}'")
+        con.sql(f"SET {name}='{prev}'")
 
 
 @contextlib.contextmanager
-def profile(con: Connection, *, mode: ProfilingMode = "standard") -> Iterator[ProfileResult]:
+def profile(con: Connection, *, mode: ProfilingMode = "standard") -> Generator[ProfileResult]:
     """Profile queries in the block and restore prior settings on exit."""
     prev_enabled = _current_setting(con, "enable_profiling")
     prev_mode = _current_setting(con, "profiling_mode")
-    con.execute("SET enable_profiling='no_output'")
+    con.sql("SET enable_profiling='no_output'")
     if mode == "detailed":
-        con.execute("SET profiling_mode='detailed'")
+        con.sql("SET profiling_mode='detailed'")
     result = ProfileResult(con)
     try:
         yield result

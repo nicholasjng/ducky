@@ -11,9 +11,9 @@ import pandas
 import polars
 import pyarrow
 import torch
-from mlx import core as mx  # ty: ignore[unresolved-import]
+from mlx import core as mx
 
-__duckdb_version__: str = "v2.1.0-dev0"
+__duckdb_version__: str = "v2.0.0-dev0"
 
 class Error(Exception): ...
 
@@ -94,7 +94,7 @@ class Result:
 
     def to_numpy(self, columns: Iterable[str] | None = None) -> dict[str, numpy.ndarray]:
         """
-        Drain the result into a {name: numpy.ndarray} dict. Raises on VARCHAR/LIST/STRUCT/MAP; use arrow() for those.
+        Drain the result into a {name: numpy.ndarray} dict. NULLs become NaN in FLOAT/DOUBLE columns and raise elsewhere. Raises on VARCHAR/LIST/STRUCT/MAP; use arrow() for those.
         """
 
     def __arrow_c_stream__(self, requested_schema: Any = None) -> Any:
@@ -118,7 +118,7 @@ class Result:
 
     def fetchnumpy(self) -> dict[str, numpy.ndarray]:
         """
-        Return the result as a dict of column name -> numpy array. Numeric and temporal columns only; use arrow() for strings and nested types.
+        Return the result as a dict of column name -> numpy array. Numeric and temporal columns only; use arrow() for strings and nested types. NULLs become NaN in FLOAT/DOUBLE columns and raise elsewhere.
         """
 
     def chunks(self) -> Iterator[Chunk]:
@@ -390,7 +390,7 @@ class Connection:
 
     def fetchnumpy(self) -> dict[str, numpy.ndarray]:
         """
-        Return the result as a dict of column name -> numpy array. Numeric and temporal columns only; use arrow() for strings and nested types.
+        Return the result as a dict of column name -> numpy array. Numeric and temporal columns only; use arrow() for strings and nested types. NULLs become NaN in FLOAT/DOUBLE columns and raise elsewhere.
         """
 
     def chunks(self) -> Iterator[Chunk]:
@@ -465,7 +465,7 @@ class Connection:
         special_handling: bool = False,
     ) -> None:
         """
-        Register a chunk-wise NumPy scalar UDF. Types may be explicit or inferred. With special_handling, inputs and output use ``(values, validity)`` tuples.
+        Register a chunk-wise NumPy scalar UDF. Types may be explicit or inferred. Rows with a NULL argument are not passed to fn and yield NULL; with special_handling, inputs and output use ``(values, validity)`` tuples instead.
         """
 
     def create_arrow_function(
@@ -484,7 +484,7 @@ class Connection:
         self, name: str, cls: type, parameters: list[str] | dict[str, str], return_type: str
     ) -> None:
         """
-        Register an aggregate class defining update and finalize. Define combine to support merging populated partial states.
+        Register an aggregate class defining update, combine and finalize. Rows with a NULL argument are skipped. combine(other) merges another partial state into self without modifying other.
         """
 
     def create_table_function(
@@ -520,7 +520,9 @@ class Connection:
         """
 
     def register_arrow(self, name: str, obj: Any) -> None:
-        """Register a reusable Arrow C stream source as table ``name``."""
+        """
+        Register an Arrow C stream source as table ``name`` (matched case-insensitively). Tables and data frames are re-read by every query; readers and query results are one-shot and can be scanned once.
+        """
 
     def load_extension(self, name: str) -> None:
         """

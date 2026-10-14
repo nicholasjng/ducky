@@ -61,7 +61,8 @@ void def_conversions(Cls& cls, Src src) {
         [src](nb::object self) { return conversions().attr("fetchnumpy")(src(self)); },
         nb::sig("def fetchnumpy(self) -> dict[str, numpy.ndarray]"),
         "Return the result as a dict of column name -> numpy array. Numeric and "
-        "temporal columns only; use arrow() for strings and nested types.");
+        "temporal columns only; use arrow() for strings and nested types. NULLs become "
+        "NaN in FLOAT/DOUBLE columns and raise elsewhere.");
     cls.def(
         "chunks", [src](nb::object self) { return conversions().attr("chunks")(src(self)); },
         nb::sig("def chunks(self) -> collections.abc.Iterator[Chunk]"),
@@ -230,8 +231,9 @@ NB_MODULE(_core, m) {
         .def("to_numpy", &Result::to_numpy, "columns"_a = nb::none(),
              nb::sig("def to_numpy(self, columns: collections.abc.Iterable[str] "
                      "| None = None) -> dict[str, numpy.ndarray]"),
-             "Drain the result into a {name: numpy.ndarray} dict. "
-             "Raises on VARCHAR/LIST/STRUCT/MAP; use arrow() for those.",
+             "Drain the result into a {name: numpy.ndarray} dict. NULLs become NaN in "
+             "FLOAT/DOUBLE columns and raise elsewhere. Raises on VARCHAR/LIST/STRUCT/MAP; "
+             "use arrow() for those.",
              nb::lock_self())
         .def(
             "__arrow_c_stream__",
@@ -364,12 +366,27 @@ NB_MODULE(_core, m) {
              nb::sig("def executemany(self, query: str, parameters: "
                      "collections.abc.Iterable[list | tuple | dict[str, typing.Any]]) -> None"),
              "Run once per parameter set and discard the results.", nb::lock_self())
-        .def("sql", &Connection::sql, "query"_a, "streaming"_a = false,
-             nb::sig("def sql(self, query: str, streaming: bool = False) -> Result"),
-             "Run a query and return its result directly.", nb::lock_self())
-        .def("query", &Connection::sql, "query"_a, "streaming"_a = false,
-             nb::sig("def query(self, query: str, streaming: bool = False) -> Result"),
-             "Alias for :meth:`sql`.", nb::lock_self())
+        .def(
+            "sql",
+            [](Connection& self, const std::string& query, bool streaming) {
+                return self.sql(query, nb::none(), streaming);
+            },
+            "query"_a, "streaming"_a = false,
+            nb::sig("def sql(self, query: str, streaming: bool = False) -> Result"),
+            "Run a query and return its result directly.", nb::lock_self())
+        .def(
+            "query",
+            [](Connection& self, const std::string& query, bool streaming) {
+                return self.sql(query, nb::none(), streaming);
+            },
+            "query"_a, "streaming"_a = false,
+            nb::sig("def query(self, query: str, streaming: bool = False) -> Result"),
+            "Alias for :meth:`sql`.", nb::lock_self())
+        .def("_query", &Connection::sql, "query"_a, "parameters"_a = nb::none(),
+             "streaming"_a = false,
+             nb::sig("def _query(self, query: str, parameters: list | tuple | "
+                     "dict[str, typing.Any] | None = None, streaming: bool = False) -> Result"),
+             "Like :meth:`sql`, with parameters.", nb::lock_self())
         .def("_arrow_collected_stream", &Connection::arrow_collected_stream, "query"_a,
              "parameters"_a = nb::none(), "rows_per_batch"_a = 1000000,
              nb::sig("def _arrow_collected_stream(self, query: str, parameters: list | tuple | "
@@ -478,7 +495,8 @@ NB_MODULE(_core, m) {
                     "init: collections.abc.Callable[[], typing.Any] | None = None, "
                     "*, volatile: bool = False, special_handling: bool = False) -> None"),
             "Register a chunk-wise NumPy scalar UDF. Types may be explicit or inferred. "
-            "With special_handling, inputs and output use ``(values, validity)`` tuples.",
+            "Rows with a NULL argument are not passed to fn and yield NULL; with "
+            "special_handling, inputs and output use ``(values, validity)`` tuples instead.",
             nb::lock_self())
         .def(
             "create_arrow_function",
@@ -503,8 +521,9 @@ NB_MODULE(_core, m) {
             "name"_a, "cls"_a, "parameters"_a, "return_type"_a,
             nb::sig("def create_aggregate_function(self, name: str, cls: type, "
                     "parameters: list[str] | dict[str, str], return_type: str) -> None"),
-            "Register an aggregate class defining update and finalize. Define combine "
-            "to support merging populated partial states.",
+            "Register an aggregate class defining update, combine and finalize. Rows with "
+            "a NULL argument are skipped. combine(other) merges another partial state "
+            "into self without modifying other.",
             nb::lock_self())
         .def(
             "create_table_function",
@@ -546,7 +565,10 @@ NB_MODULE(_core, m) {
              nb::lock_self())
         .def("register_arrow", &Connection::register_arrow, "name"_a, "obj"_a,
              nb::sig("def register_arrow(self, name: str, obj: typing.Any) -> None"),
-             "Register a reusable Arrow C stream source as table ``name``.", nb::lock_self())
+             "Register an Arrow C stream source as table ``name`` (matched "
+             "case-insensitively). Tables and data frames are re-read by every query; "
+             "readers and query results are one-shot and can be scanned once.",
+             nb::lock_self())
         .def("load_extension", &Connection::load_extension, "name"_a,
              nb::sig("def load_extension(self, name: str) -> None"),
              "Load an extension by name or path. Unsigned extensions require "

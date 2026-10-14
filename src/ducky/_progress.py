@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import sys
-from collections.abc import Iterator
+from collections.abc import Generator
 from typing import IO, TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
@@ -76,13 +76,15 @@ def _make_bar(desc: str, out: IO[str], use_tqdm: bool) -> _Bar:
     return _AsciiBar(desc, out)
 
 
+# Settings go through con.sql(), which leaves the connection's current result
+# (what con.fetchall() reads) alone.
 def _bool_setting(con: Connection, name: str) -> bool:
-    row = con.execute(f"SELECT current_setting('{name}')").fetchone()
+    row = con.sql(f"SELECT current_setting('{name}')").fetchone()
     return bool(row[0]) if row is not None else False
 
 
 def _set_bool(con: Connection, name: str, value: bool) -> None:
-    con.execute(f"SET {name}={'true' if value else 'false'}")
+    con.sql(f"SET {name}={'true' if value else 'false'}")
 
 
 @contextlib.contextmanager
@@ -93,7 +95,7 @@ def progress_bar(
     interval: float = _DEFAULT_INTERVAL,
     out: IO[str] | None = None,
     use_tqdm: bool = True,
-) -> Iterator[Connection]:
+) -> Generator[Connection]:
     """Show query progress, using ``tqdm`` when available."""
     import threading
 

@@ -10,7 +10,7 @@ from ._core import Connection, Result, connect
 
 if TYPE_CHECKING:
     import jax
-    import mlx.core as mx  # ty: ignore[unresolved-import]
+    import mlx.core as mx
     import numpy as np
     import torch
 
@@ -180,7 +180,7 @@ def _gather(arr: Any, idx: Any, backend: Backend) -> Any:
 
         return arr[torch.as_tensor(idx, device=arr.device)]
     if backend == "mlx":
-        import mlx.core as mx  # ty: ignore[unresolved-import]
+        import mlx.core as mx
 
         return arr[mx.array(idx)]
     return arr[idx]  # numpy and jax both index with a host ndarray
@@ -197,7 +197,7 @@ def _stack(cols: list[Any], backend: Backend) -> Any:
 
         return torch.stack(cols, dim=1)
     if backend == "mlx":
-        import mlx.core as mx  # ty: ignore[unresolved-import]
+        import mlx.core as mx
 
         return mx.stack(cols, axis=1)
     import numpy as np
@@ -365,7 +365,7 @@ def _compile_sql(
     fields: dict[str, Field],
     drop_nulls: list[str] | None,
     split_spec: Split | None,
-) -> tuple[str, list[tuple[str, int, int]], str | None]:
+) -> tuple[str, list[tuple[str, int, int]]]:
     """Compile fields, filtering, splitting, and standardization into SQL."""
     if not fields:
         raise ValueError("at least one field is required")
@@ -401,7 +401,6 @@ def _compile_sql(
     raw_sql = f"SELECT *, {bucket_expr} AS _bucket FROM {from_clause}{null_filter}"
 
     needs_stats = any(spec.standardize for _, _, spec in columns)
-    train_check_sql: str | None = None
     if needs_stats:
         train_range = next((r for r in ranges if r[0] == "train"), None)
         if train_range is None:
@@ -419,10 +418,6 @@ def _compile_sql(
         stats_sql = f"SELECT {', '.join(stats_cols)} FROM raw WHERE {is_train}"
         ctes = f"WITH raw AS ({raw_sql}), stats AS ({stats_sql})"
         from_outer = "raw, stats"
-        # avg()/stddev_pop() over zero rows return NULL, which coalesce(nullif(std, 0), 1)
-        # below would treat as a constant column instead of an empty fold — silently
-        # NULL-ing every standardized value. Catch it explicitly instead.
-        train_check_sql = f"WITH raw AS ({raw_sql}) SELECT count(*) FROM raw WHERE {is_train}"
     else:
         ctes = f"WITH raw AS ({raw_sql})"
         from_outer = "raw"
@@ -445,7 +440,7 @@ def _compile_sql(
     select_items.append("CAST(_bucket AS BIGINT) AS _bucket")
 
     sql = f"{ctes} SELECT {', '.join(select_items)} FROM {from_outer}"
-    return sql, ranges, train_check_sql
+    return sql, ranges
 
 
 def _assemble_field(name: str, spec: Field, columns_data: dict[str, Any], backend: Backend) -> Any:
@@ -565,17 +560,11 @@ def dataset(
 
     field_specs = _normalize_fields(fields, columns, target)
 
-    sql, ranges, train_check_sql = _compile_sql(source, field_specs, drop_nulls, split)
+    sql, ranges = _compile_sql(source, field_specs, drop_nulls, split)
     own_connection = con is None
     if own_connection:
         con = connect()
     try:
-        if train_check_sql is not None and con.sql(train_check_sql).fetchitem() == 0:
-            raise ValueError(
-                "standardize=True requires at least one row in the 'train' fold "
-                "after filtering/splitting, but it's empty; widen the split, check "
-                "drop_nulls, or drop standardize=True"
-            )
         columns_data = _materialize(con.sql(sql), backend, device)
     finally:
         if own_connection:
@@ -584,6 +573,18 @@ def dataset(
     import numpy as np
 
     bucket = _bucket_to_host(columns_data.pop("_bucket"))
+    # avg()/stddev_pop() over an empty train fold return NULL, which the
+    # standardization would treat as a constant column instead of an empty fold.
+    # Checked here, on the materialized buckets, rather than with a second query
+    # that would read the source again.
+    if any(spec.standardize for _, _, spec in _iter_field_columns(field_specs)):
+        _, train_lo, train_hi = next(r for r in ranges if r[0] == "train")
+        if not np.any((bucket >= train_lo) & (bucket < train_hi)):
+            raise ValueError(
+                "standardize=True requires at least one row in the 'train' fold "
+                "after filtering/splitting, but it's empty; widen the split, check "
+                "drop_nulls, or drop standardize=True"
+            )
     assembled = {
         field_name: _assemble_field(field_name, spec, columns_data, backend)
         for field_name, spec in field_specs.items()
