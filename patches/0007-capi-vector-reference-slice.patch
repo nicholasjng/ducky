@@ -1,0 +1,55 @@
+Add duckdb_vector_reference_slice
+
+The C API can only window a vector through a selection vector
+(duckdb_slice_vector), which turns a flat vector into a dictionary. A table
+function that emits windows of a larger, already converted chunk (such as an
+Arrow scan over a big record batch) then hands out dictionary vectors, and any
+consumer that needs flat input copies them: an INSERT flattens every column.
+Vector::Slice(other, offset, end) already produces a zero-copy flat view for
+flat vectors (and slices strings, lists, structs, arrays, and dictionaries by
+type); expose it.
+
+Note for upstreaming: duckdb.h is generated from api_spec/v1 by capigen; this
+patch edits the generated header directly. An upstream PR must add YAML
+definitions and regenerate, plus tests.
+
+diff --git a/src/include/duckdb.h b/src/include/duckdb.h
+index a3fca84bfc2..5fbb0164d8a 100644
+--- a/src/include/duckdb.h
++++ b/src/include/duckdb.h
+@@ -10319,6 +10319,19 @@ DUCKDB_C_API void duckdb_vector_reference_value(duckdb_vector vector, duckdb_val
+ DUCKDB_C_API void duckdb_vector_reference_vector(duckdb_vector to_vector, duckdb_vector from_vector);
+ #endif
+ 
++/*!
++Changes `to_vector` to reference rows `[offset, offset + count)` of `from_vector`, without copying. Unlike slicing
++with a selection vector (`duckdb_slice_vector`), a flat vector stays flat: the result points into `from_vector`'s data,
++whose ownership it shares. `offset + count` must not exceed the size of `from_vector`.
++
++* @param to_vector The receiving vector, of the same type as `from_vector`.
++* @param from_vector The vector to reference.
++* @param offset The first row to reference.
++* @param count The number of rows to reference.
++*/
++DUCKDB_C_API void duckdb_vector_reference_slice(duckdb_vector to_vector, duckdb_vector from_vector, idx_t offset,
++                                                idx_t count);
++
+ #if DUCKDB_API_VERSION_AT_LEAST(0, 3, 3)
+ /*!
+  * Returns whether or not a row is valid (i.e. not NULL) in the given validity mask.
+diff --git a/src/main/capi/v1/data_chunk-c.cpp b/src/main/capi/v1/data_chunk-c.cpp
+index 327785206e1..dbcc2e1a7d9 100644
+--- a/src/main/capi/v1/data_chunk-c.cpp
++++ b/src/main/capi/v1/data_chunk-c.cpp
+@@ -313,3 +313,11 @@ void duckdb_vector_reference_vector(duckdb_vector to_vector, duckdb_vector from_
+ 	auto dfrom_vector = reinterpret_cast<duckdb::Vector *>(from_vector);
+ 	dto_vector->Reference(*dfrom_vector);
+ }
++
++void duckdb_vector_reference_slice(duckdb_vector to_vector, duckdb_vector from_vector, idx_t offset, idx_t count) {
++	auto dto_vector = reinterpret_cast<duckdb::Vector *>(to_vector);
++	auto dfrom_vector = reinterpret_cast<duckdb::Vector *>(from_vector);
++	// Reference checks that the types match; the slice then replaces the referenced buffer.
++	dto_vector->Reference(*dfrom_vector);
++	dto_vector->Slice(*dfrom_vector, offset, offset + count);
++}

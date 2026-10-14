@@ -1,0 +1,27 @@
+Skip the optimizer for EXECUTE of an already-planned statement
+
+Every execution of a prepared statement now runs as a generated EXECUTE
+statement (PreparedStatement::CreateExecuteStatement). Binding it yields a
+LogicalExecute that carries the prepared statement's optimized physical plan,
+yet Planner::Optimize still constructs an Optimizer and runs all built-in
+passes on it, because LogicalExecute inherits RequireOptimizer() == true. On
+small statements that was about a third of each execution, measured on main
+(an INSERT ... VALUES via executemany: 80 -> 59 us per row; SELECT ?+?: 45 ->
+33 us). Only a rebound plan, which LogicalExecute holds as its child, needs the
+optimizer; LogicalPrepare already defers to its child the same way.
+
+diff --git a/src/include/duckdb/planner/operator/logical_execute.hpp b/src/include/duckdb/planner/operator/logical_execute.hpp
+index 6e43e42378f..c493ea32e5b 100644
+--- a/src/include/duckdb/planner/operator/logical_execute.hpp
++++ b/src/include/duckdb/planner/operator/logical_execute.hpp
+@@ -31,6 +31,10 @@ public:
+ 	bool SupportSerialization() const override {
+ 		return false;
+ 	}
++	//! The prepared plan was optimized when it was prepared; only a rebound plan (the child) needs the optimizer
++	bool RequireOptimizer() const override {
++		return !children.empty() && children[0]->RequireOptimizer();
++	}
+ 
+ protected:
+ 	void ResolveTypes() override {

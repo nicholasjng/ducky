@@ -1,0 +1,41 @@
+Share one owner across all columns in duckdb_data_chunk_from_arrow
+
+duckdb_data_chunk_from_arrow moved the input ArrowArray into the first column's
+scan state and gave every other column a wrapper with a null release callback.
+Zero-copy columns keep their scan state's wrapper alive as vector auxiliary
+data, so the whole array's buffers were owned by column 0's vector alone: once
+that vector was released (e.g. a projection or a caller referencing a subset of
+the columns), the remaining columns pointed at freed Arrow buffers. Take
+ownership once and share the wrapper with every column.
+
+diff --git a/src/main/capi/v1/arrow-c.cpp b/src/main/capi/v1/arrow-c.cpp
+index 1586c181b0d..274e20ab755 100644
+--- a/src/main/capi/v1/arrow-c.cpp
++++ b/src/main/capi/v1/arrow-c.cpp
+@@ -141,17 +141,20 @@ duckdb_error_data duckdb_data_chunk_from_arrow(duckdb_connection connection, str
+ 
+ 	auto &arrow_types = arrow_table->GetColumns();
+ 	dchunk->SetChildCardinality(duckdb::NumericCast<idx_t>(arrow_array->length));
++	// Take ownership of the whole array once. Every column's buffers belong to it, so every column must keep the
++	// same owner alive: a per-column owner would let the first column's vector release the buffers that the other
++	// columns still reference.
++	auto owned_data = duckdb::make_shared_ptr<duckdb::ArrowArrayWrapper>();
++	owned_data->arrow_array = *arrow_array;
++	// We set it to nullptr to effectively transfer the ownership
++	arrow_array->release = nullptr;
+ 	for (idx_t i = 0; i < dchunk->ColumnCount(); i++) {
+-		auto &parent_array = *arrow_array;
++		auto &parent_array = owned_data->arrow_array;
+ 		auto &array = parent_array.children[i];
+ 		auto arrow_type = arrow_types.at(i);
+ 		auto array_physical_type = arrow_type->GetPhysicalType();
+ 		auto array_state = duckdb::make_uniq<duckdb::ArrowArrayScanState>(*conn->context);
+-		// We need to make sure that our chunk will hold the ownership
+-		array_state->owned_data = duckdb::make_shared_ptr<duckdb::ArrowArrayWrapper>();
+-		array_state->owned_data->arrow_array = *arrow_array;
+-		// We set it to nullptr to effectively transfer the ownership
+-		arrow_array->release = nullptr;
++		array_state->owned_data = owned_data;
+ 		try {
+ 			switch (array_physical_type) {
+ 			case duckdb::ArrowArrayPhysicalType::DICTIONARY_ENCODED:

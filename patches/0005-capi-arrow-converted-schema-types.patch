@@ -1,0 +1,74 @@
+Expose the column types of a converted Arrow schema
+
+duckdb_schema_from_arrow resolves every column's DuckDB type, but the C API
+offers no way to read them: a client had to convert a batch with
+duckdb_data_chunk_from_arrow and inspect its vectors, which consumes data and
+fails for a source without batches (an empty table). Add
+duckdb_arrow_converted_schema_column_count / _column_type, which return the
+resolved types directly.
+
+Note for upstreaming: duckdb.h is generated from api_spec/v1 by capigen; this
+patch edits the generated header directly. An upstream PR must add YAML
+definitions and regenerate, plus tests.
+
+diff --git a/src/include/duckdb.h b/src/include/duckdb.h
+index 9c4eed819de..a3fca84bfc2 100644
+--- a/src/include/duckdb.h
++++ b/src/include/duckdb.h
+@@ -2852,6 +2852,26 @@ DUCKDB_C_API duckdb_error_data duckdb_data_chunk_from_arrow(duckdb_connection co
+  */
+ DUCKDB_C_API void duckdb_destroy_arrow_converted_schema(duckdb_arrow_converted_schema *arrow_converted_schema);
+ 
++/*!
++Returns the number of columns of an Arrow schema converted with `duckdb_schema_from_arrow`.
++
++* @param converted_schema The converted schema.
++* @return The number of columns, or 0 if `converted_schema` is NULL.
++*/
++DUCKDB_C_API idx_t duckdb_arrow_converted_schema_column_count(duckdb_arrow_converted_schema converted_schema);
++
++/*!
++Returns the DuckDB logical type that column `index` of a converted Arrow schema is read as. This is the type
++`duckdb_data_chunk_from_arrow` produces for that column, available without converting any data (e.g. for a source
++that has no batches). The result must be destroyed with `duckdb_destroy_logical_type`.
++
++* @param converted_schema The converted schema.
++* @param index The column index.
++* @return The logical type, or NULL if `converted_schema` is NULL or `index` is out of range.
++*/
++DUCKDB_C_API duckdb_logical_type duckdb_arrow_converted_schema_column_type(duckdb_arrow_converted_schema converted_schema,
++                                                                          idx_t index);
++
+ /*!
+ Exposes an executed result in the Arrow format (from `duckdb_pending_prepared_arrow`) as an Arrow C stream interface
+ `ArrowArrayStream`. Ownership of the record batches moves into the stream, which also holds its own copy of the schema:
+diff --git a/src/main/capi/v1/arrow-c.cpp b/src/main/capi/v1/arrow-c.cpp
+index 274e20ab755..2ce1ace6973 100644
+--- a/src/main/capi/v1/arrow-c.cpp
++++ b/src/main/capi/v1/arrow-c.cpp
+@@ -188,6 +188,25 @@ duckdb_error_data duckdb_data_chunk_from_arrow(duckdb_connection connection, str
+ 	return nullptr;
+ }
+ 
++idx_t duckdb_arrow_converted_schema_column_count(duckdb_arrow_converted_schema converted_schema) {
++	if (!converted_schema) {
++		return 0;
++	}
++	return reinterpret_cast<duckdb::ArrowTableSchema *>(converted_schema)->GetTypes().size();
++}
++
++duckdb_logical_type duckdb_arrow_converted_schema_column_type(duckdb_arrow_converted_schema converted_schema,
++                                                              idx_t index) {
++	if (!converted_schema) {
++		return nullptr;
++	}
++	auto &types = reinterpret_cast<duckdb::ArrowTableSchema *>(converted_schema)->GetTypes();
++	if (index >= types.size()) {
++		return nullptr;
++	}
++	return reinterpret_cast<duckdb_logical_type>(new LogicalType(types[index]));
++}
++
+ void duckdb_destroy_arrow_converted_schema(duckdb_arrow_converted_schema *arrow_converted_schema) {
+ 	if (arrow_converted_schema && *arrow_converted_schema) {
+ 		auto converted_schema = reinterpret_cast<duckdb::ArrowTableSchema *>(*arrow_converted_schema);

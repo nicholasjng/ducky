@@ -1,0 +1,61 @@
+Add duckdb_column_is_generated to the table description API
+
+A table description lists every column, including generated (virtual) ones,
+while an appender only takes values for stored columns. Without a way to tell
+them apart, a client mapping column names to appender positions misaligns every
+column after a generated one. Expose ColumnDefinition::Generated() alongside
+duckdb_column_has_default.
+
+Note for upstreaming: duckdb.h is generated from api_spec/v1 by capigen; this
+patch edits the generated header directly. An upstream PR must add a YAML
+definition and regenerate, plus tests.
+
+diff --git a/src/include/duckdb.h b/src/include/duckdb.h
+index 509e08bad3d..9c4eed819de 100644
+--- a/src/include/duckdb.h
++++ b/src/include/duckdb.h
+@@ -7741,6 +7741,17 @@ DUCKDB_C_API const char *duckdb_table_description_error(duckdb_table_description
+  * @return duckdb_state
+  */
+ DUCKDB_C_API duckdb_state duckdb_column_has_default(duckdb_table_description table_description, idx_t index, bool *out);
++
++/*!
++ * Check if the column at 'index' index of the table is a generated column (`GENERATED ALWAYS AS ...`). Generated columns
++ * are computed, not stored: appenders do not take values for them.
++ *
++ * @param table_description The table_description to query.
++ * @param index The index of the column to query.
++ * @param out The out-parameter used to store the result.
++ * @return duckdb_state
++ */
++DUCKDB_C_API duckdb_state duckdb_column_is_generated(duckdb_table_description table_description, idx_t index, bool *out);
+ #endif
+ 
+ #if DUCKDB_API_VERSION_AT_LEAST(1, 5, 6)
+diff --git a/src/main/capi/v1/table_description-c.cpp b/src/main/capi/v1/table_description-c.cpp
+index e3040daa033..b49db07e0ea 100644
+--- a/src/main/capi/v1/table_description-c.cpp
++++ b/src/main/capi/v1/table_description-c.cpp
+@@ -97,6 +97,22 @@ duckdb_state duckdb_column_has_default(duckdb_table_description table_descriptio
+ 	return DuckDBSuccess;
+ }
+ 
++duckdb_state duckdb_column_is_generated(duckdb_table_description table_description, idx_t index, bool *out) {
++	auto wrapper = reinterpret_cast<TableDescriptionWrapper *>(table_description);
++	if (GetTableDescription(wrapper, index) == DuckDBError) {
++		return DuckDBError;
++	}
++	if (!out) {
++		wrapper->error = "Please provide a valid (non-null) 'out' variable";
++		return DuckDBError;
++	}
++
++	auto &table = wrapper->description;
++	auto &column = table->columns[index];
++	*out = column.Generated();
++	return DuckDBSuccess;
++}
++
+ idx_t duckdb_table_description_get_column_count(duckdb_table_description table_description) {
+ 	auto wrapper = reinterpret_cast<TableDescriptionWrapper *>(table_description);
+ 	if (GetTableDescription(wrapper, duckdb::optional_idx()) == DuckDBError) {
