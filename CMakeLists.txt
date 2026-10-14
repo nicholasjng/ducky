@@ -38,6 +38,13 @@ if(DUCKY_ASAN)
   add_link_options(-fsanitize=address)
 endif()
 
+# Keep symbol names for profilers and stack traces, at the cost of a larger
+# module. Sanitizer reports need them too.
+option(DUCKY_SYMBOLS "Keep symbol names in the extension module" OFF)
+if((DEFINED ENV{DUCKY_SYMBOLS} OR DUCKY_ASAN) AND NOT DUCKY_SYMBOLS)
+  set(DUCKY_SYMBOLS ON)
+endif()
+
 # Python + nanobind
 find_package(Python 3.11 REQUIRED COMPONENTS Interpreter Development.Module)
 
@@ -75,11 +82,13 @@ add_subdirectory(${DUCKDB_DIR} duckdb EXCLUDE_FROM_ALL)
 
 # The extension module
 # Opt into free-threaded Python and retain Release optimization for conversion loops.
+set(_ducky_module_options NB_STATIC FREE_THREADED NOMINSIZE)
+if(DUCKY_SYMBOLS)
+  list(APPEND _ducky_module_options NOSTRIP)
+endif()
 nanobind_add_module(
   _core
-  NB_STATIC
-  FREE_THREADED
-  NOMINSIZE
+  ${_ducky_module_options}
   src/cpp/ducky.cpp
   src/cpp/appender.cpp
   src/cpp/connection.cpp
@@ -91,22 +100,36 @@ nanobind_add_module(
   src/cpp/result.cpp)
 
 target_include_directories(_core PRIVATE ${DUCKDB_DIR}/src/include)
-target_link_libraries(_core PRIVATE duckdb_static tsl::robin_map)
 
-# Preserve DuckDB's generated extension loader through dead stripping.
-if(TARGET duckdb_generated_extension_loader)
-  target_link_libraries(
-    _core PRIVATE
-    "$<LINK_LIBRARY:WHOLE_ARCHIVE,duckdb_generated_extension_loader>")
-endif()
-foreach(ext IN LISTS DUCKDB_STATIC_EXTENSIONS)
-  if(TARGET ${ext}_extension)
-    target_link_libraries(_core PRIVATE ${ext}_extension)
-  endif()
-endforeach()
+# Link the extensions, plus the HTTP client and loadable-extension support that
+# INSTALL and LOAD need, ahead of DuckDB itself. DuckDB generates a loader that
+# registers them in this order, which is also their load order.
+set(DUCKDB_MODULE_BASE_DIR "${DUCKDB_DIR}")
+duckdb_link_extensions(
+  _core PRIVATE httplib loadable_extensions ${DUCKDB_STATIC_EXTENSIONS})
+target_link_libraries(_core PRIVATE duckdb_static tsl::robin_map)
 
 # Prevent dllimport annotations when statically linking on Windows.
 target_compile_definitions(_core PRIVATE DUCKDB_STATIC_BUILD)
+
+# Export only the module's init function. The statically linked DuckDB would
+# otherwise export its C++ symbols, and the loader binds another DuckDB in the
+# process (such as duckdb-python's) to ours: macOS coalesces weak definitions
+# across images, Linux unifies STB_GNU_UNIQUE ones. Loadable extensions do not
+# need the exports: DuckDB links each one against its own copy of DuckDB, unless
+# it was built with EXTENSION_STATIC_BUILD=OFF.
+if(APPLE)
+  target_link_options(_core PRIVATE "LINKER:-exported_symbol,_PyInit__core")
+  # Hidden symbols otherwise lose their names, even without stripping.
+  if(DUCKY_SYMBOLS)
+    target_link_options(_core PRIVATE "LINKER:-keep_private_externs")
+  endif()
+elseif(UNIX)
+  set(_ducky_exports "${CMAKE_CURRENT_BINARY_DIR}/_core.exports")
+  file(WRITE "${_ducky_exports}" "{ global: PyInit__core; local: *; };\n")
+  target_link_options(_core PRIVATE "LINKER:--version-script=${_ducky_exports}")
+  set_property(TARGET _core APPEND PROPERTY LINK_DEPENDS "${_ducky_exports}")
+endif()
 
 # Target flags let stub generation preload the ASAN runtime.
 if(DUCKY_ASAN)

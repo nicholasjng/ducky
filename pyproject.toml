@@ -48,7 +48,7 @@ mew-bench = { path = "../mew", editable = true }
 
 [tool.uv]
 exclude-newer = "1 week"
-exclude-newer-package = { nanobind = false, ruff = false, ty = false }
+exclude-newer-package = { nanobind = false, ruff = false, ty = false, scikit-build-core = false }
 # Keep contributor build tools available for CMake and stub targets.
 default-groups = ["build"]
 
@@ -59,6 +59,12 @@ wheel.packages = ["src/ducky"]
 cmake.version = ">=3.29"
 cmake.build-type = "Release"
 logging.level = "INFO"
+
+# Installing would strip the symbol names these builds keep (see CMakeLists.txt).
+[[tool.scikit-build.overrides]]
+if.any.env.DUCKY_SYMBOLS = true
+if.any.env.DUCKY_ASAN = true
+install.strip = false
 
 [[tool.dynamic-metadata]]
 provider = "scikit_build_core.metadata.regex"
