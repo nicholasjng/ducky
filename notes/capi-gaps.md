@@ -1,6 +1,6 @@
 # DuckDB API gaps for data loading and wrangling
 
-*Reviewed 2026-09-14 against DuckDB `625f75f`.*
+*Reviewed 2026-11-10 against DuckDB `77fa3df`.*
 
 This note tracks additions that would materially improve ducky's data-wrangling
 and ML data-loading workflows. It excludes extension-author APIs whose main use
@@ -51,26 +51,28 @@ projected columns, advertise cardinality when known, and allow independent
 partitions to run in parallel. This reduces Python calls and avoids constructing
 values for columns the query does not use.
 
-DuckDB's C++ `TableFunction` also has filter-pushdown hooks and complex-filter
-callbacks. The C API exposes projection pushdown but no equivalent filter
-callback. A C API addition would let Python data sources prune files, row
-groups, or remote requests before producing batches.
+C API v1 exposes projection pushdown but no filter pushdown. C API v2, which is
+unstable (see [capi-v2.md](capi-v2.md)), has a filter pushdown callback, and
+claim batch, order preservation, partition data, and stats callbacks that fit a
+parallel batch producer. Filter pushdown would let Python data sources prune
+files, row groups, or remote requests before producing batches.
 
-## Incremental Arrow registration
+## Parallel Arrow conversion
 
 **Available C API:** Arrow schema and batch conversion plus custom table
 functions.
 
-The registered Arrow scan drains the entire source during table-function
-initialization. That permits parallel, GIL-free reads after initialization, but
-removes backpressure and buffers an unbounded reader before the query can make
-progress.
+The registered Arrow scan pulls batches lazily, re-streams reusable sources on
+every execution, and refuses a second scan of a one-shot reader. Workers emit
+zero-copy windows of the current batch in parallel, but a single worker pulls
+and converts each batch while holding the scan's lock, so conversion does not
+overlap with production or with other conversions.
 
-Keep the buffered parallel mode and add a sequential incremental mode that owns
-one live stream and converts batches on demand. Registration should optionally
-take a callable that opens a fresh stream for each execution. This makes cached
-and prepared statements safely rescannable and supports remote or generated
-sources whose complete contents should never reside in memory.
+Convert outside the lock, keeping a bounded number of batches in flight, so
+wide or nested batches convert on several threads. A Python callable that opens
+a fresh stream for each execution would also make generated or remote sources
+rescannable without a reusable object. C API v2's claim batch callback and
+Arrow importer fit this design.
 
 ## Structured types and nested values
 
@@ -117,9 +119,10 @@ not support.
 - `duckdb_extract_statements` and `duckdb_prepare_extracted_statement` would
   support SQL scripts and statement-by-statement results. Useful for tooling,
   but peripheral to loaders.
-- `duckdb_appender_create_query`, `duckdb_appender_add_column`, and
-  `duckdb_append_value` could extend appender projections and nested rows. Arrow
-  ingestion already covers the important columnar path.
+- `duckdb_appender_create_query` and `duckdb_append_value` could extend
+  appender projections and nested rows. Arrow ingestion already covers the
+  important columnar path, and `append_columns` uses
+  `duckdb_appender_add_column` to give omitted columns their defaults.
 - External task-state APIs could let caller-owned threads participate in
   DuckDB's scheduler. A connection pool and DuckDB's internal workers are a
   simpler first solution for Python training code.
@@ -132,6 +135,6 @@ not support.
 1. Add `Database`, multiple connections, and a bounded pool.
 2. Build a streaming loader on separate pooled connections.
 3. Add stable split keys and slice unshuffled in-memory batches.
-4. Add batch-producing table functions and incremental Arrow sources.
+4. Add batch-producing table functions and parallel Arrow conversion.
 5. Expose structured logical types and nested parameter binding.
 6. Revisit filesystem registration after native extensions prove insufficient.

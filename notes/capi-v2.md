@@ -1,6 +1,6 @@
 # DuckDB C API v2
 
-*Reviewed 2026-09-14 against DuckDB `625f75f`.*
+*Reviewed 2026-11-10 against DuckDB `77fa3df`.*
 
 DuckDB C API v2 is a redesigned C interface in `duckdb_v2.h`. Its version is
 independent of the DuckDB engine version: a DuckDB 2.1 development build can
@@ -19,71 +19,89 @@ V2 applies one model across the API:
 - Resources are opaque handles with explicit destroy functions.
 - Calls return a categorized `DUCKDB_V2_ERROR` and can provide structured error
   information.
-- Strings are length-delimited views, so embedded NUL bytes are unambiguous.
+- Strings are length-delimited, so embedded NUL bytes are unambiguous.
 - An environment owns database creation and shared file-conflict detection.
 - Logical types, values, options, schemas, catalogs, functions, and filesystems
   use consistent handle and error conventions.
-- The stable surface is versioned independently, with separate switches for
-  deprecated and unstable additions.
 
 These changes mainly improve correctness, diagnostics, and maintainability.
 They do not make vector or chunk access inherently faster.
 
+## Stability
+
+Every v2 function is unstable. DuckDB PR #27410 ("Mark C API v2 unstable",
+2026-10-16) demoted the whole surface, which had been marked stable at v2.0.0,
+because it is still being worked on; the `v2.0-cyanoptera` release branch
+matches. Consumers must define `DUCKDB_V2_API_ALLOW_UNSTABLE=1` to see any
+declaration, and the surface keeps changing (`duckdb_v2_str` parameters were
+removed on 2026-11-05).
+
+Ducky statically links its pinned DuckDB revision, so it can compile against
+the unstable surface, but each pin bump may break v2 code. V1 remains supported
+and mature.
+
 ## Query and result ownership
 
-A v2 result is an incremental cursor over one connection. The caller advances
-it with the result step and chunk-fetch operations, then destroys it. While the
-result is live, the connection rejects another query with
-`DUCKDB_V2_ERROR_RESOURCE_IN_USE`.
+A v2 result is an incremental cursor over one connection. `result_step` runs a
+bounded unit of execution without blocking and reports `CHUNK`, `WAITING`,
+`FINISHED`, or `CANCELLED`; `result_wait` blocks until a step can make progress,
+and `result_fetch_chunk` and `result_drain` are blocking conveniences.
+Cancellation is a status rather than an error. While a result is live, the
+connection rejects another query with `DUCKDB_V2_ERROR_RESOURCE_IN_USE`.
 
-This contract fits ducky's asynchronous execution better than v1. Ducky can
-currently create several pending results on one connection; they interfere and
-usually leave only one query successful. V2 would turn that misuse into an
-immediate typed error. Actual concurrency would still require separate
-connections, preferably created by the shared `Database` and pool proposed in
+This fits ducky's asynchronous execution better than v1, which ducky drives
+with pending results, `execute_tasks` budgets, and a sleep backoff while workers
+own the remaining tasks. Actual concurrency still requires separate
+connections, created by the shared `Database` and pool proposed in
 [capi-gaps.md](capi-gaps.md).
-
-The unified result state machine also combines pending execution, streaming,
-cancellation, metadata, and finalization. Ducky currently composes these from
-several v1 APIs and carries patches for Arrow result collection and reusable
-chunk fetching.
 
 ## Relevant additions for ducky
 
-V2's environment and database ownership are a natural base for multiple
-connections. Its structured error codes could map to a useful Python exception
-hierarchy without parsing DuckDB messages.
+- **Arrow results.** `prepared_statement_execute_arrow` and
+  `statement_execute_arrow` take a rows-per-batch limit and produce Arrow arrays
+  through DuckDB's native Arrow result format. The result steps like a chunk
+  result and converts to an `ArrowArrayStream` with
+  `arrow_result_to_arrow_c_stream`. This covers what
+  `patches/0001-capi-arrow-collector.patch` adds to v1.
+- **Arrow importer and exporter.** An importer resolves a schema once and splits
+  long arrays into chunks of a given batch size, carrying short remainders into
+  the next array. It covers the windowing that `append_arrow` and the Arrow scan
+  build on `patches/0007-capi-vector-reference-slice.patch`.
+- **Table functions.** A claim batch callback hands work to threads one batch
+  at a time; `bind_set_order_preservation(NO_ORDER)` lets such a scan run in
+  parallel into results, INSERT, and COPY, and a partition data callback keeps
+  insertion order while running in parallel. A stats callback lets the
+  optimizer prune scans and answer `min()` and `max()`; a filter pushdown
+  callback lets the function inspect and accept the query's predicates.
+- **Instances and connections.** Environments, instances, and
+  `connection_create` support one database shared by several connections.
+- **Collections as statement inputs.** `statement_add_collection` exposes a
+  column data collection to one statement as a named common table expression,
+  read again on every execution. Collections support parallel append and scan.
+- **Type parsing.** `factory_create_type_from_text` parses SQL type text,
+  including nested, enum, and catalog types. It would replace `TypeParser`'s
+  `SELECT CAST(NULL AS ...)` query on a private connection.
+- **Smaller additions.** Typed query metrics (`connection_get_query_metrics`),
+  a thread-safe progress snapshot (`connection_progress_get`), scalar functions
+  whose return type depends on their arguments (a resolve types callback),
+  `vector_cast` and `value_cast` with SQL `CAST` and `TRY_CAST` semantics,
+  generated-column introspection (covered for v1 by
+  `patches/0004-capi-column-is-generated.patch`), multi-file reader functions,
+  and filesystem path helpers such as glob.
 
-The following areas also align with ducky's data-loading work:
+## Gaps
 
-- Column-data collections support parallel append and scan state.
-- Logical types and values cover nested data through one consistent interface.
-- Arrow import and export have explicit importer/exporter handles and ownership.
-- Function properties unify volatility, NULL behavior, fallibility, and other
-  planning metadata.
-- Typed database and connection options avoid constructing configuration SQL.
-- Filesystem handles expose configured storage with structured options and
-  errors.
-
-Some desired features remain absent or incomplete. In particular, C++ table
-functions have filter-pushdown hooks that v2 does not expose as a general C
-callback, and registering a Python-backed filesystem still needs a C++ adapter
-or a future C API.
-
-## Stability
-
-The generated `duckdb_v2.h` marks its normal surface stable at API v2.0.0 and
-hides unstable declarations unless explicitly enabled. Consumers can target an
-older v2 surface with version macros.
-
-The separate `duckdb_extension_v2.h` still warns that the extension ABI is
-guaranteed only for the matching DuckDB version. That matters most to loadable
-binary extensions. Ducky statically links its pinned DuckDB revision, so it does
-not need cross-version extension ABI compatibility, but it would still absorb
-changes whenever the pin advances.
-
-V1 remains supported and mature. V2 should currently be treated as a cleaner
-new foundation rather than a required upgrade.
+- V2 has no appender. `statement_add_collection` with `INSERT ... SELECT`
+  covers bulk columnar inserts, but not row-at-a-time appends or `DEFAULT`
+  handling.
+- `result_fetch_chunk` and `result_step` return a new chunk per call; nothing
+  fetches into a reused chunk as `patches/0002-capi-fetch-chunk-into.patch`
+  does for v1.
+- Vectors have no offset-and-count reference; zero-copy windows of a chunk need
+  the Arrow importer or a patch.
+- Registering a Python-backed filesystem still needs a C++ adapter.
+- V1 and v2 handles do not convert into each other, so both cannot share one
+  database instance.
 
 ## Migration cost
 
@@ -93,22 +111,20 @@ A complete migration would touch nearly every binding subsystem:
 - prepared, pending, and streaming query execution;
 - result, chunk, vector, type, and value conversion;
 - Arrow import and export;
-- appenders and Python UDF registration;
+- appenders, which v2 lacks, and Python UDF registration;
 - errors, progress, profiling, and extension loading;
-- both carried DuckDB patches.
+- the carried DuckDB patches.
 
-Mixing v1 and v2 temporarily is possible because DuckDB exports both symbol
-families, but sharing ownership across their handle types would require care.
-A narrow vertical prototype is safer than converting isolated helpers.
+DuckDB exports both symbol families, but without handle conversion a v2 path
+must own its database end to end. A narrow vertical prototype is safer than
+converting isolated helpers.
 
 ## Recommendation
 
-Keep the existing v1 implementation for now. It has broad coverage, established
-tests, and working optimized conversion paths.
+Keep the v1 implementation while v2 is unstable.
 
-Reassess v2 while designing shared databases and streaming loaders. Start with
-an experimental path that implements environment creation, database open,
-multiple connections, query execution, chunk fetching, cancellation, and
-cleanup. Benchmark it against the v1 path and verify error and lifetime behavior
-under sanitizers. If that core is simpler and stable across the next DuckDB pin,
-migrate the remaining binding surface in coherent subsystems.
+Prototype behind a flag where v2 removes code or a patch: Arrow results, which
+would retire patch 0001, and `result_step` for the asynchronous driver.
+Benchmark against the v1 path and verify error and lifetime behavior under
+sanitizers. Revisit batch-producing table functions once their callbacks
+stabilize; they are the largest functional gain.
