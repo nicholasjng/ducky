@@ -759,6 +759,11 @@ void Connection::close() {
 
 int Connection::gc_traverse(visitproc visit, void* arg) const {
     Py_VISIT(profile_sink_.ptr());
+    // The database owns its functions' callables. Only a sole owner of the
+    // database owns them, and only then can gc_clear free them by closing.
+    if (handle_ && handle_.use_count() == 1) {
+        for (const nb::object& obj : handle_->py_refs()) Py_VISIT(obj.ptr());
+    }
     // GC holds the GIL or stops all threads; taking mu could deadlock.
     if (arrow_registry_) {
         for (const auto& [name, source] : arrow_registry_->sources) {
@@ -770,6 +775,11 @@ int Connection::gc_traverse(visitproc visit, void* arg) const {
 }
 
 void Connection::gc_clear() {
+    if (handle_ && handle_.use_count() == 1) {
+        // Closing drops the database, and with it the callables it owns.
+        close();
+        return;
+    }
     if (arrow_registry_) {
         std::lock_guard<std::mutex> lock(arrow_registry_->mu);
         arrow_registry_->sources.clear();

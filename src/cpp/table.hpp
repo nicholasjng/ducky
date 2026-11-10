@@ -13,7 +13,7 @@ namespace nb = nanobind;
 class Connection;
 
 struct TableUDFContext {
-    nb::callable factory;
+    nb::handle factory;                            // kept alive by the DuckDBHandle
     std::vector<duckdb_logical_type> param_types;  // owned
     std::vector<std::string> col_names;
     std::vector<duckdb_logical_type> col_types;  // owned
@@ -31,7 +31,7 @@ struct TableUDFContext {
 };
 
 struct TableUDFBindData {
-    nb::callable factory;
+    nb::handle factory;  // borrowed from TableUDFContext
     nb::list python_args;
     std::vector<duckdb_type> col_type_ids;
     std::vector<std::string> col_names;

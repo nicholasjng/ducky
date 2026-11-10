@@ -128,8 +128,9 @@ std::string infer_return_type(nb::callable fn) {
 
 // Lives in DuckDB's extra_info slot; carries everything the trampoline needs.
 struct UDFContext {
-    nb::callable callable;       // owns the Python ref
-    nb::callable init_callable;  // optional per-worker-thread state factory
+    // Kept alive by the DuckDBHandle.
+    nb::handle callable;
+    nb::handle init_callable;  // optional per-worker-thread state factory
     // If non-empty: dict-style — callable receives one dict {name: ndarray}.
     // If empty: positional — callable receives ndarrays as positional args.
     std::vector<std::string> param_names;
@@ -361,7 +362,7 @@ void udf_trampoline(duckdb_function_info info, duckdb_data_chunk input, duckdb_v
 // ── Arrow UDF ────────────────────────────────────────────────────────────────
 
 struct ArrowUDFContext {
-    nb::callable callable;            // owns the Python ref
+    nb::handle callable;              // kept alive by the DuckDBHandle
     duckdb_connection con = nullptr;  // borrowed; valid while connection is open
     duckdb_arrow_options options = nullptr;
     std::vector<std::string> param_names;          // one entry per parameter
@@ -624,12 +625,12 @@ void create_scalar_function(Connection& con, const std::string& name, nb::callab
     if (!has_varargs && parameters.is_none()) parameters = infer_parameters(fn);
     std::string rt_name =
         return_type.is_none() ? infer_return_type(fn) : nb::cast<std::string>(return_type);
-    ctx->callable = std::move(fn);
+    ctx->callable = handle->keep(std::move(fn));
     ctx->return_type = &lookup(rt_name);
     ctx->special_handling = special_handling;
     if (!init.is_none()) {
         try {
-            ctx->init_callable = nb::cast<nb::callable>(init);
+            ctx->init_callable = handle->keep(nb::cast<nb::callable>(init));
         } catch (const nb::cast_error&) {
             throw DuckyError("ducky: UDF '" + name + "' init= must be a callable");
         }
@@ -694,7 +695,7 @@ void create_arrow_scalar_function(Connection& con, const std::string& name, nb::
     duckdb_connection raw = handle->connection;
     TypeParser types(handle->database, raw);
     auto ctx = std::make_unique<ArrowUDFContext>();
-    ctx->callable = std::move(fn);
+    ctx->callable = handle->keep(std::move(fn));
     ctx->con = raw;
     ctx->record_batch = record_batch;
     duckdb_connection_get_arrow_options(raw, &ctx->options);
