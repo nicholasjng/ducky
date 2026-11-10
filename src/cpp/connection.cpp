@@ -857,21 +857,26 @@ duckdb_prepared_statement Connection::statement_cache_checkout(const std::string
 }
 
 void Connection::statement_cache_checkin(const std::string& query, duckdb_prepared_statement stmt) {
+    // destroy_prepared releases the GIL, letting another thread use the cache:
+    // unlink entries before destroying their statements.
+    duckdb_prepared_statement replaced = nullptr;
     auto it = statement_cache_.find(query);
     if (it != statement_cache_.end()) {
         // Replace a concurrently returned copy.
-        destroy_prepared(it->second->stmt);
+        replaced = it->second->stmt;
         statement_lru_.erase(it->second);
         statement_cache_.erase(it);
     }
     statement_lru_.push_front(CachedStatement{query, stmt});
     statement_cache_.emplace(query, statement_lru_.begin());
+    duckdb_prepared_statement evicted = nullptr;
     if (statement_lru_.size() > kStatementCacheCapacity) {
-        CachedStatement& victim = statement_lru_.back();
-        destroy_prepared(victim.stmt);
-        statement_cache_.erase(victim.query);
+        evicted = statement_lru_.back().stmt;
+        statement_cache_.erase(statement_lru_.back().query);
         statement_lru_.pop_back();
     }
+    destroy_prepared(replaced);
+    destroy_prepared(evicted);
 }
 
 void Connection::statement_cache_clear() {
@@ -1127,12 +1132,14 @@ PreparedStatement::PreparedStatement(duckdb_prepared_statement stmt,
 
 PreparedStatement::~PreparedStatement() { destroy_prepared(stmt_); }
 
-void PreparedStatement::ensure_valid() const {
+std::unique_lock<std::mutex> PreparedStatement::lock_valid() const {
+    std::unique_lock<std::mutex> lock = lock_releasing_gil(mu_);
     if (!stmt_) throw DuckyError("ducky: prepared statement is closed");
+    return lock;
 }
 
 std::shared_ptr<Result> PreparedStatement::execute(nb::object parameters, bool streaming) {
-    ensure_valid();
+    auto lock = lock_valid();
     // Each execution starts unbound.
     if (duckdb_clear_bindings(stmt_) == DuckDBError) {
         throw DuckyError("ducky: failed to clear prepared-statement bindings");
@@ -1145,17 +1152,17 @@ std::shared_ptr<Result> PreparedStatement::execute(nb::object parameters, bool s
 }
 
 void PreparedStatement::executemany(nb::object seq) {
-    ensure_valid();
+    auto lock = lock_valid();
     executemany_loop(stmt_, seq);
 }
 
 int64_t PreparedStatement::num_parameters() const {
-    ensure_valid();
+    auto lock = lock_valid();
     return (int64_t)duckdb_nparams(stmt_);
 }
 
 nb::object PreparedStatement::parameter_name(int64_t index) const {
-    ensure_valid();
+    auto lock = lock_valid();
     const char* name = duckdb_parameter_name(stmt_, (idx_t)index);
     if (!name) return nb::none();
     nb::object out = nb::str(name);
@@ -1164,7 +1171,7 @@ nb::object PreparedStatement::parameter_name(int64_t index) const {
 }
 
 std::vector<std::string> PreparedStatement::column_names() const {
-    ensure_valid();
+    auto lock = lock_valid();
     idx_t n = duckdb_prepared_statement_column_count(stmt_);
     std::vector<std::string> out;
     out.reserve(n);
@@ -1177,7 +1184,7 @@ std::vector<std::string> PreparedStatement::column_names() const {
 }
 
 std::vector<std::string> PreparedStatement::column_types() const {
-    ensure_valid();
+    auto lock = lock_valid();
     idx_t n = duckdb_prepared_statement_column_count(stmt_);
     std::vector<std::string> out;
     out.reserve(n);
@@ -1188,11 +1195,12 @@ std::vector<std::string> PreparedStatement::column_types() const {
 }
 
 std::string PreparedStatement::statement_type() const {
-    ensure_valid();
+    auto lock = lock_valid();
     return duckdb_statement_type_name(duckdb_prepared_statement_type(stmt_));
 }
 
 void PreparedStatement::close() {
+    auto lock = lock_releasing_gil(mu_);
     destroy_prepared(stmt_);
     handle_.reset();
 }

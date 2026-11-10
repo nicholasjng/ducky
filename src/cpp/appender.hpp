@@ -4,6 +4,7 @@
 #include <tsl/robin_map.h>
 
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
@@ -45,7 +46,8 @@ class Appender {
     void close();
 
    private:
-    void ensure_open() const;
+    // Locks the appender and raises if it is closed.
+    std::unique_lock<std::mutex> lock_open();
     void check_state(duckdb_state state, const char* what);
 
     // Resolve a column name or throw.
@@ -60,4 +62,7 @@ class Appender {
     // Whether each column has a default expression.
     std::vector<bool> has_default_;
     std::shared_ptr<DuckDBHandle> connection_;
+    // Guards handle_. Appends and flushes run with the GIL released, so
+    // nb::lock_self alone doesn't keep close() out of them.
+    std::mutex mu_;
 };

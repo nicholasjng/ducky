@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import threading
+
 import pytest
 
 import ducky
@@ -109,3 +111,30 @@ def test_dataframe_path_on_prepared_result(con):
     stmt = con.prepare("SELECT ? AS a, ? AS b")
     df = stmt.execute([1, 2]).df()
     assert df.to_dict("list") == {"a": [1], "b": [2]}
+
+
+def test_close_waits_for_running_executemany(con):
+    # executemany releases the GIL per row; close() from another thread must
+    # wait for it rather than free the statement underneath it.
+    con.execute("CREATE TABLE t (a INT)")
+    stmt = con.prepare("INSERT INTO t VALUES (?)")
+    rows = [(i,) for i in range(20_000)]
+    started = threading.Event()
+    errors = []
+
+    def run():
+        started.set()
+        try:
+            stmt.executemany(rows)
+        except ducky.Error as e:  # close() won the race
+            errors.append(e)
+
+    t = threading.Thread(target=run)
+    t.start()
+    started.wait()
+    stmt.close()
+    t.join()
+    assert all("closed" in str(e) for e in errors)
+    with pytest.raises(ducky.Error, match="closed"):
+        stmt.execute([1])
+    assert con.execute("SELECT count(*) FROM t").fetchitem() in (0, len(rows))

@@ -1,5 +1,7 @@
 """Prepared-statement cache behavior."""
 
+import threading
+
 import pytest
 
 import ducky
@@ -91,3 +93,25 @@ def test_close_with_populated_cache(con):
     con.close()
     with pytest.raises(ducky.Error, match="closed"):
         con.execute("SELECT 1")
+
+
+def test_concurrent_eviction_keeps_cache_consistent(con):
+    # Evicting destroys a statement with the GIL released; other threads
+    # filling the cache meanwhile must not see it half-updated. Overlapping
+    # queries on one connection are refused, which is fine here.
+    errors = []
+
+    def worker(base):
+        for i in range(400):
+            try:
+                assert con.sql(f"SELECT {base + i}").fetchitem() == base + i
+            except ducky.Error as e:
+                if "Resource In Use" not in str(e):
+                    errors.append(e)
+
+    threads = [threading.Thread(target=worker, args=(k * 1000,)) for k in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert errors == []

@@ -377,6 +377,8 @@ struct ArrowUDFContext {
     // must not require pyarrow). Filled under the GIL by ensure_out_schema.
     nb::object out_schema;  // pa.Schema, one field
     nb::object out_type;    // that field's pa.DataType
+    // Workers can enter ensure_out_schema concurrently on free-threaded builds.
+    nb::ft_mutex out_schema_mu;
 
     ArrowUDFContext() = default;
     ArrowUDFContext(const ArrowUDFContext&) = delete;
@@ -406,6 +408,7 @@ struct ArrowPair {
 // Resolve `return_type` into the pa.Schema the output batch is exported with.
 // Cached on the context; called with the GIL held.
 void ensure_out_schema(ArrowUDFContext* ctx) {
+    nb::ft_lock_guard lock(ctx->out_schema_mu);
     if (ctx->out_type.is_valid()) return;
     ArrowSchema target{};
     const char* name = "x";

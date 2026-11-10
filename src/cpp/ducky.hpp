@@ -4,6 +4,7 @@
 #include <nanobind/nanobind.h>
 
 #include <atomic>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -61,6 +62,17 @@ class release_gil_if_held {
    private:
     PyThreadState* state_;
 };
+
+// Locks `mu`, waiting with the GIL released, so a holder that waits for the
+// GIL (or for DuckDB workers that need it) cannot deadlock with the waiter.
+inline std::unique_lock<std::mutex> lock_releasing_gil(std::mutex& mu) {
+    std::unique_lock<std::mutex> lock(mu, std::try_to_lock);
+    if (!lock.owns_lock()) {
+        release_gil_if_held release;
+        lock.lock();
+    }
+    return lock;
+}
 
 // Report callback exceptions through DuckDB instead of crossing the C ABI.
 template <typename Body, typename SetError>
