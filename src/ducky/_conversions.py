@@ -124,10 +124,9 @@ def pl(source: ArrowSource, lazy: bool = False) -> polars.DataFrame | polars.Laz
     """Return ``source`` as a polars ``DataFrame`` (or ``LazyFrame`` if ``lazy``)."""
     import polars
 
-    # polars.from_arrow is typed DataFrame | Series; an Arrow stream is always
-    # the DataFrame branch.
-    frame = polars.from_arrow(source)
-    assert isinstance(frame, polars.DataFrame)
+    # Not polars.from_arrow: since polars 2.0 it turns any non-pyarrow Arrow
+    # stream into a struct Series.
+    frame = polars.DataFrame(source)
     return frame.lazy() if lazy else frame
 
 
