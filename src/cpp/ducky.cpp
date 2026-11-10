@@ -60,9 +60,10 @@ void def_conversions(Cls& cls, Src src) {
         "fetchnumpy",
         [src](nb::object self) { return conversions().attr("fetchnumpy")(src(self)); },
         nb::sig("def fetchnumpy(self) -> dict[str, numpy.ndarray]"),
-        "Return the result as a dict of column name -> numpy array. Numeric and "
-        "temporal columns only; use arrow() for strings and nested types. NULLs become "
-        "NaN in FLOAT/DOUBLE columns and raise elsewhere.");
+        "Return the result as a dict of column name -> numpy array. Numeric and temporal columns\n"
+        "only; use arrow() for strings and nested types. NULLs become NaN in FLOAT/DOUBLE columns "
+        "and\n"
+        "raise elsewhere.");
     cls.def(
         "chunks", [src](nb::object self) { return conversions().attr("chunks")(src(self)); },
         nb::sig("def chunks(self) -> collections.abc.Iterator[Chunk]"),
@@ -218,8 +219,8 @@ NB_MODULE(_core, m) {
         .def("fetchall", &Result::fetchall, nb::sig("def fetchall(self) -> list[tuple]"),
              "Return all remaining rows.", nb::lock_self())
         .def("fetchitem", &Result::fetchitem, nb::sig("def fetchitem(self) -> typing.Any"),
-             "Return the lone scalar of a 1x1 result, for ``COUNT(*)``-style queries. "
-             "Raises :class:`Error` on any other shape.",
+             "Return the lone scalar of a 1x1 result, for ``COUNT(*)``-style queries. Raises\n"
+             ":class:`Error` on any other shape.",
              nb::lock_self())
         .def_prop_ro("rows_changed", &Result::rows_changed,
                      "Rows affected by INSERT, UPDATE, or DELETE; otherwise 0.", nb::lock_self())
@@ -231,9 +232,9 @@ NB_MODULE(_core, m) {
         .def("to_numpy", &Result::to_numpy, "columns"_a = nb::none(),
              nb::sig("def to_numpy(self, columns: collections.abc.Iterable[str] "
                      "| None = None) -> dict[str, numpy.ndarray]"),
-             "Drain the result into a {name: numpy.ndarray} dict. NULLs become NaN in "
-             "FLOAT/DOUBLE columns and raise elsewhere. Raises on VARCHAR/LIST/STRUCT/MAP; "
-             "use arrow() for those.",
+             "Drain the result into a {name: numpy.ndarray} dict. NULLs become NaN in FLOAT/DOUBLE "
+             "columns\n"
+             "and raise elsewhere. Raises on VARCHAR/LIST/STRUCT/MAP; use arrow() for those.",
              nb::lock_self())
         .def(
             "__arrow_c_stream__",
@@ -274,7 +275,7 @@ NB_MODULE(_core, m) {
         .def("append_columns", &Appender::append_columns, "columns"_a, "masks"_a = nb::none(),
              nb::sig("def append_columns(self, columns: dict[str, numpy.ndarray], "
                      "masks: dict[str, numpy.ndarray] | None = None) -> None"),
-             "Append equal-length numeric or temporal arrays with optional validity masks. "
+             "Append equal-length numeric or temporal arrays with optional validity masks.\n"
              "Missing columns take their DEFAULT, or NULL.",
              nb::lock_self())
         .def("append_arrow", &Appender::append_arrow, "source"_a,
@@ -359,13 +360,14 @@ NB_MODULE(_core, m) {
     nb::class_<Connection> conn_cls(m, "Connection", nb::type_slots(connection_slots),
                                     "A connection to a DuckDB database.");
     conn_cls
-        .def("execute", &Connection::execute, "query"_a, "parameters"_a = nb::none(),
-             "streaming"_a = false, nb::rv_policy::reference,
-             nb::sig("def execute(self, query: str, parameters: list | tuple | "
-                     "dict[str, typing.Any] | None = None, streaming: bool = False) -> Connection"),
-             "Execute one statement and retain its result for fetch methods. Streaming "
-             "results are single-pass. Returns ``self``.",
-             nb::lock_self())
+        .def(
+            "execute", &Connection::execute, "query"_a, "parameters"_a = nb::none(),
+            "streaming"_a = false, nb::rv_policy::reference,
+            nb::sig("def execute(self, query: str, parameters: list | tuple | "
+                    "dict[str, typing.Any] | None = None, streaming: bool = False) -> Connection"),
+            "Execute one statement and retain its result for fetch methods. Streaming results are\n"
+            "single-pass. Returns ``self``.",
+            nb::lock_self())
         .def("executemany", &Connection::executemany, "query"_a, "parameters"_a,
              nb::sig("def executemany(self, query: str, parameters: "
                      "collections.abc.Iterable[list | tuple | dict[str, typing.Any]]) -> None"),
@@ -478,8 +480,8 @@ NB_MODULE(_core, m) {
         "columns"_a = nb::none(),
         nb::sig("def to_numpy(self, columns: collections.abc.Iterable[str] | None = None) "
                 "-> dict[str, numpy.ndarray]"),
-        "Drain the latest result into a {name: numpy.ndarray} dict. "
-        "Raises on VARCHAR/LIST/STRUCT/MAP; use arrow() for those.");
+        "Drain the latest result into a {name: numpy.ndarray} dict. Raises on\n"
+        "VARCHAR/LIST/STRUCT/MAP; use arrow() for those.");
     conn_cls
         .def(
             "create_function",
@@ -498,9 +500,11 @@ NB_MODULE(_core, m) {
                     "varargs: str | None = None, "
                     "init: collections.abc.Callable[[], typing.Any] | None = None, "
                     "*, volatile: bool = False, special_handling: bool = False) -> None"),
-            "Register a chunk-wise NumPy scalar UDF. Types may be explicit or inferred. "
-            "Rows with a NULL argument are not passed to fn and yield NULL; with "
-            "special_handling, inputs and output use ``(values, validity)`` tuples instead.",
+            "Register a chunk-wise NumPy scalar UDF. Types may be explicit or inferred. Rows with "
+            "a NULL\n"
+            "argument are not passed to fn and yield NULL; with special_handling, inputs and "
+            "output use\n"
+            "``(values, validity)`` tuples instead.",
             nb::lock_self())
         .def(
             "create_arrow_function",
@@ -513,8 +517,9 @@ NB_MODULE(_core, m) {
             nb::sig("def create_arrow_function(self, name: str, fn: collections.abc.Callable, "
                     "parameters: list[str] | dict[str, str], return_type: str, "
                     "record_batch: bool = False) -> None"),
-            "Register an Arrow scalar UDF. The callable receives Arrow arrays, a named "
-            "array dict, or a RecordBatch, and returns an Arrow array.",
+            "Register an Arrow scalar UDF. The callable receives Arrow arrays, a named array dict, "
+            "or a\n"
+            "RecordBatch, and returns an Arrow array.",
             nb::lock_self())
         .def(
             "create_aggregate_function",
@@ -525,9 +530,10 @@ NB_MODULE(_core, m) {
             "name"_a, "cls"_a, "parameters"_a, "return_type"_a,
             nb::sig("def create_aggregate_function(self, name: str, cls: type, "
                     "parameters: list[str] | dict[str, str], return_type: str) -> None"),
-            "Register an aggregate class defining update, combine and finalize. Rows with "
-            "a NULL argument are skipped. combine(other) merges another partial state "
-            "into self without modifying other.",
+            "Register an aggregate class defining update, combine and finalize. Rows with a NULL "
+            "argument\n"
+            "are skipped. combine(other) merges another partial state into self without modifying "
+            "other.",
             nb::lock_self())
         .def(
             "create_table_function",
@@ -564,18 +570,20 @@ NB_MODULE(_core, m) {
              nb::sig("def set_profile_sink(self, sink: collections.abc.Callable[[str, "
                      "dict[str, typing.Any]], None] | None, *, sample: int = 1, "
                      "mode: str = 'standard') -> None"),
-             "Call ``sink(query, info)`` after every Nth materialized query. Pass None "
-             "to detach. Streaming queries are skipped.",
+             "Call ``sink(query, info)`` after every Nth materialized query. Pass None to detach.\n"
+             "Streaming queries are skipped.",
              nb::lock_self())
         .def("register_arrow", &Connection::register_arrow, "name"_a, "obj"_a,
              nb::sig("def register_arrow(self, name: str, obj: typing.Any) -> None"),
-             "Register an Arrow C stream source as table ``name`` (matched "
-             "case-insensitively). Tables and data frames are re-read by every query; "
-             "readers and query results are one-shot and can be scanned once.",
+             "Register an Arrow C stream source as table ``name`` (matched case-insensitively). "
+             "Tables and\n"
+             "data frames are re-read by every query; readers and query results are one-shot and "
+             "can be\n"
+             "scanned once.",
              nb::lock_self())
         .def("load_extension", &Connection::load_extension, "name"_a,
              nb::sig("def load_extension(self, name: str) -> None"),
-             "Load an extension by name or path. Unsigned extensions require "
+             "Load an extension by name or path. Unsigned extensions require\n"
              "allow_unsigned_extensions=True when connecting.",
              nb::lock_self())
         .def("close", &Connection::close, "Close the connection.", nb::lock_self())

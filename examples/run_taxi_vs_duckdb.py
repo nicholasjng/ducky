@@ -1,5 +1,5 @@
 # /// script
-# requires-python = ">=3.11"
+# requires-python = ">=3.12"
 # dependencies = []
 # ///
 """Compare ducky and duckdb-python on NYC Yellow Taxi data."""
@@ -49,7 +49,10 @@ def main() -> None:
 
     results = {name: _run(name, script, months) for name, script in SCRIPTS.items()}
 
-    header = f"{'engine':<15}{'rows':>10}{'load (s)':>10}{'train (s)':>11}{'total (s)':>11}{'val MAE (min)':>15}"
+    header = (
+        f"{'engine':<15}{'rows':>10}{'load (s)':>10}{'train (s)':>11}{'total (s)':>11}"
+        f"{'val MAE (min)':>15}"
+    )
     print(header)
     print("-" * len(header))
     for name, r in results.items():
@@ -65,7 +68,8 @@ def main() -> None:
     ratio = max(ducky_load, other_load) / min(ducky_load, other_load)
     print(f"\nData loading: {faster} was {ratio:.2f}x faster on this run.")
     print(
-        "(Both engines reach equivalent val MAE; training itself is identical code — see _taxi_common.py.)"
+        "(Both engines reach equivalent val MAE; training itself is identical code — "
+        "see _taxi_common.py.)"
     )
 
 

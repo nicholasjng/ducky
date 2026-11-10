@@ -1,11 +1,6 @@
 """ducky: tiny, fast nanobind bindings for DuckDB's C API."""
 
-import sys
-
-if sys.version_info >= (3, 12):
-    from typing import Unpack
-else:
-    from typing_extensions import Unpack
+from typing import Unpack
 
 from ._conversions import ArrowSource
 from ._core import (

@@ -153,9 +153,7 @@ def test_iter_batches_jax_yields_arrays(con):
 
     n = 5000
     res = con.sql(f"SELECT i FROM range({n}) t(i)")
-    arrays = []
-    for batch in res.iter_batches_jax():
-        arrays.append(batch["i"])
+    arrays = [batch["i"] for batch in res.iter_batches_jax()]
     combined = jnp.concatenate(arrays)
     np.testing.assert_array_equal(np.asarray(combined), np.arange(n))
 

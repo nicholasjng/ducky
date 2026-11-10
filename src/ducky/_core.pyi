@@ -79,7 +79,8 @@ class Result:
 
     def fetchitem(self) -> Any:
         """
-        Return the lone scalar of a 1x1 result, for ``COUNT(*)``-style queries. Raises :class:`Error` on any other shape.
+        Return the lone scalar of a 1x1 result, for ``COUNT(*)``-style queries. Raises
+        :class:`Error` on any other shape.
         """
 
     @property
@@ -94,7 +95,8 @@ class Result:
 
     def to_numpy(self, columns: Iterable[str] | None = None) -> dict[str, numpy.ndarray]:
         """
-        Drain the result into a {name: numpy.ndarray} dict. NULLs become NaN in FLOAT/DOUBLE columns and raise elsewhere. Raises on VARCHAR/LIST/STRUCT/MAP; use arrow() for those.
+        Drain the result into a {name: numpy.ndarray} dict. NULLs become NaN in FLOAT/DOUBLE columns
+        and raise elsewhere. Raises on VARCHAR/LIST/STRUCT/MAP; use arrow() for those.
         """
 
     def __arrow_c_stream__(self, requested_schema: Any = None) -> Any:
@@ -118,7 +120,9 @@ class Result:
 
     def fetchnumpy(self) -> dict[str, numpy.ndarray]:
         """
-        Return the result as a dict of column name -> numpy array. Numeric and temporal columns only; use arrow() for strings and nested types. NULLs become NaN in FLOAT/DOUBLE columns and raise elsewhere.
+        Return the result as a dict of column name -> numpy array. Numeric and temporal columns
+        only; use arrow() for strings and nested types. NULLs become NaN in FLOAT/DOUBLE columns and
+        raise elsewhere.
         """
 
     def chunks(self) -> Iterator[Chunk]:
@@ -188,7 +192,8 @@ class Appender:
         self, columns: dict[str, numpy.ndarray], masks: dict[str, numpy.ndarray] | None = None
     ) -> None:
         """
-        Append equal-length numeric or temporal arrays with optional validity masks. Missing columns take their DEFAULT, or NULL.
+        Append equal-length numeric or temporal arrays with optional validity masks.
+        Missing columns take their DEFAULT, or NULL.
         """
 
     def append_arrow(self, source: Any) -> None:
@@ -306,7 +311,8 @@ class Connection:
         streaming: bool = False,
     ) -> Connection:
         """
-        Execute one statement and retain its result for fetch methods. Streaming results are single-pass. Returns ``self``.
+        Execute one statement and retain its result for fetch methods. Streaming results are
+        single-pass. Returns ``self``.
         """
 
     def executemany(self, query: str, parameters: Iterable[list | tuple | dict[str, Any]]) -> None:
@@ -395,7 +401,9 @@ class Connection:
 
     def fetchnumpy(self) -> dict[str, numpy.ndarray]:
         """
-        Return the result as a dict of column name -> numpy array. Numeric and temporal columns only; use arrow() for strings and nested types. NULLs become NaN in FLOAT/DOUBLE columns and raise elsewhere.
+        Return the result as a dict of column name -> numpy array. Numeric and temporal columns
+        only; use arrow() for strings and nested types. NULLs become NaN in FLOAT/DOUBLE columns and
+        raise elsewhere.
         """
 
     def chunks(self) -> Iterator[Chunk]:
@@ -454,7 +462,8 @@ class Connection:
 
     def to_numpy(self, columns: Iterable[str] | None = None) -> dict[str, numpy.ndarray]:
         """
-        Drain the latest result into a {name: numpy.ndarray} dict. Raises on VARCHAR/LIST/STRUCT/MAP; use arrow() for those.
+        Drain the latest result into a {name: numpy.ndarray} dict. Raises on
+        VARCHAR/LIST/STRUCT/MAP; use arrow() for those.
         """
 
     def create_function(
@@ -470,7 +479,9 @@ class Connection:
         special_handling: bool = False,
     ) -> None:
         """
-        Register a chunk-wise NumPy scalar UDF. Types may be explicit or inferred. Rows with a NULL argument are not passed to fn and yield NULL; with special_handling, inputs and output use ``(values, validity)`` tuples instead.
+        Register a chunk-wise NumPy scalar UDF. Types may be explicit or inferred. Rows with a NULL
+        argument are not passed to fn and yield NULL; with special_handling, inputs and output use
+        ``(values, validity)`` tuples instead.
         """
 
     def create_arrow_function(
@@ -482,14 +493,16 @@ class Connection:
         record_batch: bool = False,
     ) -> None:
         """
-        Register an Arrow scalar UDF. The callable receives Arrow arrays, a named array dict, or a RecordBatch, and returns an Arrow array.
+        Register an Arrow scalar UDF. The callable receives Arrow arrays, a named array dict, or a
+        RecordBatch, and returns an Arrow array.
         """
 
     def create_aggregate_function(
         self, name: str, cls: type, parameters: list[str] | dict[str, str], return_type: str
     ) -> None:
         """
-        Register an aggregate class defining update, combine and finalize. Rows with a NULL argument are skipped. combine(other) merges another partial state into self without modifying other.
+        Register an aggregate class defining update, combine and finalize. Rows with a NULL argument
+        are skipped. combine(other) merges another partial state into self without modifying other.
         """
 
     def create_table_function(
@@ -521,17 +534,21 @@ class Connection:
         mode: str = "standard",
     ) -> None:
         """
-        Call ``sink(query, info)`` after every Nth materialized query. Pass None to detach. Streaming queries are skipped.
+        Call ``sink(query, info)`` after every Nth materialized query. Pass None to detach.
+        Streaming queries are skipped.
         """
 
     def register_arrow(self, name: str, obj: Any) -> None:
         """
-        Register an Arrow C stream source as table ``name`` (matched case-insensitively). Tables and data frames are re-read by every query; readers and query results are one-shot and can be scanned once.
+        Register an Arrow C stream source as table ``name`` (matched case-insensitively). Tables and
+        data frames are re-read by every query; readers and query results are one-shot and can be
+        scanned once.
         """
 
     def load_extension(self, name: str) -> None:
         """
-        Load an extension by name or path. Unsigned extensions require allow_unsigned_extensions=True when connecting.
+        Load an extension by name or path. Unsigned extensions require
+        allow_unsigned_extensions=True when connecting.
         """
 
     def close(self) -> None:

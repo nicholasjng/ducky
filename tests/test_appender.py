@@ -1,3 +1,5 @@
+import re
+
 import numpy as np
 import pytest
 
@@ -275,7 +277,10 @@ def test_appender_row_date_rejects_datetime(con):
     import datetime as dt
 
     con.execute("CREATE TABLE t (d DATE)")
-    with con.appender("t") as app, pytest.raises(ducky.Error, match="expected datetime.date"):
+    with (
+        con.appender("t") as app,
+        pytest.raises(ducky.Error, match=re.escape("expected datetime.date")),
+    ):
         app.append_row(dt.datetime(2024, 1, 2, 3, 4))
 
 

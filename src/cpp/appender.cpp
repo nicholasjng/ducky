@@ -361,10 +361,8 @@ Staged stage_value(duckdb_type t, nb::handle value, idx_t col, const std::string
     PyObject* raw = value.ptr();
     switch (t) {
         case DUCKDB_TYPE_BOOLEAN: {
-            // bool and numpy.bool_ (named bool_ before NumPy 2); integers are
-            // rejected rather than coerced.
-            std::string type = PyBool_Check(raw) ? "bool" : type_name_of(value);
-            if (type != "bool" && type != "bool_") {
+            // bool and numpy.bool; integers are rejected rather than coerced.
+            if (!PyBool_Check(raw) && type_name_of(value) != "bool") {
                 throw_value_error("expected bool, got " + type_name_of(value), t, col, name);
             }
             int truth = PyObject_IsTrue(raw);

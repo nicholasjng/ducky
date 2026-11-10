@@ -2,6 +2,7 @@
 
 import datetime
 import gc
+import re
 import subprocess
 import sys
 import weakref
@@ -85,7 +86,7 @@ def test_interval_large_seconds_decodes_exactly(con):
 
 
 def test_interval_months_beyond_timedelta_range_raises(con):
-    with pytest.raises(ducky.Error, match="overflows datetime.timedelta"):
+    with pytest.raises(ducky.Error, match=re.escape("overflows datetime.timedelta")):
         con.sql("SELECT INTERVAL '200000000' MONTHS").fetchone()
 
 
@@ -460,7 +461,8 @@ def test_second_drain_of_result_is_empty(con):
 def test_to_numpy_nulls(con):
     np = pytest.importorskip("numpy")
     out = con.sql("SELECT x FROM (VALUES (1.5::DOUBLE), (NULL)) t(x)").to_numpy()
-    assert out["x"][0] == 1.5 and np.isnan(out["x"][1])
+    assert out["x"][0] == 1.5
+    assert np.isnan(out["x"][1])
     with pytest.raises(ducky.Error, match="NULL"):
         con.sql("SELECT x FROM (VALUES (1), (NULL)) t(x)").to_numpy()
 
@@ -503,7 +505,8 @@ def test_decoding_newer_types(con):
     union = "UNION(num INT, str VARCHAR)"
     assert con.sql(f"SELECT union_value(str := 'x')::{union}").fetchitem() == "x"
     wkb = con.sql("SELECT 'POINT(1 2)'::GEOMETRY").fetchitem()
-    assert isinstance(wkb, bytes) and len(wkb) == 21
+    assert isinstance(wkb, bytes)
+    assert len(wkb) == 21
     assert con.sql("SELECT '1'::BIT, NULL").types == ["BIT", "NULL"]
 
 

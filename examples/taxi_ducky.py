@@ -1,5 +1,5 @@
 # /// script
-# requires-python = ">=3.11"
+# requires-python = ">=3.12"
 # dependencies = [
 #     "ducky",
 #     "jax>=0.10.1",
@@ -55,7 +55,8 @@ def main() -> None:
         con=con,
         backend="jax",
     )
-    assert ds.train is not None and ds.val is not None
+    assert ds.train is not None
+    assert ds.val is not None
     Xtr, ytr = ds.train.tensors()
     Xval, yval = ds.val.tensors()
     jax.block_until_ready((Xtr, ytr, Xval, yval))

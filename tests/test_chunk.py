@@ -46,7 +46,8 @@ def test_two_live_chunks_fall_back_without_pool_and_stay_independent(con):
     res = con.sql(f"SELECT i FROM range({n}) t(i)")
     chunk_a = res.fetch_chunk()
     chunk_b = res.fetch_chunk()  # pool is empty (chunk_a still live) -> fresh allocation
-    assert chunk_a is not None and chunk_b is not None
+    assert chunk_a is not None
+    assert chunk_b is not None
     a_values = chunk_a.column("i").copy()
     b_values = chunk_b.column("i").copy()
     np.testing.assert_array_equal(a_values, np.arange(0, 2048, dtype=np.int64))
@@ -83,7 +84,7 @@ def test_column_dtypes(con):
         "ubi": np.uint64,
         "f": np.float32,
         "d": np.float64,
-        "b": np.bool_,
+        "b": np.bool,
     }
     for name, dtype in expected.items():
         assert chunk.column(name).dtype == np.dtype(dtype), name
