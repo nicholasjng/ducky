@@ -1,6 +1,7 @@
 #pragma once
 
 #include <nanobind/nanobind.h>
+#include <nanobind/ndarray.h>
 #include <tsl/robin_map.h>
 
 #include <memory>
@@ -33,7 +34,8 @@ class Appender {
     // Append one row; ducky.DEFAULT selects the column default.
     void append_row(nb::args values);
 
-    // Append named arrays with optional validity masks.
+    // Append named arrays with optional validity masks. Columns left out take
+    // their DEFAULT, or NULL.
     void append_columns(nb::dict columns, nb::object masks);
 
     // Append a positionally and type-compatible Arrow stream or array.
@@ -48,6 +50,11 @@ class Appender {
    private:
     // Locks the appender and raises if it is closed.
     std::unique_lock<std::mutex> lock_open();
+    // Appends `n_rows` rows of the present columns through one reusable chunk.
+    void append_column_slices(const std::vector<idx_t>& present,
+                              const std::vector<nb::ndarray<nb::ro, nb::c_contig>>& arrays,
+                              const std::vector<nb::ndarray<nb::ro, nb::c_contig>>& masks,
+                              const std::vector<bool>& mask_present, int64_t n_rows);
     void check_state(duckdb_state state, const char* what);
 
     // Resolve a column name or throw.

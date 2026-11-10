@@ -43,6 +43,27 @@ def test_appender_columns_partial_fills_null(con):
     assert rows == [(0, None), (1, None), (2, None)]
 
 
+def test_appender_columns_partial_takes_defaults(con):
+    con.execute("CREATE SEQUENCE seq START 10")
+    con.execute(
+        "CREATE TABLE t (id BIGINT, k BIGINT DEFAULT nextval('seq'), note VARCHAR DEFAULT 'x', "
+        "score DOUBLE)"
+    )
+    with con.appender("t") as app:
+        app.append_row(-1, 1, "row", 0.5)
+        app.append_columns({"id": np.arange(3, dtype=np.int64)})
+        # The full column set is active again afterwards.
+        app.append_row(-2, 2, "row", 1.5)
+    rows = con.execute("SELECT * FROM t ORDER BY id").fetchall()
+    assert rows == [
+        (-2, 2, "row", 1.5),
+        (-1, 1, "row", 0.5),
+        (0, 10, "x", None),
+        (1, 11, "x", None),
+        (2, 12, "x", None),
+    ]
+
+
 def test_appender_arrow_large_batch_windows(con):
     pa = pytest.importorskip("pyarrow")
     con.execute("CREATE TABLE t (a BIGINT, s VARCHAR)")

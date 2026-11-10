@@ -188,7 +188,7 @@ class Appender:
         self, columns: dict[str, numpy.ndarray], masks: dict[str, numpy.ndarray] | None = None
     ) -> None:
         """
-        Append equal-length numeric or temporal arrays with optional validity masks. Missing columns become NULL.
+        Append equal-length numeric or temporal arrays with optional validity masks. Missing columns take their DEFAULT, or NULL.
         """
 
     def append_arrow(self, source: Any) -> None:
