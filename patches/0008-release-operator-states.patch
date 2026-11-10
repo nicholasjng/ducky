@@ -1,0 +1,87 @@
+Release operator states when a prepared statement's execution ends
+
+A prepared plan outlives its executions (a statement cache, an explicit
+prepared statement), and its operators keep the last execution's global sink
+and operator states until the plan is executed again or destroyed: a hash
+table, a sort, or the states of an aggregate. For a C-API aggregate whose
+states are Python objects, those objects then stay alive after the query
+finished, and a state that refers back to the client keeps it alive too. Drop
+the states when the statement ends, after its executor (and result collector)
+is gone, following EXECUTE into the prepared plan it runs.
+
+diff --git a/src/execution/physical_plan_generator.cpp b/src/execution/physical_plan_generator.cpp
+index 5f8c678e..fbe17dd4 100644
+--- a/src/execution/physical_plan_generator.cpp
++++ b/src/execution/physical_plan_generator.cpp
+@@ -1,5 +1,8 @@
+ #include "duckdb/execution/physical_plan_generator.hpp"
+ 
++#include "duckdb/execution/operator/helper/physical_execute.hpp"
++#include "duckdb/main/prepared_statement_data.hpp"
++
+ #include "duckdb/catalog/catalog_entry/scalar_function_catalog_entry.hpp"
+ #include "duckdb/common/types/column/column_data_collection.hpp"
+ #include "duckdb/execution/column_binding_resolver.hpp"
+@@ -15,6 +18,23 @@
+ 
+ namespace duckdb {
+ 
++void PhysicalPlan::ReleaseOperatorStates() {
++	for (auto &op : ops) {
++		auto &op_ref = op.get();
++		{
++			lock_guard<mutex> guard(op_ref.lock);
++			op_ref.sink_state.reset();
++			op_ref.op_state.reset();
++		}
++		if (op_ref.type == PhysicalOperatorType::EXECUTE) {
++			auto &execute = op_ref.Cast<PhysicalExecute>();
++			if (execute.prepared && execute.prepared->physical_plan) {
++				execute.prepared->physical_plan->ReleaseOperatorStates();
++			}
++		}
++	}
++}
++
+ PhysicalPlanGenerator::PhysicalPlanGenerator(ClientContext &context) : context(context) {
+ }
+ 
+diff --git a/src/include/duckdb/execution/physical_plan_generator.hpp b/src/include/duckdb/execution/physical_plan_generator.hpp
+index 4e88cb2d..dbf9c30a 100644
+--- a/src/include/duckdb/execution/physical_plan_generator.hpp
++++ b/src/include/duckdb/execution/physical_plan_generator.hpp
+@@ -67,6 +67,9 @@ public:
+ 	ArenaAllocator &ArenaRef() {
+ 		return arena;
+ 	}
++	//! Drop the global sink and operator states the last execution left in the operators, also in the plans that
++	//! EXECUTE operators run. Only while the plan is not executing
++	void ReleaseOperatorStates();
+ 
+ private:
+ 	//! The arena allocator storing the physical operator memory.
+diff --git a/src/main/client_context_execution.cpp b/src/main/client_context_execution.cpp
+index c1400b3c..77701d20 100644
+--- a/src/main/client_context_execution.cpp
++++ b/src/main/client_context_execution.cpp
+@@ -19,6 +19,7 @@
+ #include "duckdb/main/database_manager.hpp"
+ #include "duckdb/main/error_manager.hpp"
+ #include "duckdb/main/prepared_statement_data.hpp"
++#include "duckdb/execution/physical_plan_generator.hpp"
+ #include "duckdb/main/query_profiler.hpp"
+ #include "duckdb/main/query_result.hpp"
+ #include "duckdb/main/result_format.hpp"
+@@ -595,7 +596,11 @@ ErrorData ClientContext::EndStatementInternal(ClientContextLock &lock, optional_
+ 		active_query->executor.reset();
+ 	}
+ 	active_query->progress_bar.reset();
+-	// The plan outlives the executor
++	// The plan outlives the executor, and a prepared statement's outlives the statement: release what the execution
++	// left in its operators (a hash table, aggregate states) instead of keeping it until the plan runs again
++	if (active_query->prepared && active_query->prepared->physical_plan) {
++		active_query->prepared->physical_plan->ReleaseOperatorStates();
++	}
+ 	active_query->prepared.reset();
+ 	ErrorData end_error;
+ 	if (!active_query->statement_began) {

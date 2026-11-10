@@ -341,7 +341,7 @@ void create_table_function(Connection& con, const std::string& name, nb::callabl
     duckdb_connection raw = handle->connection;
     TypeParser types(handle->database, raw);
     auto ctx = std::make_unique<TableUDFContext>();
-    ctx->factory = factory;
+    ctx->factory = handle->keep(factory);
 
     // Parse parameter types.
     if (!nb::isinstance<nb::sequence>(parameters)) {

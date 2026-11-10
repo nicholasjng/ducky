@@ -244,7 +244,7 @@ void create_aggregate_function(Connection& con, const std::string& name, nb::obj
                          "frames and large GROUP BYs");
     }
     auto ctx = std::make_unique<AggregateUDFContext>();
-    ctx->cls = nb::cast<nb::callable>(cls);
+    ctx->cls = handle->keep(nb::cast<nb::callable>(cls));
     ctx->return_type = &lookup_typespec(return_type);
 
     if (nb::isinstance<nb::dict>(parameters)) {

@@ -12,7 +12,7 @@ namespace nb = nanobind;
 class Connection;
 
 struct AggregateUDFContext {
-    nb::callable cls;
+    nb::handle cls;  // kept alive by the DuckDBHandle
     std::vector<const TypeSpec*> param_types;
     const TypeSpec* return_type;
 };

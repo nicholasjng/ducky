@@ -811,6 +811,57 @@ async def test_concurrent_asql_on_one_connection(con):
     assert [r.fetchitem() for r in results] == [199999990000000, 2]
 
 
+@pytest.mark.parametrize("kind", ["scalar", "arrow", "aggregate", "table"])
+def test_udf_cycle_is_collectable(kind):
+    # See test_profile_sink_cycle_is_collectable: `con` must stay local to make().
+    if kind == "arrow":
+        pytest.importorskip("pyarrow")
+
+    def make():
+        con = ducky.connect()
+
+        def fn(x):
+            _ = con  # closes over the connection -> reference cycle
+            return x
+
+        class Agg:
+            def __init__(self):
+                self.con = con
+                self.total = 0
+
+            def update(self, x):
+                self.total += int(x.sum())
+
+            def combine(self, other):
+                self.total += other.total
+
+            def finalize(self):
+                return self.total
+
+        def rows(n):
+            _ = con
+            yield from ((i,) for i in range(n))
+
+        if kind == "scalar":
+            con.create_function("f", fn, ["BIGINT"], "BIGINT")
+            query, ref = "SELECT sum(f(i)) FROM range(10) t(i)", weakref.ref(fn)
+        elif kind == "arrow":
+            con.create_arrow_function("f", fn, ["BIGINT"], "BIGINT")
+            query, ref = "SELECT sum(f(i)) FROM range(10) t(i)", weakref.ref(fn)
+        elif kind == "aggregate":
+            con.create_aggregate_function("f", Agg, ["BIGINT"], "BIGINT")
+            query, ref = "SELECT f(i) FROM range(10) t(i)", weakref.ref(Agg)
+        else:
+            con.create_table_function("f", rows, ["BIGINT"], {"i": "BIGINT"})
+            query, ref = "SELECT sum(i) FROM f(10)", weakref.ref(rows)
+        assert con.sql(query).fetchitem() == 45
+        return ref
+
+    ref = make()
+    gc.collect()
+    assert ref() is None
+
+
 def test_nested_and_enum_rows_decode(con):
     con.execute("CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy')")
     rows = con.sql(
