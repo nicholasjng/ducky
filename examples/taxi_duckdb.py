@@ -1,5 +1,5 @@
 # /// script
-# requires-python = ">=3.11"
+# requires-python = ">=3.12"
 # dependencies = [
 #     "duckdb>=1.5",
 #     "jax>=0.10.1",

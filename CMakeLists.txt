@@ -46,7 +46,7 @@ if((DEFINED ENV{DUCKY_SYMBOLS} OR DUCKY_ASAN) AND NOT DUCKY_SYMBOLS)
 endif()
 
 # Python + nanobind
-find_package(Python 3.11 REQUIRED COMPONENTS Interpreter Development.Module)
+find_package(Python 3.12 REQUIRED COMPONENTS Interpreter Development.Module)
 
 execute_process(
   COMMAND "${Python_EXECUTABLE}" -m nanobind --cmake_dir

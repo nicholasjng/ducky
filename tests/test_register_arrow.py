@@ -102,7 +102,7 @@ def test_rejects_non_arrow(con) -> None:
     ["", "1bad", "has space", "with-dash", "drop;table"],
 )
 def test_rejects_bad_name(name: str, con) -> None:
-    with pytest.raises(Exception, match="(?i)(invalid|empty) table name"):
+    with pytest.raises(Exception, match=r"(?i)(invalid|empty) table name"):
         con.register_arrow(name, pa.Table.from_pydict({"x": [1]}))
 
 
@@ -151,5 +151,5 @@ def test_scan_joins_real_table(con) -> None:
 
 def test_unknown_table_still_errors(con) -> None:
     con.register_arrow("known", pa.table({"i": pa.array([1], pa.int64())}))
-    with pytest.raises(ducky.Error, match="(?i)nonexistent"):
+    with pytest.raises(ducky.Error, match=r"(?i)nonexistent"):
         con.sql("SELECT * FROM nonexistent").fetchall()

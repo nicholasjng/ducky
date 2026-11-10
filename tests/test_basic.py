@@ -33,7 +33,8 @@ def test_fetchall_spans_chunks_and_repeats(con):
     result = con.sql("SELECT * FROM range(5000) t(i)")
     rows = result.fetchall()
     assert len(rows) == 5000
-    assert rows[0] == (0,) and rows[-1] == (4999,)
+    assert rows[0] == (0,)
+    assert rows[-1] == (4999,)
     assert result.fetchall() == []
 
 

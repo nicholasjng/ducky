@@ -20,7 +20,7 @@ def test_prepare_execute_positional(con):
 def test_prepare_execute_does_not_reuse_omitted_parameters(con):
     stmt = con.prepare("SELECT ?::INTEGER")
     assert stmt.execute([7]).fetchitem() == 7
-    with pytest.raises(ducky.Error, match="[Pp]arameter"):
+    with pytest.raises(ducky.Error, match=r"[Pp]arameter"):
         stmt.execute()
 
 
@@ -51,7 +51,7 @@ def test_executemany_batched_insert(con):
 def test_prepared_executemany_does_not_reuse_short_row(con):
     con.execute("CREATE TABLE t(a INTEGER, b INTEGER)")
     stmt = con.prepare("INSERT INTO t VALUES (?, ?)")
-    with pytest.raises(ducky.Error, match="[Pp]arameter"):
+    with pytest.raises(ducky.Error, match=r"[Pp]arameter"):
         stmt.executemany([(1, 2), (3,)])
     assert con.sql("SELECT * FROM t").fetchall() == [(1, 2)]
 

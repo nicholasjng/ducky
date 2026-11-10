@@ -127,7 +127,7 @@ def test_nullable_output_uint8_mask(con):
 def test_nullable_output_bool_mask(con):
     con.create_function(
         "maybe",
-        lambda x: (x, (x > 0).astype(np.bool_)),
+        lambda x: (x, (x > 0).astype(np.bool)),
         parameters=["BIGINT"],
         return_type="BIGINT",
     )
@@ -203,7 +203,7 @@ def test_infer_only_parameters(con):
 def test_infer_bool(con):
 
     def isodd(x: int) -> bool:
-        return (x % 2 == 1).astype(np.bool_)  # ty: ignore[unresolved-attribute]
+        return (x % 2 == 1).astype(np.bool)  # ty: ignore[missing-attribute]
 
     con.create_function("isodd", isodd)
     rows = con.sql("SELECT isodd(i) FROM range(4) t(i) ORDER BY i").fetchall()
@@ -367,7 +367,8 @@ def test_special_handling_all_valid_mask(con):
         special_handling=True,
     )
     con.sql("SELECT echo(i) FROM range(8) t(i)").fetchall()
-    assert seen and (seen[0] == 1).all()
+    assert seen
+    assert (seen[0] == 1).all()
 
 
 def test_special_handling_dict_style(con):

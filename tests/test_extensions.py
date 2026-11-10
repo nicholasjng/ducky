@@ -66,7 +66,9 @@ def test_icu_statically_linked(con):
 
 @pytest.mark.skipif(
     not os.environ.get("DUCKY_EXT_BINARY"),
-    reason="set DUCKY_EXT_BINARY to a loadable .duckdb_extension built against ducky's pinned DuckDB",
+    reason=(
+        "set DUCKY_EXT_BINARY to a loadable .duckdb_extension built against ducky's pinned DuckDB"
+    ),
 )
 def test_load_external_unsigned_extension(con):
     # Integration test for a genuinely not-statically-linked extension. DuckDB's

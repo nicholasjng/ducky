@@ -185,7 +185,7 @@ void agg_finalize(duckdb_function_info info, duckdb_aggregate_state* source, duc
                 // Cast the returned scalar to the right C type and write it.
                 uint8_t* slot = out + (offset + i) * elem_size;
                 if (want.code == (uint8_t)nb::dlpack::dtype_code::Bool && want.bits == 8) {
-                    // Truthiness, so numpy.bool_ and other bool-like scalars work.
+                    // Truthiness, so numpy.bool and other bool-like scalars work.
                     int truth = PyObject_IsTrue(val.ptr());
                     if (truth < 0) throw nb::python_error();
                     *slot = truth ? 1 : 0;

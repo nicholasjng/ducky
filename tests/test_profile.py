@@ -16,7 +16,8 @@ def test_profile_snapshots_info_on_exit(con):
         con.execute("SELECT count(*) FROM range(1000)").fetchall()
     # Snapshot was taken before settings reset, so .info survives the with-block.
     assert p.info is not None
-    assert "metrics" in p.info and "children" in p.info
+    assert "metrics" in p.info
+    assert "children" in p.info
 
 
 def test_profile_restores_settings_after_block(con):
@@ -101,7 +102,8 @@ def test_profile_refresh_inside_block_overwrites_info(con):
         # Different queries produce distinct trees (SQL text differs in summary).
         first_summary = next((c for c in first["children"] if "sql" in c["metrics"]), None)
         second_summary = next((c for c in second["children"] if "sql" in c["metrics"]), None)
-        assert first_summary and second_summary
+        assert first_summary
+        assert second_summary
         assert first_summary["metrics"]["sql"] != second_summary["metrics"]["sql"]
 
 
@@ -144,7 +146,8 @@ def test_set_profile_sink_fires_per_query(con):
     assert sqls == ["SELECT 1", "SELECT count(*) FROM range(100) t(i)"]
     # Each record carries a real profiling tree.
     for _, info in captured:
-        assert "metrics" in info and "children" in info
+        assert "metrics" in info
+        assert "children" in info
 
 
 def test_set_profile_sink_sample_n(con):
@@ -189,7 +192,7 @@ def test_set_profile_sink_rejects_non_callable(con):
 
 
 def test_set_profile_sink_rejects_bad_mode(con):
-    with pytest.raises(ducky.Error, match="standard.*detailed"):
+    with pytest.raises(ducky.Error, match=r"standard.*detailed"):
         con.set_profile_sink(lambda _s, _i: None, mode="bogus")
 
 
@@ -203,7 +206,8 @@ def test_set_profile_sink_skips_streaming(con):
     con.execute("SELECT 1").fetchall()
     con.execute("SELECT 2 FROM range(10) t(i)", streaming=True).fetchall()
     con.execute("SELECT 3").fetchall()
-    assert "SELECT 1" in sqls and "SELECT 3" in sqls
+    assert "SELECT 1" in sqls
+    assert "SELECT 3" in sqls
     assert "SELECT 2 FROM range(10) t(i)" not in sqls
 
 

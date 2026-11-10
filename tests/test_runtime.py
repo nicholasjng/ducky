@@ -136,7 +136,8 @@ def test_interrupt_cancels_born_as_arrow_query():
     con.interrupt()
     t.join(timeout=10)
     assert not t.is_alive(), "born-as-Arrow query did not respond to interrupt within 10s"
-    assert err and isinstance(err[0], ducky.Error)
+    assert err
+    assert isinstance(err[0], ducky.Error)
     # Connection survives: a fresh collector query still runs.
     assert con.arrow("SELECT 1 AS x").column("x").to_pylist() == [1]
 

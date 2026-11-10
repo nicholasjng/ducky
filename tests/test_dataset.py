@@ -40,7 +40,9 @@ def test_named_three_way_split(csv_path):
         split=ducky.split({"train": 0.7, "val": 0.15, "test": 0.15}, seed=0),
     )
     assert set(ds.folds) == {"train", "val", "test"}
-    assert ds.train is not None and ds.val is not None and ds.test is not None
+    assert ds.train is not None
+    assert ds.val is not None
+    assert ds.test is not None
     assert ds.train.n_rows + ds.val.n_rows + ds.test.n_rows == 1000
 
 
@@ -224,7 +226,8 @@ def test_no_leak_train_stats_into_val(csv_path):
         target=ducky.target("y", dtype="i64"),
         split=split,
     )
-    assert raw.train is not None and raw.val is not None
+    assert raw.train is not None
+    assert raw.val is not None
     train_x = raw.train["X"][:, 0]
     val_x = raw.val["X"][:, 0]
     mean = train_x.mean()
@@ -236,7 +239,8 @@ def test_no_leak_train_stats_into_val(csv_path):
         target=ducky.target("y", dtype="i64"),
         split=split,
     )
-    assert ds.train is not None and ds.val is not None
+    assert ds.train is not None
+    assert ds.val is not None
     np.testing.assert_allclose(ds.train["X"][:, 0], (train_x - mean) / std, rtol=1e-4, atol=1e-4)
     np.testing.assert_allclose(ds.val["X"][:, 0], (val_x - mean) / std, rtol=1e-4, atol=1e-4)
 
@@ -362,7 +366,7 @@ def test_standardize_on_vector_field(weighted_csv_path):
 
 
 def test_fields_and_columns_mutually_exclusive(csv_path):
-    with pytest.raises(ValueError, match="either fields=|not both"):
+    with pytest.raises(ValueError, match=r"either fields=|not both"):
         ducky.dataset(
             csv_path,
             fields={"X": ducky.matrix({"x": ducky.feature("x")}), "y": ducky.vector("y")},
@@ -372,7 +376,7 @@ def test_fields_and_columns_mutually_exclusive(csv_path):
 
 
 def test_dataset_requires_some_spec(csv_path):
-    with pytest.raises(ValueError, match="fields=|columns="):
+    with pytest.raises(ValueError, match=r"fields=|columns="):
         ducky.dataset(csv_path)
 
 

@@ -1,5 +1,5 @@
 # FIX: pyarrow.compute's stub is apparently not very good.
-# ty: ignore[unresolved-attribute]
+# ty: ignore[missing-attribute]
 from decimal import Decimal
 
 import numpy as np

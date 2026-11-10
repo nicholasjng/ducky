@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Generic, Literal, Protocol, TypeVar, overload
+from typing import TYPE_CHECKING, Any, Literal, Protocol, overload
 
 from ._core import Connection, Result, connect
 
@@ -134,9 +134,6 @@ class AbstractArray(Protocol):
     def shape(self) -> tuple[int, ...]: ...
 
 
-ArrayT = TypeVar("ArrayT", bound=AbstractArray)
-
-
 def _materialize(result: Result, backend: Backend, device: Any) -> dict[str, Any]:
     """Drain ``result`` into backend arrays."""
     from . import _conversions as conv
@@ -206,7 +203,7 @@ def _stack(cols: list[Any], backend: Backend) -> Any:
 
 
 @dataclass
-class Fold(Generic[ArrayT]):
+class Fold[ArrayT: AbstractArray]:
     """Named arrays for one split; ``fold.Xy`` returns ``(fold.X, fold.y)``."""
 
     backend: Backend
@@ -275,7 +272,7 @@ class Fold(Generic[ArrayT]):
 
 
 @dataclass
-class Dataset(Generic[ArrayT]):
+class Dataset[ArrayT: AbstractArray]:
     """Backend arrays grouped into named folds."""
 
     folds: dict[str, Fold[ArrayT]]

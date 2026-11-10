@@ -18,7 +18,7 @@ def test_repeated_execute_returns_fresh_results(con):
 def test_parameters_do_not_leak_between_calls(con):
     assert con.execute("SELECT ?::INT", [1]).fetchone() == (1,)
     # A fresh prepare starts unbound; the cached statement must behave the same.
-    with pytest.raises(ducky.Error, match="[Pp]arameter"):
+    with pytest.raises(ducky.Error, match=r"[Pp]arameter"):
         con.execute("SELECT ?::INT")
 
 
@@ -58,7 +58,7 @@ def test_error_after_table_dropped(con):
 def test_failed_execution_does_not_poison_the_cache(con):
     con.execute("CREATE TABLE t (a INT PRIMARY KEY)")
     con.execute("INSERT INTO t VALUES (?)", [1])
-    with pytest.raises(ducky.Error, match="[Cc]onstraint"):
+    with pytest.raises(ducky.Error, match=r"[Cc]onstraint"):
         con.execute("INSERT INTO t VALUES (?)", [1])
     con.execute("INSERT INTO t VALUES (?)", [2])
     assert con.execute("SELECT count(*) FROM t").fetchitem() == 2
@@ -66,7 +66,7 @@ def test_failed_execution_does_not_poison_the_cache(con):
 
 def test_connection_executemany_does_not_reuse_missing_named_parameter(con):
     con.execute("CREATE TABLE t(a INTEGER, b INTEGER)")
-    with pytest.raises(ducky.Error, match="[Pp]arameter"):
+    with pytest.raises(ducky.Error, match=r"[Pp]arameter"):
         con.executemany("INSERT INTO t VALUES ($a, $b)", [{"a": 1, "b": 2}, {"a": 3}])
     assert con.sql("SELECT * FROM t").fetchall() == [(1, 2)]
 
