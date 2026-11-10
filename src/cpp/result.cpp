@@ -102,10 +102,15 @@ nb::object time_to_py(int64_t micros) {
     return steal_checked(PyTime_FromTime(s.hour, s.min, s.sec, s.micros));
 }
 
-nb::object time_tz_to_py(uint64_t bits) {
+// `timezones` caches one datetime.timezone per UTC offset.
+nb::object time_tz_to_py(uint64_t bits, tsl::robin_map<int32_t, nb::object>& timezones) {
     duckdb_time_tz_struct s = duckdb_from_time_tz(duckdb_time_tz{bits});
-    nb::object delta = steal_checked(PyDelta_FromDSU(0, s.offset, 0));
-    nb::object tz = py_types().timezone(delta);
+    auto it = timezones.find(s.offset);
+    if (it == timezones.end()) {
+        nb::object delta = steal_checked(PyDelta_FromDSU(0, s.offset, 0));
+        it = timezones.emplace(s.offset, py_types().timezone(delta)).first;
+    }
+    const nb::object& tz = it->second;
     return steal_checked(PyDateTimeAPI->Time_FromTime(
         s.time.hour, s.time.min, s.time.sec, s.time.micros, tz.ptr(), PyDateTimeAPI->TimeType));
 }
@@ -241,14 +246,14 @@ nb::object bignum_to_py(const duckdb_string_t& value) {
     return negative ? steal_checked(PyNumber_Negative(result.ptr())) : result;
 }
 
-nb::object convert_value(duckdb_vector vector, duckdb_logical_type logical, idx_t row);
+nb::object convert_value(CellDecoder& decoder, duckdb_vector vector, idx_t row);
 
-// Convert one cell using pre-resolved vector metadata.
-nb::object convert_cell(duckdb_type tid, duckdb_vector vector, duckdb_logical_type logical,
-                        void* data, uint64_t* validity, idx_t row) {
+// Convert one cell of `vector`, whose data and validity are passed in.
+nb::object convert_cell(CellDecoder& decoder, duckdb_vector vector, void* data, uint64_t* validity,
+                        idx_t row) {
     if (validity && !duckdb_validity_row_is_valid(validity, row)) return nb::none();
 
-    switch (tid) {
+    switch (decoder.type) {
         case DUCKDB_TYPE_BOOLEAN:
             return nb::cast(((bool*)data)[row]);
         case DUCKDB_TYPE_TINYINT:
@@ -276,8 +281,7 @@ nb::object convert_cell(duckdb_type tid, duckdb_vector vector, duckdb_logical_ty
         case DUCKDB_TYPE_DOUBLE:
             return nb::cast(((double*)data)[row]);
         case DUCKDB_TYPE_DECIMAL:
-            return decimal_to_py(data, row, duckdb_decimal_internal_type(logical),
-                                 duckdb_decimal_scale(logical));
+            return decimal_to_py(data, row, decoder.internal, decoder.scale);
         case DUCKDB_TYPE_VARCHAR: {
             auto* s = (duckdb_string_t*)data;
             return nb::str(duckdb_string_t_data(&s[row]), duckdb_string_t_length(s[row]));
@@ -298,7 +302,7 @@ nb::object convert_cell(duckdb_type tid, duckdb_vector vector, duckdb_logical_ty
         case DUCKDB_TYPE_TIME_NS:
             return time_to_py(floor_div(((int64_t*)data)[row], 1000));
         case DUCKDB_TYPE_TIME_TZ:
-            return time_tz_to_py(((uint64_t*)data)[row]);
+            return time_tz_to_py(((uint64_t*)data)[row], decoder.timezones);
         case DUCKDB_TYPE_TIMESTAMP:
             return timestamp_to_py(((int64_t*)data)[row], false);
         case DUCKDB_TYPE_TIMESTAMP_TZ:
@@ -322,44 +326,43 @@ nb::object convert_cell(duckdb_type tid, duckdb_vector vector, duckdb_logical_ty
         case DUCKDB_TYPE_SQLNULL:
             return nb::none();
         case DUCKDB_TYPE_ENUM: {
-            idx_t index = enum_index(data, row, duckdb_enum_internal_type(logical));
-            char* value = duckdb_enum_dictionary_value(logical, index);
-            nb::str out(value);
-            duckdb_free(value);
-            return out;
+            idx_t index = enum_index(data, row, decoder.internal);
+            if (index >= decoder.enum_values.size()) {
+                throw DuckyError("ducky: ENUM index out of range");
+            }
+            return decoder.enum_values[index];
         }
         case DUCKDB_TYPE_LIST: {
             duckdb_list_entry entry = ((duckdb_list_entry*)data)[row];
             duckdb_vector child = duckdb_list_vector_get_child(vector);
-            duckdb_logical_type child_type = duckdb_vector_get_column_type(child);
-            nb::list items;
+            void* child_data = duckdb_vector_get_data(child);
+            uint64_t* child_validity = duckdb_vector_get_validity(child);
+            nb::object items = steal_checked(PyList_New((Py_ssize_t)entry.length));
             for (idx_t k = 0; k < entry.length; ++k) {
-                items.append(convert_value(child, child_type, entry.offset + k));
+                nb::object item = convert_cell(decoder.children[0], child, child_data,
+                                               child_validity, entry.offset + k);
+                PyList_SET_ITEM(items.ptr(), (Py_ssize_t)k, item.release().ptr());
             }
-            duckdb_destroy_logical_type(&child_type);
             return items;
         }
         case DUCKDB_TYPE_ARRAY: {
-            idx_t size = duckdb_array_type_array_size(logical);
+            idx_t size = decoder.array_size;
             duckdb_vector child = duckdb_array_vector_get_child(vector);
-            duckdb_logical_type child_type = duckdb_vector_get_column_type(child);
-            nb::list items;
+            void* child_data = duckdb_vector_get_data(child);
+            uint64_t* child_validity = duckdb_vector_get_validity(child);
+            nb::object items = steal_checked(PyList_New((Py_ssize_t)size));
             for (idx_t k = 0; k < size; ++k) {
-                items.append(convert_value(child, child_type, row * size + k));
+                nb::object item = convert_cell(decoder.children[0], child, child_data,
+                                               child_validity, row * size + k);
+                PyList_SET_ITEM(items.ptr(), (Py_ssize_t)k, item.release().ptr());
             }
-            duckdb_destroy_logical_type(&child_type);
             return items;
         }
         case DUCKDB_TYPE_STRUCT: {
-            idx_t n = duckdb_struct_type_child_count(logical);
             nb::dict fields;
-            for (idx_t c = 0; c < n; ++c) {
-                char* name = duckdb_struct_type_child_name(logical, c);
+            for (idx_t c = 0; c < (idx_t)decoder.children.size(); ++c) {
                 duckdb_vector child = duckdb_struct_vector_get_child(vector, c);
-                duckdb_logical_type child_type = duckdb_vector_get_column_type(child);
-                fields[nb::str(name)] = convert_value(child, child_type, row);
-                duckdb_destroy_logical_type(&child_type);
-                duckdb_free(name);
+                fields[decoder.names[c]] = convert_value(decoder.children[c], child, row);
             }
             return fields;
         }
@@ -368,11 +371,9 @@ nb::object convert_cell(duckdb_type tid, duckdb_vector vector, duckdb_logical_ty
             // the value is the member the tag selects.
             duckdb_vector tags = duckdb_struct_vector_get_child(vector, 0);
             uint8_t tag = ((uint8_t*)duckdb_vector_get_data(tags))[row];
+            if (tag >= decoder.children.size()) throw DuckyError("ducky: UNION tag out of range");
             duckdb_vector member = duckdb_struct_vector_get_child(vector, (idx_t)tag + 1);
-            duckdb_logical_type member_type = duckdb_union_type_member_type(logical, tag);
-            nb::object out = convert_value(member, member_type, row);
-            duckdb_destroy_logical_type(&member_type);
-            return out;
+            return convert_value(decoder.children[tag], member, row);
         }
         case DUCKDB_TYPE_MAP: {
             // Physical layout: LIST(STRUCT(key, value)).
@@ -380,15 +381,17 @@ nb::object convert_cell(duckdb_type tid, duckdb_vector vector, duckdb_logical_ty
             duckdb_vector pairs = duckdb_list_vector_get_child(vector);
             duckdb_vector keys = duckdb_struct_vector_get_child(pairs, 0);
             duckdb_vector values = duckdb_struct_vector_get_child(pairs, 1);
-            duckdb_logical_type key_type = duckdb_vector_get_column_type(keys);
-            duckdb_logical_type value_type = duckdb_vector_get_column_type(values);
+            void* key_data = duckdb_vector_get_data(keys);
+            uint64_t* key_validity = duckdb_vector_get_validity(keys);
+            void* value_data = duckdb_vector_get_data(values);
+            uint64_t* value_validity = duckdb_vector_get_validity(values);
             nb::dict mapping;
             for (idx_t k = 0; k < entry.length; ++k) {
-                mapping[convert_value(keys, key_type, entry.offset + k)] =
-                    convert_value(values, value_type, entry.offset + k);
+                mapping[convert_cell(decoder.children[0], keys, key_data, key_validity,
+                                     entry.offset + k)] =
+                    convert_cell(decoder.children[1], values, value_data, value_validity,
+                                 entry.offset + k);
             }
-            duckdb_destroy_logical_type(&key_type);
-            duckdb_destroy_logical_type(&value_type);
             return mapping;
         }
         case DUCKDB_TYPE_VARIANT:
@@ -396,15 +399,15 @@ nb::object convert_cell(duckdb_type tid, duckdb_vector vector, duckdb_logical_ty
                 "ducky: VARIANT values are not decoded to Python; cast the column (e.g. "
                 "CAST(v AS JSON) or v::VARCHAR) or use .arrow()");
         default:
-            throw DuckyError(std::string("ducky: column type ") + duckdb_type_name(tid) +
+            throw DuckyError(std::string("ducky: column type ") + duckdb_type_name(decoder.type) +
                              " is not decoded yet");
     }
 }
 
-// Resolve vector metadata and convert one nested cell.
-nb::object convert_value(duckdb_vector vector, duckdb_logical_type logical, idx_t row) {
-    return convert_cell(duckdb_get_type_id(logical), vector, logical,
-                        duckdb_vector_get_data(vector), duckdb_vector_get_validity(vector), row);
+// Convert one cell of `vector`, resolving its data and validity.
+nb::object convert_value(CellDecoder& decoder, duckdb_vector vector, idx_t row) {
+    return convert_cell(decoder, vector, duckdb_vector_get_data(vector),
+                        duckdb_vector_get_validity(vector), row);
 }
 
 // Return the byte width when DuckDB and Arrow layouts match, otherwise 0.
@@ -548,7 +551,17 @@ void mark_nulls(FastBatch* b, uint8_t*& validity, size_t valid_bytes, uint64_t* 
         validity = (uint8_t*)b->alloc(valid_bytes);
         std::memset(validity, 0xFF, valid_bytes);  // start all-valid
     }
-    for (idx_t r = 0; r < sz; ++r) {
+    idx_t r = 0;
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    // DuckDB's mask is LSB-first uint64 words, so on little-endian machines
+    // its bytes are Arrow bitmap bytes: copy the whole ones (every chunk but
+    // a short last one starts byte-aligned).
+    if (row_off % 8 == 0) {
+        r = sz / 8 * 8;
+        std::memcpy(validity + row_off / 8, val, r / 8);
+    }
+#endif
+    for (; r < sz; ++r) {
         if (!duckdb_validity_row_is_valid(val, r)) {
             size_t bit = row_off + r;
             validity[bit / 8] &= (uint8_t)~(1u << (bit % 8));
@@ -729,6 +742,66 @@ void stream_capsule_destructor(PyObject* capsule) {
 }
 
 }  // namespace
+
+CellDecoder::CellDecoder(duckdb_logical_type logical) : type(duckdb_get_type_id(logical)) {
+    // Decode a child type, which the C API hands out owned.
+    auto add_child = [this](duckdb_logical_type child) {
+        try {
+            children.emplace_back(child);
+        } catch (...) {
+            duckdb_destroy_logical_type(&child);
+            throw;
+        }
+        duckdb_destroy_logical_type(&child);
+    };
+    switch (type) {
+        case DUCKDB_TYPE_DECIMAL:
+            internal = duckdb_decimal_internal_type(logical);
+            scale = duckdb_decimal_scale(logical);
+            break;
+        case DUCKDB_TYPE_ENUM: {
+            internal = duckdb_enum_internal_type(logical);
+            uint32_t n = duckdb_enum_dictionary_size(logical);
+            enum_values.reserve(n);
+            for (uint32_t i = 0; i < n; ++i) {
+                char* value = duckdb_enum_dictionary_value(logical, i);
+                nb::str out(value);
+                duckdb_free(value);
+                enum_values.push_back(std::move(out));
+            }
+            break;
+        }
+        case DUCKDB_TYPE_LIST:
+            add_child(duckdb_list_type_child_type(logical));
+            break;
+        case DUCKDB_TYPE_ARRAY:
+            array_size = duckdb_array_type_array_size(logical);
+            add_child(duckdb_array_type_child_type(logical));
+            break;
+        case DUCKDB_TYPE_STRUCT: {
+            idx_t n = duckdb_struct_type_child_count(logical);
+            for (idx_t i = 0; i < n; ++i) {
+                char* name = duckdb_struct_type_child_name(logical, i);
+                nb::str out(name);
+                duckdb_free(name);
+                names.push_back(std::move(out));
+                add_child(duckdb_struct_type_child_type(logical, i));
+            }
+            break;
+        }
+        case DUCKDB_TYPE_MAP:
+            add_child(duckdb_map_type_key_type(logical));
+            add_child(duckdb_map_type_value_type(logical));
+            break;
+        case DUCKDB_TYPE_UNION: {
+            idx_t n = duckdb_union_type_member_count(logical);
+            for (idx_t i = 0; i < n; ++i) add_child(duckdb_union_type_member_type(logical, i));
+            break;
+        }
+        default:
+            break;
+    }
+}
 
 duckdb_data_chunk make_result_chunk(duckdb_result* result) {
     idx_t n = duckdb_column_count(result);
@@ -924,16 +997,23 @@ bool Result::ensure_row() {
     return true;
 }
 
+void Result::ensure_decoders() {
+    if (decoders_.size() == column_count_) return;
+    decoders_.clear();
+    decoders_.reserve(column_count_);
+    for (duckdb_logical_type logical : column_types_) decoders_.emplace_back(logical);
+}
+
 // Requires the cursor lock.
 nb::object Result::build_row() {
+    ensure_decoders();
     idx_t row = cursor_++;
     rows_returned_++;
     // Own the partial tuple across conversion errors.
     nb::object tuple = steal_checked(PyTuple_New((Py_ssize_t)column_count_));
     for (idx_t c = 0; c < column_count_; ++c) {
         const ColumnCursor& cur = cursors_[c];
-        nb::object value =
-            convert_cell(types_[c], cur.vector, column_types_[c], cur.data, cur.validity, row);
+        nb::object value = convert_cell(decoders_[c], cur.vector, cur.data, cur.validity, row);
         PyTuple_SET_ITEM(tuple.ptr(), (Py_ssize_t)c, value.release().ptr());
     }
     return tuple;
@@ -987,11 +1067,11 @@ nb::object Result::fetchitem() {
     }
     // Decode then confirm no second row remains. value is materialized, so it
     // survives the chunk release that the follow-up ensure_row() may trigger.
+    ensure_decoders();
     idx_t row = cursor_++;
     rows_returned_++;
     const ColumnCursor& cur = cursors_[0];
-    nb::object value =
-        convert_cell(types_[0], cur.vector, column_types_[0], cur.data, cur.validity, row);
+    nb::object value = convert_cell(decoders_[0], cur.vector, cur.data, cur.validity, row);
     if (ensure_row()) {
         throw DuckyError("ducky: fetchitem() requires exactly 1 row; the result has more");
     }

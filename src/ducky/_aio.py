@@ -38,23 +38,26 @@ async def _connection_turn(con: Connection) -> AsyncGenerator[None]:
             del _connection_locks[key]
 
 
+# Seconds of executor work per thread hop: long enough that the hop's cost is
+# negligible, short enough to resurface promptly for cancellation.
+_TICK_BUDGET = 0.005
+
+
 async def _drive(pending: PendingResult) -> Result:
     """Step ``pending`` to completion on the event loop, returning its result."""
-    no_tasks_streak = 0
     try:
         while True:
-            state = await asyncio.to_thread(pending.execute_task)
+            state = await asyncio.to_thread(pending.execute_tasks, _TICK_BUDGET)
             if state == PendingState.READY:
                 return pending.materialize()
             if state == PendingState.ERROR:
                 raise Error(pending.error())
-            if state == PendingState.NO_TASKS:
-                # Back off after repeated no-op ticks.
-                no_tasks_streak += 1
-                await asyncio.sleep(0 if no_tasks_streak < 4 else 0.001)
-            else:
-                no_tasks_streak = 0
-    except (asyncio.CancelledError, KeyboardInterrupt):
+    except asyncio.CancelledError:
+        # Drain off the event loop: it waits for the workers to stop. Shielded,
+        # so a repeated cancellation can't abandon it half-way.
+        await asyncio.shield(asyncio.to_thread(pending.drain))
+        raise
+    except KeyboardInterrupt:
         pending.drain()
         raise
 

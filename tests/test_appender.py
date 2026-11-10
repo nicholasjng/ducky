@@ -43,6 +43,24 @@ def test_appender_columns_partial_fills_null(con):
     assert rows == [(0, None), (1, None), (2, None)]
 
 
+def test_appender_arrow_large_batch_windows(con):
+    pa = pytest.importorskip("pyarrow")
+    con.execute("CREATE TABLE t (a BIGINT, s VARCHAR)")
+    n = 10_000
+    batch = pa.record_batch(
+        {
+            "a": pa.array(range(n), pa.int64()),
+            "s": pa.array([str(i) if i % 7 else None for i in range(n)]),
+        }
+    )
+    with con.appender("t") as app:
+        app.append_arrow(batch)
+    got = con.execute(
+        "SELECT count(*), sum(a), count(s), min(a) FILTER (s IS NULL) FROM t"
+    ).fetchone()
+    assert got == (n, n * (n - 1) // 2, n - len(range(0, n, 7)), 0)
+
+
 def test_appender_columns_masks(con):
     con.execute("CREATE TABLE t (score DOUBLE)")
     scores = np.array([0.1, 0.2, 0.3, 0.4], dtype=np.float64)

@@ -8,6 +8,7 @@ import time
 import pytest
 
 import ducky
+from ducky._core import PendingState
 
 
 async def test_aexecute_basic(con):
@@ -77,3 +78,38 @@ async def test_aexecute_cancellation_interrupts_and_survives():
     # The connection survives an interrupted query — a fresh one still runs.
     res = await con.aexecute("SELECT 1")
     assert res.fetchitem() == 1
+
+
+def test_execute_tasks_runs_to_completion(con):
+    pending = con.make_pending("SELECT count(*) FROM range(5_000_000)")
+    hops = 0
+    while (state := pending.execute_tasks(0.01)) not in (
+        PendingState.READY,
+        PendingState.ERROR,
+    ):
+        hops += 1
+    assert state == PendingState.READY
+    assert pending.materialize().fetchitem() == 5_000_000
+
+
+async def test_cancellation_keeps_event_loop_responsive():
+    con = ducky.connect(threads=2)
+    task = asyncio.create_task(
+        con.aexecute("SELECT count(*) FROM range(10_000_000_000) t(i) WHERE i % 7 = 0")
+    )
+    await asyncio.sleep(0.1)
+    ticks = 0
+
+    async def ticker():
+        nonlocal ticks
+        while True:
+            ticks += 1
+            await asyncio.sleep(0)
+
+    heartbeat = asyncio.create_task(ticker())
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    heartbeat.cancel()
+    assert ticks > 0
+    assert (await con.aexecute("SELECT 1")).fetchitem() == 1

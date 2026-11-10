@@ -1,6 +1,7 @@
 #pragma once
 
 #include <nanobind/nanobind.h>
+#include <tsl/robin_map.h>
 
 #include <cstdint>
 #include <memory>
@@ -14,6 +15,25 @@
 #include "duckdb.h"
 
 namespace nb = nanobind;
+
+// How to decode one column's cells into Python objects, resolved once per
+// column: nested types, field names, enum dictionaries.
+struct CellDecoder {
+    duckdb_type type = DUCKDB_TYPE_INVALID;
+    duckdb_type internal = DUCKDB_TYPE_INVALID;  // DECIMAL and ENUM storage
+    uint8_t scale = 0;                           // DECIMAL
+    idx_t array_size = 0;                        // ARRAY
+    // LIST and ARRAY: the element; STRUCT: the fields; MAP: key and value;
+    // UNION: the members.
+    std::vector<CellDecoder> children;
+    std::vector<nb::object> names;        // STRUCT field names
+    std::vector<nb::object> enum_values;  // ENUM dictionary
+    // TIME_TZ: datetime.timezone per UTC offset seen.
+    tsl::robin_map<int32_t, nb::object> timezones;
+
+    // Requires the GIL.
+    explicit CellDecoder(duckdb_logical_type logical);
+};
 
 // A lazily decoded duckdb_result.
 class Result {
@@ -120,6 +140,9 @@ class Result {
     // failed streaming result as non-streaming.
     bool streaming_ = false;
     std::vector<ColumnCursor> cursors_;
+    // Built on the first row decoded. Requires the cursor lock.
+    std::vector<CellDecoder> decoders_;
+    void ensure_decoders();
     // Guards the cursor state above and all fetches from result_. Blocking
     // fetches run with the GIL released, so binding-level locks (nb::lock_self)
     // alone don't serialize consumers.

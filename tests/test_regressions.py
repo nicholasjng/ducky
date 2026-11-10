@@ -809,3 +809,42 @@ async def test_concurrent_asql_on_one_connection(con):
         con.asql("SELECT sum(i) FROM range(20000000) t(i)"), con.asql("SELECT 2")
     )
     assert [r.fetchitem() for r in results] == [199999990000000, 2]
+
+
+def test_nested_and_enum_rows_decode(con):
+    con.execute("CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy')")
+    rows = con.sql(
+        """
+        SELECT
+            ['happy', 'sad']::mood[] AS moods,
+            {'a': [1, NULL], 'b': {'c': 'x'}} AS s,
+            MAP {'k': [1.5]} AS m,
+            union_value(num := 2)::UNION(num INT, str VARCHAR) AS u,
+            [[1, 2], [3, 4]]::INT[2][2] AS arr,
+            ('12:00:00+02:00'::TIMETZ + to_minutes(i)) AS t
+        FROM range(3) t(i)
+        """
+    ).fetchall()
+    assert len(rows) == 3
+    moods, s, m, u, arr, t1 = rows[0]
+    t2 = rows[1][-1]
+    assert moods == ["happy", "sad"]
+    assert s == {"a": [1, None], "b": {"c": "x"}}
+    assert m == {"k": [1.5]}
+    assert u == 2
+    assert arr == [[1, 2], [3, 4]]
+    assert t1.utcoffset() == t2.utcoffset() == datetime.timedelta(hours=2)
+    assert t1 != t2
+    assert t1.tzinfo is t2.tzinfo  # one timezone object per offset
+
+
+def test_arrow_fast_path_validity_across_misaligned_chunks(con):
+    pytest.importorskip("pyarrow")
+    con.execute("SET threads=1")
+    parts = [2050, 7, 3000]
+    query = " UNION ALL ".join(
+        f"SELECT CASE WHEN i % 3 = 0 THEN NULL ELSE i END AS v FROM range({n}) t(i)" for n in parts
+    )
+    got = con.sql(query).arrow().column("v").to_pylist()
+    expected = [None if i % 3 == 0 else i for n in parts for i in range(n)]
+    assert got == expected
