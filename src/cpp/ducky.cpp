@@ -275,7 +275,7 @@ NB_MODULE(_core, m) {
              nb::sig("def append_columns(self, columns: dict[str, numpy.ndarray], "
                      "masks: dict[str, numpy.ndarray] | None = None) -> None"),
              "Append equal-length numeric or temporal arrays with optional validity masks. "
-             "Missing columns become NULL.",
+             "Missing columns take their DEFAULT, or NULL.",
              nb::lock_self())
         .def("append_arrow", &Appender::append_arrow, "source"_a,
              nb::sig("def append_arrow(self, source: typing.Any) -> None"),

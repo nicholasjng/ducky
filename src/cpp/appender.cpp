@@ -619,8 +619,7 @@ void Appender::append_columns(nb::dict columns, nb::object masks) {
             std::string name = nb::cast<std::string>(key);
             idx_t idx = resolve(name);
             if (!col_present[idx]) {
-                // A mask over a missing (memset-NULL) column would flip
-                // uninitialized buffer contents back to valid.
+                // A missing column takes its DEFAULT; there is nothing to mask.
                 throw DuckyError("ducky: mask for '" + name +
                                  "' has no matching entry in `columns`");
             }
@@ -642,49 +641,77 @@ void Appender::append_columns(nb::dict columns, nb::object masks) {
 
     if (n_rows <= 0) return;
 
+    std::vector<idx_t> present;
+    for (idx_t i = 0; i < n_cols; ++i) {
+        if (col_present[i]) present.push_back(i);
+    }
+    if (present.size() == n_cols) {
+        append_column_slices(present, col_arrays, mask_arrays, mask_present, n_rows);
+        return;
+    }
+    // Restrict the appender to the given columns so the others take their
+    // DEFAULT (or NULL). Changing the active columns flushes buffered rows.
+    duckdb_state state;
+    {
+        release_gil_if_held release;
+        state = duckdb_appender_clear_columns(handle_);
+        for (idx_t i : present) {
+            if (state == DuckDBError) break;
+            state = duckdb_appender_add_column(handle_, names_[i].c_str());
+        }
+    }
+    try {
+        check_state(state, "selecting the appended columns failed");
+        append_column_slices(present, col_arrays, mask_arrays, mask_present, n_rows);
+    } catch (...) {
+        release_gil_if_held release;
+        duckdb_appender_clear_columns(handle_);
+        throw;
+    }
+    {
+        release_gil_if_held release;
+        state = duckdb_appender_clear_columns(handle_);
+    }
+    check_state(state, "flushing the appended columns failed");
+}
+
+void Appender::append_column_slices(const std::vector<idx_t>& present,
+                                    const std::vector<AnyArray>& arrays,
+                                    const std::vector<AnyArray>& masks,
+                                    const std::vector<bool>& mask_present, int64_t n_rows) {
     idx_t vec_size = duckdb_vector_size();
+    std::vector<duckdb_logical_type> types;
+    types.reserve(present.size());
+    for (idx_t i : present) types.push_back(types_[i]);
 
     // Stream slices of up to vec_size rows through one reusable chunk:
     // duckdb_append_data_chunk copies the data into the appender, and
     // duckdb_data_chunk_reset restores capacity and all-valid validity masks
     // (StandardVectorBuffer::ResetCapacity), so per-slice re-allocation is
     // pure overhead.
-    duckdb_data_chunk chunk = duckdb_create_data_chunk(types_.data(), n_cols);
+    duckdb_data_chunk chunk = duckdb_create_data_chunk(types.data(), (idx_t)types.size());
     for (int64_t offset = 0; offset < n_rows; offset += (int64_t)vec_size) {
         idx_t this_n = (idx_t)std::min<int64_t>(vec_size, n_rows - offset);
 
         duckdb_data_chunk_reset(chunk);
         duckdb_data_chunk_set_size(chunk, this_n);
 
-        for (idx_t i = 0; i < n_cols; ++i) {
-            duckdb_vector vec = duckdb_data_chunk_get_vector(chunk, i);
-            void* dst = duckdb_vector_get_data(vec);
-
-            if (col_present[i]) {
-                FlatDType d;
-                flat_dtype_for(type_ids_[i], d);
-                const uint8_t* src = (const uint8_t*)col_arrays[i].data();
-                std::memcpy(dst, src + offset * d.elem_size, this_n * d.elem_size);
-            } else {
-                // Missing column → all NULL via a single memset on the bitmap.
-                duckdb_vector_ensure_validity_writable(vec);
-                uint64_t* validity = duckdb_vector_get_validity(vec);
-                std::memset(validity, 0, (this_n + 7) / 8);
-            }
+        for (idx_t k = 0; k < (idx_t)present.size(); ++k) {
+            idx_t i = present[k];
+            duckdb_vector vec = duckdb_data_chunk_get_vector(chunk, k);
+            FlatDType d;
+            flat_dtype_for(type_ids_[i], d);
+            const uint8_t* src = (const uint8_t*)arrays[i].data();
+            std::memcpy(duckdb_vector_get_data(vec), src + offset * d.elem_size,
+                        this_n * d.elem_size);
 
             if (mask_present[i]) {
                 duckdb_vector_ensure_validity_writable(vec);
                 uint64_t* validity = duckdb_vector_get_validity(vec);
-                if (mask_arrays[i].dtype().code == nb::dtype<bool>().code) {
-                    const bool* m = (const bool*)mask_arrays[i].data();
-                    for (idx_t r = 0; r < this_n; ++r) {
-                        duckdb_validity_set_row_validity(validity, r, m[offset + r]);
-                    }
-                } else {
-                    const uint8_t* m = (const uint8_t*)mask_arrays[i].data();
-                    for (idx_t r = 0; r < this_n; ++r) {
-                        duckdb_validity_set_row_validity(validity, r, m[offset + r] != 0);
-                    }
+                // bool and uint8 masks are both one byte per row.
+                const uint8_t* m = (const uint8_t*)masks[i].data();
+                for (idx_t r = 0; r < this_n; ++r) {
+                    duckdb_validity_set_row_validity(validity, r, m[offset + r] != 0);
                 }
             }
         }
