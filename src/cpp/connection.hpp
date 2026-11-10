@@ -3,6 +3,7 @@
 #include <nanobind/nanobind.h>
 #include <tsl/robin_map.h>
 
+#include <chrono>
 #include <cstdint>
 #include <list>
 #include <memory>
@@ -19,6 +20,22 @@ class PreparedStatement;
 struct ArrowRegistry;
 
 // Steppable pending result used by ducky._aio.
+// Runs a pending query's tasks on the calling thread. While DuckDB's workers
+// finish the last tasks of a pipeline there is nothing to execute here: yield,
+// then sleep briefly. Short sleeps keep the wake-up latency well below a
+// typical query's runtime.
+class TaskPacer {
+   public:
+    // Runs tasks until the result is ready, execution fails, or `deadline`
+    // passes, and returns the last state. Call without the GIL.
+    duckdb_pending_state run(duckdb_pending_result pending,
+                             std::chrono::steady_clock::time_point deadline);
+
+   private:
+    int no_tasks_streak_ = 0;
+    std::chrono::microseconds backoff_{0};
+};
+
 class PendingResult {
    public:
     // Takes `pending`, and `stmt` when `owns_stmt`.
@@ -31,6 +48,8 @@ class PendingResult {
 
     // Advance the executor by one task. Releases the GIL.
     duckdb_pending_state execute_task();
+    // Runs tasks for up to `budget` seconds (GIL released); see TaskPacer.
+    duckdb_pending_state execute_tasks(double budget);
     // DuckDB's most recent error message, or "" if the handle is gone.
     std::string error();
     // Materialize the finished result; call once execute_task reports READY.
@@ -43,6 +62,7 @@ class PendingResult {
     void cleanup_locked();
 
     std::mutex mu_;
+    TaskPacer pacer_;
     duckdb_pending_result pending_ = nullptr;
     duckdb_prepared_statement stmt_ = nullptr;
     bool owns_stmt_ = false;

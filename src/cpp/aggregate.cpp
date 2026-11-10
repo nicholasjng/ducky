@@ -108,6 +108,8 @@ void agg_update(duckdb_function_info info, duckdb_data_chunk input,
                 single_state = states[i] == first_state;
             }
             if (single_state && all_rows) {
+                // Owner-less arrays: nanobind hands Python a copy, which the
+                // caller may keep.
                 size_t shape[1] = {(size_t)n};
                 nb::list args;
                 for (idx_t c = 0; c < n_cols; ++c) {

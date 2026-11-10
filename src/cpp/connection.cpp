@@ -408,35 +408,14 @@ duckdb_result drive_pending(duckdb_connection con, duckdb_pending_result pending
         throw DuckyError(message);
     }
 
-    // While DuckDB's workers finish the last tasks of a pipeline there is
-    // nothing to execute here: yield, then sleep briefly. Short sleeps keep the
-    // wake-up latency well below a typical query's runtime.
-    constexpr int yield_ticks = 64;
-    constexpr std::chrono::microseconds min_sleep(20), max_sleep(100);
-    int no_tasks_streak = 0;
-    std::chrono::microseconds backoff(0);
+    TaskPacer pacer;
     for (;;) {
         duckdb_pending_state state;
         {
             // Release the GIL and resurface every 10 ms for signals.
             nb::gil_scoped_release release;
-            auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(10);
-            for (;;) {
-                state = duckdb_pending_execute_task(pending);
-                if (state == DUCKDB_PENDING_RESULT_READY || state == DUCKDB_PENDING_ERROR) break;
-                if (state == DUCKDB_PENDING_NO_TASKS_AVAILABLE) {
-                    if (++no_tasks_streak > yield_ticks) {
-                        backoff = std::min(std::max(backoff * 2, min_sleep), max_sleep);
-                        std::this_thread::sleep_for(backoff);
-                    } else {
-                        std::this_thread::yield();
-                    }
-                } else {
-                    no_tasks_streak = 0;
-                    backoff = std::chrono::microseconds(0);
-                }
-                if (std::chrono::steady_clock::now() >= deadline) break;
-            }
+            state = pacer.run(pending,
+                              std::chrono::steady_clock::now() + std::chrono::milliseconds(10));
         }
         if (state == DUCKDB_PENDING_ERROR) {
             std::string message = duckdb_message(duckdb_pending_error(pending));
@@ -1026,6 +1005,37 @@ PendingResult::~PendingResult() {
         duckdb_destroy_result(&drained);
         cleanup_locked();
     }
+}
+
+duckdb_pending_state TaskPacer::run(duckdb_pending_result pending,
+                                    std::chrono::steady_clock::time_point deadline) {
+    constexpr int yield_ticks = 64;
+    constexpr std::chrono::microseconds min_sleep(20), max_sleep(100);
+    for (;;) {
+        duckdb_pending_state state = duckdb_pending_execute_task(pending);
+        if (state == DUCKDB_PENDING_RESULT_READY || state == DUCKDB_PENDING_ERROR) return state;
+        if (state == DUCKDB_PENDING_NO_TASKS_AVAILABLE) {
+            if (++no_tasks_streak_ > yield_ticks) {
+                backoff_ = std::min(std::max(backoff_ * 2, min_sleep), max_sleep);
+                std::this_thread::sleep_for(backoff_);
+            } else {
+                std::this_thread::yield();
+            }
+        } else {
+            no_tasks_streak_ = 0;
+            backoff_ = std::chrono::microseconds(0);
+        }
+        if (std::chrono::steady_clock::now() >= deadline) return state;
+    }
+}
+
+duckdb_pending_state PendingResult::execute_tasks(double budget) {
+    auto span = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+        std::chrono::duration<double>(budget > 0 ? budget : 0));
+    nb::gil_scoped_release release;
+    std::lock_guard<std::mutex> lock(mu_);
+    if (!pending_) throw DuckyError("ducky: pending result already consumed");
+    return pacer_.run(pending_, std::chrono::steady_clock::now() + span);
 }
 
 duckdb_pending_state PendingResult::execute_task() {

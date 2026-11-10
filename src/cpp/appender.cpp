@@ -739,21 +739,17 @@ void Appender::append_arrow(nb::object source) {
                 }
                 duckdb_data_chunk slice = duckdb_create_data_chunk(types.data(), n_cols);
                 for (duckdb_logical_type& t : types) duckdb_destroy_logical_type(&t);
-                duckdb_selection_vector sel = duckdb_create_selection_vector(rows);
-                sel_t* index = duckdb_selection_vector_get_data_ptr(sel);
-                for (idx_t r = 0; r < rows; ++r) index[r] = (sel_t)r;
                 for (idx_t offset = 0; offset < rows && st == DuckDBSuccess; offset += window) {
                     idx_t count = std::min(window, rows - offset);
-                    duckdb_data_chunk_reset(slice);
+                    // Zero-copy windows: a flat vector stays flat.
                     for (idx_t c = 0; c < n_cols; ++c) {
-                        duckdb_vector_copy_sel(duckdb_data_chunk_get_vector(chunk, c),
-                                               duckdb_data_chunk_get_vector(slice, c), sel,
-                                               offset + count, offset, 0);
+                        duckdb_vector_reference_slice(duckdb_data_chunk_get_vector(slice, c),
+                                                      duckdb_data_chunk_get_vector(chunk, c),
+                                                      offset, count);
                     }
                     duckdb_data_chunk_set_size(slice, count);
                     st = duckdb_append_data_chunk(handle_, slice);
                 }
-                duckdb_destroy_selection_vector(sel);
                 duckdb_destroy_data_chunk(&slice);
             }
             duckdb_destroy_data_chunk(&chunk);

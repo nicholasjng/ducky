@@ -167,21 +167,29 @@ void udf_init_trampoline(duckdb_init_info info) {
     }
 }
 
-// Build a uint8 ndarray view (1=valid, 0=NULL) over `mask_buf` for vector `v`.
-// `mask_buf` must outlive the returned ndarray.
-nb::object build_input_mask(duckdb_vector v, idx_t n, std::vector<uint8_t>& mask_buf) {
-    mask_buf.resize(n);
+// A heap buffer of `bytes` bytes owned by `owner`, a capsule that frees it.
+// Arrays built over it with that owner are handed to Python without a copy.
+char* owned_buffer(size_t bytes, nb::object& owner) {
+    char* buf = new char[bytes ? bytes : 1];
+    owner = nb::capsule(buf, [](void* p) noexcept { delete[] (char*)p; });
+    return buf;
+}
+
+// A uint8 ndarray (1=valid, 0=NULL) of vector `v`'s first `n` rows.
+nb::object build_input_mask(duckdb_vector v, idx_t n) {
+    nb::object owner;
+    uint8_t* mask = (uint8_t*)owned_buffer(n, owner);
     uint64_t* validity = duckdb_vector_get_validity(v);
     if (!validity) {
-        std::memset(mask_buf.data(), 1, n);
+        std::memset(mask, 1, n);
     } else {
         for (idx_t i = 0; i < n; ++i) {
-            mask_buf[i] = duckdb_validity_row_is_valid(validity, i) ? 1 : 0;
+            mask[i] = duckdb_validity_row_is_valid(validity, i) ? 1 : 0;
         }
     }
     size_t shape[1] = {(size_t)n};
-    return nb::cast(nb::ndarray<nb::numpy, nb::ro>(mask_buf.data(), 1, shape, nb::handle(), nullptr,
-                                                   nb::dtype<uint8_t>()));
+    return nb::cast(
+        nb::ndarray<nb::numpy, nb::ro>(mask, 1, shape, owner, nullptr, nb::dtype<uint8_t>()));
 }
 
 // Forwards a C++ or Python exception as a DuckDB UDF error string.
@@ -225,16 +233,12 @@ void udf_trampoline(duckdb_function_info info, duckdb_data_chunk input, duckdb_v
     idx_t n = duckdb_data_chunk_get_size(input);
     idx_t n_params =
         ctx->varargs_type ? duckdb_data_chunk_get_column_count(input) : ctx->param_types.size();
-    // Per-arg mask scratch (only with special_handling). The (values, mask)
-    // ndarrays view this storage; it must live until the callable returns.
-    std::vector<std::vector<uint8_t>> mask_bufs(ctx->special_handling ? n_params : 0);
     // Without special handling, rows with a NULL input are left out of the
     // call (their output is NULL), so the callable never sees the arbitrary
     // values DuckDB leaves in NULL slots.
     std::vector<idx_t> keep;
     bool compact = !ctx->special_handling && collect_valid_rows(input, n_params, n, keep);
     idx_t m = compact ? (idx_t)keep.size() : n;
-    std::vector<std::vector<char>> gathered(compact ? n_params : 0);
     size_t shape[1] = {(size_t)m};
 
     guard(
@@ -253,27 +257,25 @@ void udf_trampoline(duckdb_function_info info, duckdb_data_chunk input, duckdb_v
                 if (m == 0) return;  // every row has a NULL input
             }
 
-            // Input ndarray views over the chunk's vectors (or over the
-            // gathered valid rows). Owner is empty; arrays are valid only for
-            // this call, like Chunk.column views.
+            // Input arrays own their data, so the callable may keep them.
+            // Without an owner, nanobind copies the chunk's vector; gathered
+            // valid rows are built in an owned buffer instead, copied once.
             auto build_values = [&](idx_t i) {
                 duckdb_vector v = duckdb_data_chunk_get_vector(input, i);
                 void* data = duckdb_vector_get_data(v);
                 const TypeSpec* t = ctx->varargs_type ? ctx->varargs_type : ctx->param_types[i];
+                nb::object owner;
                 if (compact) {
-                    std::vector<char>& buf = gathered[i];
-                    buf.resize(m * t->size);
+                    char* buf = owned_buffer(m * t->size, owner);
                     for (idx_t j = 0; j < m; ++j) {
-                        std::memcpy(buf.data() + j * t->size, (char*)data + keep[j] * t->size,
-                                    t->size);
+                        std::memcpy(buf + j * t->size, (char*)data + keep[j] * t->size, t->size);
                     }
-                    data = buf.data();
+                    data = buf;
                 }
-                nb::object values = nb::cast(nb::ndarray<nb::numpy, nb::ro>(
-                    data, 1, shape, nb::handle(), nullptr, t->dtype()));
+                nb::object values = nb::cast(
+                    nb::ndarray<nb::numpy, nb::ro>(data, 1, shape, owner, nullptr, t->dtype()));
                 if (!ctx->special_handling) return values;
-                nb::object mask = build_input_mask(v, n, mask_bufs[i]);
-                return (nb::object)nb::make_tuple(values, mask);
+                return (nb::object)nb::make_tuple(values, build_input_mask(v, n));
             };
 
             // Borrowed; the holder owns it until thread teardown.

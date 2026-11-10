@@ -345,6 +345,10 @@ NB_MODULE(_core, m) {
         .def("execute_task", &PendingResult::execute_task,
              nb::sig("def execute_task(self) -> PendingState"),
              "Advance the executor by one task (GIL released) and return the new state.")
+        .def(
+            "execute_tasks", &PendingResult::execute_tasks, "budget"_a = 0.005,
+            nb::sig("def execute_tasks(self, budget: float = 0.005) -> PendingState"),
+            "Run tasks for up to ``budget`` seconds (GIL released), stopping once ready or failed.")
         .def("error", &PendingResult::error, nb::sig("def error(self) -> str"),
              "DuckDB's message for the most recent error, may be empty.")
         .def("materialize", &PendingResult::materialize, nb::sig("def materialize(self) -> Result"),

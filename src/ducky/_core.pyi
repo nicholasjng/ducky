@@ -280,6 +280,11 @@ class PendingResult:
         Advance the executor by one task (GIL released) and return the new state.
         """
 
+    def execute_tasks(self, budget: float = 0.005) -> PendingState:
+        """
+        Run tasks for up to ``budget`` seconds (GIL released), stopping once ready or failed.
+        """
+
     def error(self) -> str:
         """DuckDB's message for the most recent error, may be empty."""
 
