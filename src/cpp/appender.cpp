@@ -201,8 +201,10 @@ Appender::~Appender() {
     types_.clear();
 }
 
-void Appender::ensure_open() const {
+std::unique_lock<std::mutex> Appender::lock_open() {
+    std::unique_lock<std::mutex> lock = lock_releasing_gil(mu_);
     if (!handle_) throw DuckyError("ducky: appender is closed");
+    return lock;
 }
 
 void Appender::check_state(duckdb_state state, const char* what) {
@@ -237,7 +239,7 @@ idx_t Appender::resolve(const std::string& name) const {
 }
 
 void Appender::flush() {
-    ensure_open();
+    auto lock = lock_open();
     duckdb_state state;
     {
         release_gil_if_held release;
@@ -247,6 +249,7 @@ void Appender::flush() {
 }
 
 void Appender::close() {
+    auto lock = lock_releasing_gil(mu_);
     if (!handle_) return;
     // Best-effort: surface the close error, but always destroy.
     release_gil_if_held release;
@@ -534,7 +537,7 @@ duckdb_state append_staged(duckdb_appender app, const Staged& v) {
 }  // namespace
 
 void Appender::append_row(nb::args values) {
-    ensure_open();
+    auto lock = lock_open();
     idx_t n_cols = type_ids_.size();
     if (values.size() != n_cols) {
         throw DuckyError("ducky: append_row expected " + std::to_string(n_cols) + " values, got " +
@@ -571,7 +574,7 @@ void Appender::append_row(nb::args values) {
 }
 
 void Appender::append_columns(nb::dict columns, nb::object masks) {
-    ensure_open();
+    auto lock = lock_open();
     idx_t n_cols = type_ids_.size();
     if (columns.size() == 0) return;
 
@@ -701,7 +704,7 @@ void Appender::append_columns(nb::dict columns, nb::object masks) {
 }
 
 void Appender::append_arrow(nb::object source) {
-    ensure_open();
+    auto lock = lock_open();
     duckdb_connection con = connection_->connection;
     if (!con) throw DuckyError("ducky: the appender's connection is closed");
 

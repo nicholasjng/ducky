@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -109,8 +110,12 @@ class PreparedStatement {
     void close();
 
    private:
-    void ensure_valid() const;
+    // Locks the statement and raises if it is closed.
+    std::unique_lock<std::mutex> lock_valid() const;
 
     duckdb_prepared_statement stmt_ = nullptr;
     std::shared_ptr<DuckDBHandle> handle_;
+    // Guards stmt_ and its bindings. Executions run with the GIL released, so
+    // nb::lock_self alone doesn't keep close() or a rebind out of them.
+    mutable std::mutex mu_;
 };

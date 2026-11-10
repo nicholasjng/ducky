@@ -238,3 +238,28 @@ def test_appender_row_date_rejects_datetime(con):
     con.execute("CREATE TABLE t (d DATE)")
     with con.appender("t") as app, pytest.raises(ducky.Error, match="expected datetime.date"):
         app.append_row(dt.datetime(2024, 1, 2, 3, 4))
+
+
+def test_appender_close_waits_for_running_append(con):
+    import threading
+
+    con.execute("CREATE TABLE t (a BIGINT)")
+    app = con.appender("t")
+    data = {"a": np.arange(2_000_000, dtype=np.int64)}
+    started = threading.Event()
+    errors = []
+
+    def run():
+        started.set()
+        try:
+            app.append_columns(data)
+        except ducky.Error as e:  # close() won the race
+            errors.append(e)
+
+    t = threading.Thread(target=run)
+    t.start()
+    started.wait()
+    app.close()
+    t.join()
+    assert all("closed" in str(e) for e in errors)
+    assert con.execute("SELECT count(*) FROM t").fetchitem() in (0, 2_000_000)

@@ -825,14 +825,7 @@ void Result::release_chunk() {
     cursor_ = 0;
 }
 
-std::unique_lock<std::mutex> Result::lock_cursor() {
-    std::unique_lock<std::mutex> lock(mu_, std::try_to_lock);
-    if (!lock.owns_lock()) {
-        release_gil_if_held release;
-        lock.lock();
-    }
-    return lock;
-}
+std::unique_lock<std::mutex> Result::lock_cursor() { return lock_releasing_gil(mu_); }
 
 bool Result::fetch_into_locked(duckdb_data_chunk dst) {
     // The end is sticky: fetching past it would fail on a closed stream.
