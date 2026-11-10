@@ -1,7 +1,7 @@
 [submodule "ext/duckdb"]
 	path = ext/duckdb
 	url = https://github.com/duckdb/duckdb.git
-	branch = v2.0-cyanoptera
+	branch = main
 	shallow = true
 [picky "ext/duckdb"]
 	patches = patches

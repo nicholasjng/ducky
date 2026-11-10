@@ -26,7 +26,7 @@ database to the repository root. Package builds remain isolated.
 ## Updating DuckDB
 
 ```sh
-picky update ext/duckdb v2.0-cyanoptera
+picky update ext/duckdb main
 uv sync --all-groups --reinstall-package=ducky
 uv run --no-sync pytest -q
 ```

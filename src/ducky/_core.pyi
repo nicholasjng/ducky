@@ -13,7 +13,7 @@ import pyarrow
 import torch
 from mlx import core as mx
 
-__duckdb_version__: str = "v2.0.0-dev0"
+__duckdb_version__: str = "v2.1.0-dev0"
 
 class Error(Exception): ...
 
