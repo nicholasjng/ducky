@@ -4,6 +4,7 @@
 #include <nanobind/ndarray.h>
 
 #include <string>
+#include <vector>
 
 #include "duckdb.h"
 
@@ -25,6 +26,24 @@ const TypeSpec& lookup_typespec(const std::string& name);
 
 // Return flat type metadata, or nullptr when unsupported.
 const TypeSpec* typespec_for(duckdb_type type);
+
+// A fixed-size ARRAY of a flat type, nested to any depth (FLOAT[4][3]). Its
+// innermost child vector holds every row's values back to back, so the column
+// is an ndarray of shape (rows, *dims).
+struct ArrayLayout {
+    const TypeSpec* leaf = nullptr;
+    std::vector<size_t> dims;  // outermost first
+    size_t values_per_row = 1;
+};
+
+// Fill `out` and return true if `logical` is such an ARRAY.
+bool array_layout(duckdb_logical_type logical, ArrayLayout& out);
+
+// Descend from an ARRAY vector to the child vector holding its values.
+inline duckdb_vector array_leaf(duckdb_vector v, const ArrayLayout& layout) {
+    for (size_t i = 0; i < layout.dims.size(); ++i) v = duckdb_array_vector_get_child(v);
+    return v;
+}
 
 // Cached NumPy dtypes for structured DuckDB storage.
 struct StructDtypes {

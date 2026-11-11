@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Literal, Protocol, overload
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, Protocol, overload
 
 from ._core import Connection, Result, connect
 
@@ -42,13 +42,23 @@ class Vector:
 
 
 @dataclass(frozen=True)
+class Tensor:
+    """A fixed-size ARRAY field, materialised as an ``(n, *shape)`` array."""
+
+    expr: str
+    shape: tuple[int, ...]
+    dtype: str = "f32"
+    standardize: ClassVar[bool] = False  # per-element statistics aren't supported
+
+
+@dataclass(frozen=True)
 class Matrix:
     """Ordered feature columns materialized as an ``(n, d)`` array."""
 
     columns: dict[str, Feature] = field(default_factory=dict)
 
 
-Field = Vector | Matrix
+Field = Vector | Matrix | Tensor
 
 
 @dataclass(frozen=True)
@@ -72,6 +82,14 @@ def target(expr: str, *, dtype: str = "f32") -> Target:
 def vector(expr: str, *, dtype: str = "f32", standardize: bool = False) -> Vector:
     """Shorthand for :class:`Vector`."""
     return Vector(expr=expr, dtype=dtype, standardize=standardize)
+
+
+def tensor(expr: str, shape: int | tuple[int, ...], *, dtype: str = "f32") -> Tensor:
+    """Shorthand for :class:`Tensor`; an int ``shape`` is a 1-D embedding size."""
+    dims = (shape,) if isinstance(shape, int) else tuple(shape)
+    if not dims or not all(isinstance(d, int) and d > 0 for d in dims):
+        raise ValueError(f"tensor shape must be one or more positive ints; got {shape!r}")
+    return Tensor(expr=expr, shape=dims, dtype=dtype)
 
 
 def matrix(columns: dict[str, Feature]) -> Matrix:
@@ -347,10 +365,10 @@ def _fold_ranges(fractions: dict[str, float]) -> list[tuple[str, int, int]]:
 
 def _iter_field_columns(
     fields: dict[str, Field],
-) -> Iterator[tuple[str, str, Feature | Vector]]:
+) -> Iterator[tuple[str, str, Feature | Vector | Tensor]]:
     """Yield each materialized column's alias, field name, and specification."""
     for field_name, spec in fields.items():
-        if isinstance(spec, Vector):
+        if isinstance(spec, Vector | Tensor):
             yield field_name, field_name, spec
         else:
             for col_name, feat in spec.columns.items():
@@ -431,9 +449,10 @@ def _compile_sql(
             expr = f"({spec.expr} - {mean}) / coalesce(nullif({std}, 0), 1)"
         else:
             expr = spec.expr
-        select_items.append(
-            f"CAST({expr} AS {_to_duckdb_dtype(spec.dtype)}) AS {_quote_ident(alias)}"
-        )
+        sql_type = _to_duckdb_dtype(spec.dtype)
+        if isinstance(spec, Tensor):
+            sql_type += "".join(f"[{d}]" for d in spec.shape)
+        select_items.append(f"CAST({expr} AS {sql_type}) AS {_quote_ident(alias)}")
     select_items.append("CAST(_bucket AS BIGINT) AS _bucket")
 
     sql = f"{ctes} SELECT {', '.join(select_items)} FROM {from_outer}"
@@ -441,8 +460,8 @@ def _compile_sql(
 
 
 def _assemble_field(name: str, spec: Field, columns_data: dict[str, Any], backend: Backend) -> Any:
-    """Stack a matrix field's columns / return a vector field's lone column."""
-    if isinstance(spec, Vector):
+    """Stack a matrix field's columns / return a vector or tensor field's lone column."""
+    if isinstance(spec, Vector | Tensor):
         return columns_data[name]
     cols = [columns_data[f"{name}__{c}"] for c in spec.columns]
     return _stack(cols, backend)

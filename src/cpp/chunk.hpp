@@ -65,8 +65,8 @@ class Chunk {
     // Non-const: fills the lazy per-column type cache.
     std::vector<std::string> column_types();
 
-    // Returns the column at `key` (int index or str name) as a 1-D ndarray
-    // view over the chunk's buffer. See class comment for supported types.
+    // Returns the column at `key` (int index or str name) as an ndarray view
+    // over the chunk's buffer: 1-D, or (rows, *dims) for a fixed-size ARRAY.
     nb::object column(nb::object key, nb::handle owner);
 
     // Same as column(), but takes a pre-resolved column index. Lets a caller
@@ -80,8 +80,8 @@ class Chunk {
 
     // Returns the column at `key` as a DLPack-compatible object (an
     // nb_ndarray with __dlpack__ / __dlpack_device__), without going through
-    // numpy. Only supported for flat numeric/temporal types; raises for
-    // structured types (HUGEINT, INTERVAL, DECIMAL, VARCHAR, ...).
+    // numpy. Only supported for flat numeric/temporal types and fixed-size
+    // ARRAYs of them; raises for structured types (HUGEINT, DECIMAL, VARCHAR, ...).
     nb::object dlpack(nb::object key, nb::handle owner);
 
     // Return a flat column as an MLX array.
@@ -94,6 +94,9 @@ class Chunk {
 
    private:
     idx_t resolve(nb::object key) const;
+    // Point at column `i`'s values if they are one contiguous buffer (a flat
+    // column, or an ARRAY of one) and give its dtype and (rows, *dims) shape.
+    bool dense(idx_t i, void*& data, nb::dlpack::dtype& dtype, std::vector<size_t>& shape);
     // Lazily resolve and cache logical types.
     duckdb_vector vector(idx_t i) const { return duckdb_data_chunk_get_vector(chunk_, i); }
     duckdb_logical_type logical_type(idx_t i);

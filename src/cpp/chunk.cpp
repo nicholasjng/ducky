@@ -33,6 +33,21 @@ nb::object make_struct_view(void* data, size_t n, size_t itemsize, nb::object dt
 
 }  // namespace
 
+bool Chunk::dense(idx_t i, void*& data, nb::dlpack::dtype& dtype, std::vector<size_t>& shape) {
+    duckdb_type tid = type_id(i);
+    shape.assign(1, (size_t)size_);
+    if (dtype_for(tid, dtype)) {
+        data = duckdb_vector_get_data(vector(i));
+        return true;
+    }
+    ArrayLayout layout;
+    if (tid != DUCKDB_TYPE_ARRAY || !array_layout(logical_type(i), layout)) return false;
+    dtype = layout.leaf->dtype();
+    shape.insert(shape.end(), layout.dims.begin(), layout.dims.end());
+    data = duckdb_vector_get_data(array_leaf(vector(i), layout));
+    return true;
+}
+
 Chunk::Chunk(duckdb_data_chunk chunk, std::shared_ptr<const ChunkSchema> schema,
              std::shared_ptr<DuckDBHandle> handle, std::weak_ptr<ChunkPool> pool)
     : chunk_(chunk),
@@ -107,16 +122,17 @@ nb::object Chunk::column(nb::object key, nb::handle owner) {
 }
 
 nb::object Chunk::column_at(idx_t i, nb::handle owner) {
-    void* data = duckdb_vector_get_data(vector(i));
+    // Primitive / temporal types and ARRAYs of them — zero-copy ndarray.
+    void* data;
+    nb::dlpack::dtype dtype;
+    std::vector<size_t> shape;
+    if (dense(i, data, dtype, shape)) {
+        return nb::cast(nb::ndarray<nb::numpy, nb::ro>(data, shape.size(), shape.data(), owner,
+                                                       nullptr, dtype));
+    }
+    data = duckdb_vector_get_data(vector(i));
     size_t n = (size_t)size_;
     duckdb_type tid = type_id(i);
-
-    // Primitive / temporal types — zero-copy ndarray.
-    nb::dlpack::dtype dtype;
-    if (dtype_for(tid, dtype)) {
-        size_t shape[1] = {n};
-        return nb::cast(nb::ndarray<nb::numpy, nb::ro>(data, 1, shape, owner, nullptr, dtype));
-    }
 
     // Structured types — zero-copy uint8 buffer reinterpreted via numpy .view().
     const StructDtypes& sd = struct_dtypes();
@@ -146,32 +162,28 @@ nb::object Chunk::column_at(idx_t i, nb::handle owner) {
 
 nb::object Chunk::dlpack(nb::object key, nb::handle owner) {
     idx_t i = resolve(key);
-    void* data = duckdb_vector_get_data(vector(i));
-    size_t n = (size_t)size_;
-    duckdb_type tid = type_id(i);
-
+    void* data;
     nb::dlpack::dtype dtype;
-    if (!dtype_for(tid, dtype)) {
-        throw DuckyError(std::string("ducky: column type ") + duckdb_type_name(tid) +
+    std::vector<size_t> shape;
+    if (!dense(i, data, dtype, shape)) {
+        throw DuckyError(std::string("ducky: column type ") + duckdb_type_name(type_id(i)) +
                          " has no flat DLPack representation; use .column() for structured types");
     }
-    size_t shape[1] = {n};
-    return nb::cast(nb::ndarray<nb::array_api, nb::ro>(data, 1, shape, owner, nullptr, dtype));
+    return nb::cast(nb::ndarray<nb::array_api, nb::ro>(data, shape.size(), shape.data(), owner,
+                                                       nullptr, dtype));
 }
 
 nb::object Chunk::mlx(nb::object key, nb::handle owner) {
     idx_t i = resolve(key);
-    void* data = duckdb_vector_get_data(vector(i));
-    size_t n = (size_t)size_;
-    duckdb_type tid = type_id(i);
-
+    void* data;
     nb::dlpack::dtype dtype;
-    if (!dtype_for(tid, dtype)) {
-        throw DuckyError(std::string("ducky: column type ") + duckdb_type_name(tid) +
+    std::vector<size_t> shape;
+    if (!dense(i, data, dtype, shape)) {
+        throw DuckyError(std::string("ducky: column type ") + duckdb_type_name(type_id(i)) +
                          " has no flat DLPack representation; use .column() for structured types");
     }
-    size_t shape[1] = {n};
-    return nb::cast(nb::ndarray<nb::mlx, nb::ro>(data, 1, shape, owner, nullptr, dtype));
+    return nb::cast(
+        nb::ndarray<nb::mlx, nb::ro>(data, shape.size(), shape.data(), owner, nullptr, dtype));
 }
 
 int Chunk::decimal_scale(nb::object key) {

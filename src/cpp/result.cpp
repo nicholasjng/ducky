@@ -4,6 +4,7 @@
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/vector.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
@@ -1114,33 +1115,47 @@ namespace {
 
 // NumPy output layout resolved before scanning.
 struct NumpyColumnPlan {
-    size_t elem_size;
+    size_t elem_size;  // bytes per row
     nb::dlpack::dtype dtype;
     nb::object struct_view;  // non-null → reinterpret via .view()
-    duckdb_type type;
+    duckdb_type type;        // an ARRAY's leaf type
+    ArrayLayout array;       // dims empty unless the column is an ARRAY
 };
 
 NumpyColumnPlan plan_column(duckdb_type tid, duckdb_logical_type logical, const std::string& name) {
     if (const TypeSpec* spec = typespec_for(tid)) {
-        return NumpyColumnPlan{spec->size, spec->dtype(), nb::object(), tid};
+        return NumpyColumnPlan{spec->size, spec->dtype(), nb::object(), tid, {}};
     }
     const StructDtypes& sd = struct_dtypes();
+    ArrayLayout array;
     switch (tid) {
         case DUCKDB_TYPE_HUGEINT:
-            return NumpyColumnPlan{sizeof(duckdb_hugeint), nb::dtype<uint8_t>(), sd.hugeint, tid};
+            return NumpyColumnPlan{
+                sizeof(duckdb_hugeint), nb::dtype<uint8_t>(), sd.hugeint, tid, {}};
         case DUCKDB_TYPE_UHUGEINT:
-            return NumpyColumnPlan{sizeof(duckdb_uhugeint), nb::dtype<uint8_t>(), sd.uhugeint, tid};
+            return NumpyColumnPlan{
+                sizeof(duckdb_uhugeint), nb::dtype<uint8_t>(), sd.uhugeint, tid, {}};
         case DUCKDB_TYPE_INTERVAL:
-            return NumpyColumnPlan{sizeof(duckdb_interval), nb::dtype<uint8_t>(), sd.interval, tid};
+            return NumpyColumnPlan{
+                sizeof(duckdb_interval), nb::dtype<uint8_t>(), sd.interval, tid, {}};
         case DUCKDB_TYPE_DECIMAL: {
             duckdb_type internal = duckdb_decimal_internal_type(logical);
             if (internal == DUCKDB_TYPE_HUGEINT) {
-                return NumpyColumnPlan{sizeof(duckdb_hugeint), nb::dtype<uint8_t>(), sd.hugeint,
-                                       tid};
+                return NumpyColumnPlan{
+                    sizeof(duckdb_hugeint), nb::dtype<uint8_t>(), sd.hugeint, tid, {}};
             }
             const TypeSpec* spec = typespec_for(internal);  // always primitive here
-            return NumpyColumnPlan{spec->size, spec->dtype(), nb::object(), tid};
+            return NumpyColumnPlan{spec->size, spec->dtype(), nb::object(), tid, {}};
         }
+        case DUCKDB_TYPE_ARRAY:
+            if (array_layout(logical, array)) {
+                const TypeSpec* leaf = array.leaf;
+                return NumpyColumnPlan{leaf->size * array.values_per_row, leaf->dtype(),
+                                       nb::object(), leaf->type, std::move(array)};
+            }
+            throw DuckyError(std::string("ducky: to_numpy: column '") + name +
+                             "' is an ARRAY of a type with no flat ndarray representation; "
+                             "use .arrow() for it");
         default:
             throw DuckyError(std::string("ducky: to_numpy: column '") + name + "' has type " +
                              duckdb_type_name(tid) +
@@ -1149,26 +1164,42 @@ NumpyColumnPlan plan_column(duckdb_type tid, duckdb_logical_type logical, const 
     }
 }
 
-// Copy `count` values of one column into `dst`. NULLs become NaN in FLOAT /
-// DOUBLE columns; other dtypes have no missing-value representation, so NULLs
-// raise rather than surfacing whatever bytes DuckDB left in the slot.
-void copy_numpy_values(char* dst, duckdb_vector v, idx_t count, const NumpyColumnPlan& plan,
-                       const std::string& name) {
-    std::memcpy(dst, duckdb_vector_get_data(v), count * plan.elem_size);
-    uint64_t* validity = duckdb_vector_get_validity(v);
+// Mark the NULL entries among `count` in `validity`, each covering `span`
+// values of `dst`. NULLs become NaN in FLOAT / DOUBLE columns; other dtypes
+// have no missing-value representation, so NULLs raise rather than surfacing
+// whatever bytes DuckDB left in the slot.
+void fill_numpy_nulls(char* dst, uint64_t* validity, idx_t count, size_t span,
+                      const NumpyColumnPlan& plan, const std::string& name) {
     if (!validity) return;
     for (idx_t r = 0; r < count; ++r) {
         if (duckdb_validity_row_is_valid(validity, r)) continue;
         if (plan.type == DUCKDB_TYPE_DOUBLE) {
-            ((double*)dst)[r] = std::numeric_limits<double>::quiet_NaN();
+            std::fill_n((double*)dst + r * span, span, std::numeric_limits<double>::quiet_NaN());
         } else if (plan.type == DUCKDB_TYPE_FLOAT) {
-            ((float*)dst)[r] = std::numeric_limits<float>::quiet_NaN();
+            std::fill_n((float*)dst + r * span, span, std::numeric_limits<float>::quiet_NaN());
         } else {
             throw DuckyError(std::string("ducky: to_numpy: column '") + name + "' (" +
                              duckdb_type_name(plan.type) +
                              ") contains NULLs, which its NumPy dtype cannot represent; use "
                              "iter_batches(with_validity=True), .arrow(), or COALESCE in SQL");
         }
+    }
+}
+
+// Copy `count` rows of one column into `dst`. A NULL ARRAY, or a NULL inside
+// one, is filled like a NULL value over every value it covers.
+void copy_numpy_values(char* dst, duckdb_vector v, idx_t count, const NumpyColumnPlan& plan,
+                       const std::string& name) {
+    const std::vector<size_t>& dims = plan.array.dims;
+    std::memcpy(dst, duckdb_vector_get_data(array_leaf(v, plan.array)), count * plan.elem_size);
+    idx_t entries = count;
+    size_t span = plan.array.values_per_row;
+    for (size_t level = 0;; ++level) {
+        fill_numpy_nulls(dst, duckdb_vector_get_validity(v), entries, span, plan, name);
+        if (level == dims.size()) break;
+        entries *= dims[level];
+        span /= dims[level];
+        v = duckdb_array_vector_get_child(v);
     }
 }
 
@@ -1229,8 +1260,10 @@ nb::object Result::to_numpy(nb::object columns) {
             nb::ndarray<nb::numpy> raw(buf, 1, byte_shape, owner, nullptr, p.dtype);
             return nb::cast(raw).attr("view")(p.struct_view);
         }
-        size_t shape[1] = {(size_t)total};
-        return nb::cast(nb::ndarray<nb::numpy>(buf, 1, shape, owner, nullptr, p.dtype));
+        std::vector<size_t> shape{(size_t)total};
+        shape.insert(shape.end(), p.array.dims.begin(), p.array.dims.end());
+        return nb::cast(
+            nb::ndarray<nb::numpy>(buf, shape.size(), shape.data(), owner, nullptr, p.dtype));
     };
 
     auto lock = lock_cursor();

@@ -21,12 +21,14 @@ from ._dataset import (
     Matrix,
     Split,
     Target,
+    Tensor,
     Vector,
     dataset,
     feature,
     matrix,
     split,
     target,
+    tensor,
     vector,
 )
 from ._profile import (
@@ -78,6 +80,7 @@ __all__ = [
     "Result",
     "Split",
     "Target",
+    "Tensor",
     "Vector",
     "__duckdb_version__",
     "config_options",
@@ -91,6 +94,7 @@ __all__ = [
     "progress_bar",
     "split",
     "target",
+    "tensor",
     "vector",
 ]
 

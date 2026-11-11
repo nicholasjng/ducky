@@ -612,6 +612,25 @@ const TypeSpec* typespec_for(duckdb_type type) {
     return nullptr;
 }
 
+bool array_layout(duckdb_logical_type logical, ArrayLayout& out) {
+    if (duckdb_get_type_id(logical) != DUCKDB_TYPE_ARRAY) return false;
+    out = ArrayLayout();
+    duckdb_logical_type current = logical;
+    bool owned = false;  // `logical` belongs to the caller
+    while (duckdb_get_type_id(current) == DUCKDB_TYPE_ARRAY) {
+        size_t size = (size_t)duckdb_array_type_array_size(current);
+        out.dims.push_back(size);
+        out.values_per_row *= size;
+        duckdb_logical_type child = duckdb_array_type_child_type(current);
+        if (owned) duckdb_destroy_logical_type(&current);
+        current = child;
+        owned = true;
+    }
+    out.leaf = typespec_for(duckdb_get_type_id(current));
+    duckdb_destroy_logical_type(&current);
+    return out.leaf != nullptr;
+}
+
 void create_scalar_function(Connection& con, const std::string& name, nb::callable fn,
                             nb::object parameters, nb::object return_type, nb::object varargs,
                             nb::object init, bool is_volatile, bool special_handling) {
