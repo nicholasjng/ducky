@@ -902,3 +902,16 @@ def test_arrow_fast_path_validity_across_misaligned_chunks(con):
     got = con.sql(query).arrow().column("v").to_pylist()
     expected = [None if i % 3 == 0 else i for n in parts for i in range(n)]
     assert got == expected
+
+
+def test_prepared_order_by_without_insertion_order():
+    # Every query runs as a prepared statement (an EXECUTE in DuckDB); its ORDER
+    # BY must keep the result ordered when insertion order is not preserved.
+    con = ducky.connect(threads=4)
+    con.execute("CREATE TABLE t AS SELECT (hash(range) % 1000000)::BIGINT a FROM range(3000000)")
+    con.execute("SET preserve_insertion_order = false")
+    for _ in range(3):
+        a = con.execute("SELECT a FROM t ORDER BY a").to_numpy()["a"]
+        assert (a[:-1] <= a[1:]).all()
+        b = con.arrow("SELECT a FROM t ORDER BY a").column("a").to_numpy()
+        assert (b[:-1] <= b[1:]).all()
