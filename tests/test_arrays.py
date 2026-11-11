@@ -214,3 +214,56 @@ def test_to_mlx_goes_through_to_numpy(con, monkeypatch):
     arrs = con.sql(f"SELECT i FROM range({n}) t(i)").to_mlx()
     assert calls == [1]
     np.testing.assert_array_equal(np.asarray(arrs["i"]), np.arange(n))
+
+
+def test_to_numpy_fixed_size_array(con):
+    n = 5000  # spans chunks
+    res = con.sql(
+        f"SELECT [i, i + 1, i + 2]::FLOAT[3] e, [[i, 0], [0, i]]::INT[2][2] m FROM range({n}) t(i)"
+    )
+    arrays = res.to_numpy()
+    i = np.arange(n, dtype=np.float32)
+    assert arrays["e"].shape == (n, 3)
+    assert arrays["e"].dtype == np.float32
+    np.testing.assert_array_equal(arrays["e"], np.stack([i, i + 1, i + 2], axis=1))
+    assert arrays["m"].shape == (n, 2, 2)
+    np.testing.assert_array_equal(arrays["m"][7], [[7, 0], [0, 7]])
+
+
+def test_to_numpy_array_nulls_become_nan(con):
+    res = con.sql(
+        "SELECT CASE i WHEN 1 THEN NULL WHEN 2 THEN [NULL, 1, 2]::DOUBLE[3] "
+        "ELSE [i, i, i]::DOUBLE[3] END e FROM range(4) t(i)"
+    )
+    np.testing.assert_array_equal(
+        res.to_numpy()["e"],
+        [[0, 0, 0], [np.nan, np.nan, np.nan], [np.nan, 1, 2], [3, 3, 3]],
+    )
+
+
+def test_to_numpy_integer_array_nulls_raise(con):
+    with pytest.raises(Exception, match="contains NULLs"):
+        con.sql("SELECT [1, NULL]::INT[2] e").to_numpy()
+    with pytest.raises(Exception, match="contains NULLs"):
+        con.sql("SELECT NULL::INT[2] e").to_numpy()
+
+
+def test_to_numpy_array_of_unsupported_type_raises(con):
+    with pytest.raises(Exception, match="ARRAY of a type"):
+        con.sql("SELECT ['a']::VARCHAR[1] e").to_numpy()
+
+
+def test_iter_batches_fixed_size_array(con):
+    res = con.sql("SELECT [i, -i]::BIGINT[2] e FROM range(3000) t(i)")
+    batches = [batch["e"] for batch in res.iter_batches()]
+    assert [b.shape for b in batches] == [(2048, 2), (952, 2)]
+    np.testing.assert_array_equal(np.concatenate(batches)[2999], [2999, -2999])
+
+
+def test_chunk_dlpack_fixed_size_array(con):
+    torch = pytest.importorskip("torch")
+    [chunk] = con.sql("SELECT [i, i * 2]::FLOAT[2] e FROM range(4) t(i)").chunks()
+    tensor = torch.from_dlpack(chunk.dlpack("e"))
+    assert tensor.shape == (4, 2)
+    np.testing.assert_array_equal(tensor.numpy(), chunk.column("e"))
+    np.testing.assert_array_equal(tensor[3].numpy(), [3, 6])

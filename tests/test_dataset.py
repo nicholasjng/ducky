@@ -421,3 +421,28 @@ def test_standardize_constant_column_yields_zeros(tmp_path):
     assert ds.train is not None
     X, _ = ds.train.tensors()
     assert np.all(X == 0.0)
+
+
+def test_tensor_field(tmp_path):
+    p = tmp_path / "emb.parquet"
+    con = ducky.connect()
+    con.execute(
+        f"COPY (SELECT [i, i * 2, i * 3]::DOUBLE[3] emb, i % 2 AS y FROM range(100) t(i)) TO '{p}'"
+    )
+    ds = ducky.dataset(
+        str(p),
+        fields={"X": ducky.tensor("emb", 3), "y": ducky.vector("y", dtype="i64")},
+        split=ducky.split(0.8, seed=0),
+    )
+    X, y = ds["train"].tensors()
+    assert X.shape == (ds["train"].n_rows, 3)
+    assert X.dtype == np.float32
+    np.testing.assert_array_equal(X[:, 1], 2 * X[:, 0])
+    np.testing.assert_array_equal(y, X[:, 0].astype(np.int64) % 2)
+
+
+def test_tensor_shape_validates():
+    with pytest.raises(ValueError, match="positive ints"):
+        ducky.tensor("emb", ())
+    with pytest.raises(ValueError, match="positive ints"):
+        ducky.tensor("emb", (3, 0))

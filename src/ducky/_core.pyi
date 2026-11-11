@@ -37,7 +37,7 @@ class Chunk:
         """Column type names."""
 
     def column(self, key: int | str) -> numpy.ndarray:
-        """Return a zero-copy 1-D ndarray view by index or name."""
+        """Return a zero-copy ndarray view by index or name; (rows, *dims) for an ARRAY."""
 
     def validity(self, key: int | str) -> numpy.ndarray | None:
         """
@@ -48,10 +48,14 @@ class Chunk:
         """Return a DECIMAL column's scale."""
 
     def dlpack(self, key: int | str) -> Any:
-        """Return a numeric or temporal column as a DLPack object."""
+        """
+        Return a numeric or temporal column, or a fixed-size ARRAY of one, as a DLPack object.
+        """
 
     def mlx(self, key: int | str) -> mx.array:
-        """Return a numeric or temporal column as an MLX array."""
+        """
+        Return a numeric or temporal column, or a fixed-size ARRAY of one, as an MLX array.
+        """
 
 class Result:
     """A query result. Iterate or call ``fetch*`` to pull rows."""
@@ -95,8 +99,9 @@ class Result:
 
     def to_numpy(self, columns: Iterable[str] | None = None) -> dict[str, numpy.ndarray]:
         """
-        Drain the result into a {name: numpy.ndarray} dict. NULLs become NaN in FLOAT/DOUBLE columns
-        and raise elsewhere. Raises on VARCHAR/LIST/STRUCT/MAP; use arrow() for those.
+        Drain the result into a {name: numpy.ndarray} dict. A fixed-size ARRAY column becomes an
+        (n, *dims) array. NULLs become NaN in FLOAT/DOUBLE columns and raise elsewhere. Raises on
+        VARCHAR/LIST/STRUCT/MAP; use arrow() for those.
         """
 
     def __arrow_c_stream__(self, requested_schema: Any = None) -> Any:
@@ -120,9 +125,9 @@ class Result:
 
     def fetchnumpy(self) -> dict[str, numpy.ndarray]:
         """
-        Return the result as a dict of column name -> numpy array. Numeric and temporal columns
-        only; use arrow() for strings and nested types. NULLs become NaN in FLOAT/DOUBLE columns and
-        raise elsewhere.
+        Return the result as a dict of column name -> numpy array. Numeric and temporal columns,
+        and fixed-size ARRAYs of them, only; use arrow() for strings and other nested types. NULLs
+        become NaN in FLOAT/DOUBLE columns and raise elsewhere.
         """
 
     def chunks(self) -> Iterator[Chunk]:
@@ -401,9 +406,9 @@ class Connection:
 
     def fetchnumpy(self) -> dict[str, numpy.ndarray]:
         """
-        Return the result as a dict of column name -> numpy array. Numeric and temporal columns
-        only; use arrow() for strings and nested types. NULLs become NaN in FLOAT/DOUBLE columns and
-        raise elsewhere.
+        Return the result as a dict of column name -> numpy array. Numeric and temporal columns,
+        and fixed-size ARRAYs of them, only; use arrow() for strings and other nested types. NULLs
+        become NaN in FLOAT/DOUBLE columns and raise elsewhere.
         """
 
     def chunks(self) -> Iterator[Chunk]:

@@ -60,10 +60,10 @@ void def_conversions(Cls& cls, Src src) {
         "fetchnumpy",
         [src](nb::object self) { return conversions().attr("fetchnumpy")(src(self)); },
         nb::sig("def fetchnumpy(self) -> dict[str, numpy.ndarray]"),
-        "Return the result as a dict of column name -> numpy array. Numeric and temporal columns\n"
-        "only; use arrow() for strings and nested types. NULLs become NaN in FLOAT/DOUBLE columns "
-        "and\n"
-        "raise elsewhere.");
+        "Return the result as a dict of column name -> numpy array. Numeric and temporal columns,\n"
+        "and fixed-size ARRAYs of them, only; use arrow() for strings and other nested types. "
+        "NULLs\n"
+        "become NaN in FLOAT/DOUBLE columns and raise elsewhere.");
     cls.def(
         "chunks", [src](nb::object self) { return conversions().attr("chunks")(src(self)); },
         nb::sig("def chunks(self) -> collections.abc.Iterator[Chunk]"),
@@ -180,7 +180,7 @@ NB_MODULE(_core, m) {
                 return nb::cast<Chunk&>(self).column(key, self);
             },
             "key"_a, nb::sig("def column(self, key: int | str) -> numpy.ndarray"),
-            "Return a zero-copy 1-D ndarray view by index or name.")
+            "Return a zero-copy ndarray view by index or name; (rows, *dims) for an ARRAY.")
         .def(
             "validity",
             [](nb::object self, nb::object key) {
@@ -197,12 +197,13 @@ NB_MODULE(_core, m) {
                 return nb::cast<Chunk&>(self).dlpack(key, self);
             },
             "key"_a, nb::sig("def dlpack(self, key: int | str) -> typing.Any"),
-            "Return a numeric or temporal column as a DLPack object.")
+            "Return a numeric or temporal column, or a fixed-size ARRAY of one, as a DLPack "
+            "object.")
         .def(
             "mlx",
             [](nb::object self, nb::object key) { return nb::cast<Chunk&>(self).mlx(key, self); },
             "key"_a, nb::sig("def mlx(self, key: int | str) -> mlx.core.array"),
-            "Return a numeric or temporal column as an MLX array.");
+            "Return a numeric or temporal column, or a fixed-size ARRAY of one, as an MLX array.");
 
     nb::class_<Result> result_cls(m, "Result",
                                   "A query result. Iterate or call ``fetch*`` to pull rows.");
@@ -229,13 +230,17 @@ NB_MODULE(_core, m) {
         .def("fetch_numpy_chunk", &Result::fetch_numpy_chunk,
              nb::sig("def fetch_numpy_chunk(self) -> dict[str, numpy.ndarray] | None"),
              "Pull the next chunk as NumPy arrays, or None at end.", nb::lock_self())
-        .def("to_numpy", &Result::to_numpy, "columns"_a = nb::none(),
-             nb::sig("def to_numpy(self, columns: collections.abc.Iterable[str] "
-                     "| None = None) -> dict[str, numpy.ndarray]"),
-             "Drain the result into a {name: numpy.ndarray} dict. NULLs become NaN in FLOAT/DOUBLE "
-             "columns\n"
-             "and raise elsewhere. Raises on VARCHAR/LIST/STRUCT/MAP; use arrow() for those.",
-             nb::lock_self())
+        .def(
+            "to_numpy", &Result::to_numpy, "columns"_a = nb::none(),
+            nb::sig("def to_numpy(self, columns: collections.abc.Iterable[str] "
+                    "| None = None) -> dict[str, numpy.ndarray]"),
+            "Drain the result into a {name: numpy.ndarray} dict. A fixed-size ARRAY column becomes "
+            "an\n"
+            "(n, *dims) array. NULLs become NaN in FLOAT/DOUBLE columns and raise elsewhere. "
+            "Raises "
+            "on\n"
+            "VARCHAR/LIST/STRUCT/MAP; use arrow() for those.",
+            nb::lock_self())
         .def(
             "__arrow_c_stream__",
             [](nb::object self, nb::object) {
