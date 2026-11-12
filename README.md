@@ -53,3 +53,32 @@ X_val, y_val = ds.val.tensors()
 ```
 
 See [examples/titanic_jax.py](examples/titanic_jax.py) for a complete example.
+
+## Streaming
+
+`ducky.stream` reads one fold per epoch instead of holding it in memory, with
+the same fields and splits as `ducky.dataset`. Fixed-size `ARRAY` columns such
+as embeddings become `(n, *shape)` arrays through `ducky.tensor`.
+
+```python
+train = ducky.stream(
+    "data/train/*.parquet",
+    fields={"X": ducky.tensor("emb", 768), "y": ducky.vector("label", dtype="i64")},
+    split=ducky.split(0.9, seed=0),
+    key="id",
+    batch_size=256,
+    shuffle=ducky.shuffle(64),  # a 64-batch buffer, or ducky.shuffle("global")
+    backend="torch",
+)
+loader = torch.utils.data.DataLoader(train, batch_size=None, num_workers=4)
+for epoch in range(n_epochs):
+    train.set_epoch(epoch)
+    for batch in loader:
+        ...
+```
+
+DataLoader workers and `torch.distributed` ranks each read their own share,
+and ranks get equally many rows, so they take the same number of steps.
+With a `key`, rows keep their fold however the data is sharded, and a
+multi-file Parquet source is sharded by file. `state_dict()` and
+`load_state_dict()` resume an epoch part-way through.

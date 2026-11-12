@@ -227,9 +227,13 @@ NB_MODULE(_core, m) {
                      "Rows affected by INSERT, UPDATE, or DELETE; otherwise 0.", nb::lock_self())
         .def("fetch_chunk", &Result::fetch_chunk, nb::sig("def fetch_chunk(self) -> Chunk | None"),
              "Pull the next :class:`Chunk`, or None at end of stream.", nb::lock_self())
-        .def("fetch_numpy_chunk", &Result::fetch_numpy_chunk,
-             nb::sig("def fetch_numpy_chunk(self) -> dict[str, numpy.ndarray] | None"),
-             "Pull the next chunk as NumPy arrays, or None at end.", nb::lock_self())
+        .def("fetch_numpy_chunk", &Result::fetch_numpy_chunk, "fill_nulls"_a = false,
+             nb::sig("def fetch_numpy_chunk(self, fill_nulls: bool = False) -> "
+                     "dict[str, numpy.ndarray] | None"),
+             "Pull the next chunk as zero-copy NumPy arrays, or None at end. With fill_nulls, "
+             "columns\n"
+             "holding NULLs are copied, NULLs becoming NaN in FLOAT/DOUBLE and raising elsewhere.",
+             nb::lock_self())
         .def(
             "to_numpy", &Result::to_numpy, "columns"_a = nb::none(),
             nb::sig("def to_numpy(self, columns: collections.abc.Iterable[str] "

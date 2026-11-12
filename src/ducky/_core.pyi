@@ -37,7 +37,9 @@ class Chunk:
         """Column type names."""
 
     def column(self, key: int | str) -> numpy.ndarray:
-        """Return a zero-copy ndarray view by index or name; (rows, *dims) for an ARRAY."""
+        """
+        Return a zero-copy ndarray view by index or name; (rows, *dims) for an ARRAY.
+        """
 
     def validity(self, key: int | str) -> numpy.ndarray | None:
         """
@@ -94,8 +96,11 @@ class Result:
     def fetch_chunk(self) -> Chunk | None:
         """Pull the next :class:`Chunk`, or None at end of stream."""
 
-    def fetch_numpy_chunk(self) -> dict[str, numpy.ndarray] | None:
-        """Pull the next chunk as NumPy arrays, or None at end."""
+    def fetch_numpy_chunk(self, fill_nulls: bool = False) -> dict[str, numpy.ndarray] | None:
+        """
+        Pull the next chunk as zero-copy NumPy arrays, or None at end. With fill_nulls, columns
+        holding NULLs are copied, NULLs becoming NaN in FLOAT/DOUBLE and raising elsewhere.
+        """
 
     def to_numpy(self, columns: Iterable[str] | None = None) -> dict[str, numpy.ndarray]:
         """

@@ -67,8 +67,10 @@ class Result {
     // Pull the next chunk. Shares the cursor with other consumers.
     nb::object fetch_chunk();
 
-    // Pull the next chunk as NumPy arrays.
-    nb::object fetch_numpy_chunk();
+    // Pull the next chunk as NumPy arrays: zero-copy views, except that with
+    // `fill_nulls` a column containing NULLs is copied with them filled as
+    // to_numpy() does.
+    nb::object fetch_numpy_chunk(bool fill_nulls);
 
     // Drain selected flat columns into NumPy arrays.
     nb::object to_numpy(nb::object columns);
