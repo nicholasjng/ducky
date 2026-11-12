@@ -38,6 +38,7 @@ from ._profile import (
     profile,
 )
 from ._progress import progress_bar
+from ._stream import Shuffle, Stream, shuffle, stream
 from ._typing import DuckDBConfig
 
 
@@ -78,7 +79,9 @@ __all__ = [
     "PreparedStatement",
     "ProfileConfig",
     "Result",
+    "Shuffle",
     "Split",
+    "Stream",
     "Target",
     "Tensor",
     "Vector",
@@ -92,7 +95,9 @@ __all__ = [
     "matrix",
     "profile",
     "progress_bar",
+    "shuffle",
     "split",
+    "stream",
     "target",
     "tensor",
     "vector",

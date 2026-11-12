@@ -1203,13 +1203,54 @@ void copy_numpy_values(char* dst, duckdb_vector v, idx_t count, const NumpyColum
     }
 }
 
+// True if any of `count` rows is NULL, or, in an ARRAY, any value in them.
+bool has_nulls(duckdb_vector v, idx_t count, const ArrayLayout& array) {
+    idx_t entries = count;
+    for (size_t level = 0;; ++level) {
+        if (uint64_t* validity = duckdb_vector_get_validity(v)) {
+            for (idx_t r = 0; r < entries; ++r) {
+                if (!duckdb_validity_row_is_valid(validity, r)) return true;
+            }
+        }
+        if (level == array.dims.size()) return false;
+        entries *= array.dims[level];
+        v = duckdb_array_vector_get_child(v);
+    }
+}
+
+// Wrap a buffer of `total` filled rows as the column's ndarray.
+nb::object wrap_numpy(const NumpyColumnPlan& p, char* buf, idx_t total, nb::object owner) {
+    if (p.struct_view) {
+        // Wrap as a flat uint8 buffer (total * elem_size bytes) and let
+        // numpy reinterpret it as a structured array of `total` items.
+        size_t byte_shape[1] = {total * p.elem_size};
+        nb::ndarray<nb::numpy> raw(buf, 1, byte_shape, owner, nullptr, p.dtype);
+        return nb::cast(raw).attr("view")(p.struct_view);
+    }
+    std::vector<size_t> shape{(size_t)total};
+    shape.insert(shape.end(), p.array.dims.begin(), p.array.dims.end());
+    return nb::cast(
+        nb::ndarray<nb::numpy>(buf, shape.size(), shape.data(), owner, nullptr, p.dtype));
+}
+
+// Allocate `bytes` owned by the returned capsule, which frees them when the
+// last ndarray referencing it goes away.
+nb::capsule numpy_buffer(size_t bytes, char*& buf) {
+    void* p = bytes ? std::malloc(bytes) : nullptr;
+    if (bytes && !p) throw std::bad_alloc();
+    buf = (char*)p;
+    return nb::capsule(p, [](void* q) noexcept { std::free(q); });
+}
+
 }  // namespace
 
-nb::object Result::fetch_numpy_chunk() {
+nb::object Result::fetch_numpy_chunk(bool fill_nulls) {
     // Validate every column before pulling, so an unsupported type doesn't
     // consume (and lose) a chunk.
+    std::vector<NumpyColumnPlan> plans;
+    plans.reserve(column_count_);
     for (idx_t i = 0; i < column_count_; ++i) {
-        plan_column(types_[i], column_types_[i], schema_->names[i]);
+        plans.push_back(plan_column(types_[i], column_types_[i], schema_->names[i]));
     }
     duckdb_data_chunk chunk;
     {
@@ -1223,8 +1264,17 @@ nb::object Result::fetch_numpy_chunk() {
     Chunk& c = nb::cast<Chunk&>(chunk_obj);
     nb::dict out;
     const std::vector<std::string>& names = schema_->names;
+    idx_t size = c.size();
     for (idx_t i = 0; i < (idx_t)names.size(); ++i) {
-        out[names[i].c_str()] = c.column_at(i, chunk_obj);
+        duckdb_vector v = duckdb_data_chunk_get_vector(chunk, i);
+        if (fill_nulls && has_nulls(v, size, plans[i].array)) {
+            char* buf;
+            nb::capsule owner = numpy_buffer(size * plans[i].elem_size, buf);
+            copy_numpy_values(buf, v, size, plans[i], names[i]);
+            out[names[i].c_str()] = wrap_numpy(plans[i], buf, size, owner);
+        } else {
+            out[names[i].c_str()] = c.column_at(i, chunk_obj);
+        }
     }
     return out;
 }
@@ -1250,22 +1300,6 @@ nb::object Result::to_numpy(nb::object columns) {
         plans[c] = plan_column(types_[c], column_types_[c], schema_->names[c]);
     }
 
-    // Wrap a filled buffer as the column's ndarray.
-    auto wrap = [&](idx_t c, char* buf, idx_t total, nb::object owner) -> nb::object {
-        const NumpyColumnPlan& p = plans[c];
-        if (p.struct_view) {
-            // Wrap as a flat uint8 buffer (total * elem_size bytes) and let
-            // numpy reinterpret it as a structured array of `total` items.
-            size_t byte_shape[1] = {total * p.elem_size};
-            nb::ndarray<nb::numpy> raw(buf, 1, byte_shape, owner, nullptr, p.dtype);
-            return nb::cast(raw).attr("view")(p.struct_view);
-        }
-        std::vector<size_t> shape{(size_t)total};
-        shape.insert(shape.end(), p.array.dims.begin(), p.array.dims.end());
-        return nb::cast(
-            nb::ndarray<nb::numpy>(buf, shape.size(), shape.data(), owner, nullptr, p.dtype));
-    };
-
     auto lock = lock_cursor();
 
     // Allocate upfront when the exact remaining row count is known.
@@ -1275,13 +1309,8 @@ nb::object Result::to_numpy(nb::object columns) {
         std::vector<nb::object> owners(column_count_);
         for (idx_t c = 0; c < column_count_; ++c) {
             if (!selected[c]) continue;
-            size_t bytes = total * plans[c].elem_size;
-            void* buf = bytes ? std::malloc(bytes) : nullptr;
-            if (bytes && !buf) throw std::bad_alloc();
-            // Capsule frees `buf` when the ndarray's owner ref hits zero (or on
-            // a throw below, via the owners vector).
-            owners[c] = nb::capsule(buf, [](void* p) noexcept { std::free(p); });
-            bufs[c] = (char*)buf;
+            // The owners vector frees the buffers on a throw below.
+            owners[c] = numpy_buffer(total * plans[c].elem_size, bufs[c]);
         }
 
         if (total > 0 && column_count_ > 0) {
@@ -1309,7 +1338,7 @@ nb::object Result::to_numpy(nb::object columns) {
         nb::dict out;
         for (idx_t c = 0; c < column_count_; ++c) {
             if (!selected[c]) continue;
-            out[schema_->names[c].c_str()] = wrap(c, bufs[c], total, owners[c]);
+            out[schema_->names[c].c_str()] = wrap_numpy(plans[c], bufs[c], total, owners[c]);
         }
         return out;
     }
@@ -1322,19 +1351,16 @@ nb::object Result::to_numpy(nb::object columns) {
     for (idx_t c = 0; c < column_count_; ++c) {
         if (!selected[c]) continue;
         const NumpyColumnPlan& p = plans[c];
-        size_t bytes = total * p.elem_size;
-        void* buf = bytes ? std::malloc(bytes) : nullptr;
-        if (bytes && !buf) throw std::bad_alloc();
-        // Capsule frees `buf` when the ndarray's owner ref hits zero.
-        nb::capsule owner(buf, [](void* p) noexcept { std::free(p); });
+        char* buf;
+        nb::capsule owner = numpy_buffer(total * p.elem_size, buf);
 
         size_t offset = 0;
         for (size_t i = 0; i < pulled.size(); ++i) {
-            copy_numpy_values((char*)buf + offset, pulled.vector(i, c), pulled.sizes[i], p,
+            copy_numpy_values(buf + offset, pulled.vector(i, c), pulled.sizes[i], p,
                               schema_->names[c]);
             offset += pulled.sizes[i] * p.elem_size;
         }
-        out[schema_->names[c].c_str()] = wrap(c, (char*)buf, total, owner);
+        out[schema_->names[c].c_str()] = wrap_numpy(p, buf, total, owner);
     }
     return out;
 }

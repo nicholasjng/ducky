@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, Protocol, overload
 
@@ -375,13 +375,45 @@ def _iter_field_columns(
                 yield f"{field_name}__{col_name}", field_name, feat
 
 
-def _compile_sql(
-    source: str,
+def _row_id_expr(key: str | None) -> str:
+    """A row's identity: its ``key`` expression, else its position in the scan."""
+    return f"({key})" if key is not None else "row_number() OVER ()"
+
+
+def _bucket_expr(row_id: str, split_spec: Split, key: str | None) -> str:
+    """Hash a row's identity (from ``_row_id_expr``) into its fold bucket."""
+    if key is None:
+        return f"(hash({row_id} + {split_spec.seed}) % {_N_BUCKETS})"
+    return f"(hash({row_id}, {split_spec.seed}) % {_N_BUCKETS})"
+
+
+def _null_filter(drop_nulls: list[str] | None) -> str:
+    if not drop_nulls:
+        return ""
+    return " WHERE " + " AND ".join(f"{_quote_ident(c)} IS NOT NULL" for c in drop_nulls)
+
+
+def _select_item(
+    alias: str, spec: Feature | Vector | Tensor, mean: str | None = None, std: str | None = None
+) -> str:
+    """Cast one field column, standardized with ``mean``/``std`` SQL if given."""
+    expr = spec.expr
+    if mean is not None and std is not None:
+        # coalesce(nullif(std, 0), 1): a constant column (std = 0) yields 0
+        # (sklearn's StandardScaler convention) instead of a division by zero,
+        # whose NULL result would surface as garbage in the dense ndarrays
+        # downstream.
+        expr = f"({expr} - {mean}) / coalesce(nullif({std}, 0), 1)"
+    sql_type = _to_duckdb_dtype(spec.dtype)
+    if isinstance(spec, Tensor):
+        sql_type += "".join(f"[{d}]" for d in spec.shape)
+    return f"CAST({expr} AS {sql_type}) AS {_quote_ident(alias)}"
+
+
+def _check_columns(
     fields: dict[str, Field],
-    drop_nulls: list[str] | None,
-    split_spec: Split | None,
-) -> tuple[str, list[tuple[str, int, int]]]:
-    """Compile fields, filtering, splitting, and standardization into SQL."""
+) -> list[tuple[str, str, Feature | Vector | Tensor]]:
+    """Return the fields' columns, rejecting empty, duplicate and reserved aliases."""
     if not fields:
         raise ValueError("at least one field is required")
 
@@ -398,21 +430,29 @@ def _compile_sql(
             "field/column alias '_bucket' is reserved for ducky's internal fold "
             "bookkeeping; rename this field or matrix column"
         )
+    return columns
+
+
+def _compile_sql(
+    source: str,
+    fields: dict[str, Field],
+    drop_nulls: list[str] | None,
+    split_spec: Split | None,
+    key: str | None = None,
+) -> tuple[str, list[tuple[str, int, int]]]:
+    """Compile fields, filtering, splitting, and standardization into SQL."""
+    columns = _check_columns(fields)
 
     from_clause = _quote_literal(source)
 
     if split_spec is not None:
         ranges = _fold_ranges(split_spec.fractions)
-        bucket_expr = f"(hash(row_number() OVER () + {split_spec.seed}) % {_N_BUCKETS})"
+        bucket_expr = _bucket_expr(_row_id_expr(key), split_spec, key)
     else:
         ranges = [("train", 0, _N_BUCKETS)]
         bucket_expr = "0::BIGINT"
 
-    null_filter = (
-        " WHERE " + " AND ".join(f"{_quote_ident(c)} IS NOT NULL" for c in drop_nulls)
-        if drop_nulls
-        else ""
-    )
+    null_filter = _null_filter(drop_nulls)
     raw_sql = f"SELECT *, {bucket_expr} AS _bucket FROM {from_clause}{null_filter}"
 
     needs_stats = any(spec.standardize for _, _, spec in columns)
@@ -440,19 +480,11 @@ def _compile_sql(
     select_items: list[str] = []
     for alias, _, spec in columns:
         if spec.standardize:
-            # coalesce(nullif(std, 0), 1): a constant column (std = 0) yields 0
-            # (sklearn's StandardScaler convention) instead of a division by
-            # zero, whose NULL result would surface as garbage in the dense
-            # ndarrays downstream.
             mean = f"stats.{_quote_ident(f'_{alias}_mean')}"
             std = f"stats.{_quote_ident(f'_{alias}_std')}"
-            expr = f"({spec.expr} - {mean}) / coalesce(nullif({std}, 0), 1)"
+            select_items.append(_select_item(alias, spec, mean, std))
         else:
-            expr = spec.expr
-        sql_type = _to_duckdb_dtype(spec.dtype)
-        if isinstance(spec, Tensor):
-            sql_type += "".join(f"[{d}]" for d in spec.shape)
-        select_items.append(f"CAST({expr} AS {sql_type}) AS {_quote_ident(alias)}")
+            select_items.append(_select_item(alias, spec))
     select_items.append("CAST(_bucket AS BIGINT) AS _bucket")
 
     sql = f"{ctes} SELECT {', '.join(select_items)} FROM {from_outer}"
@@ -468,7 +500,7 @@ def _assemble_field(name: str, spec: Field, columns_data: dict[str, Any], backen
 
 
 def _normalize_fields(
-    fields: dict[str, Field] | None,
+    fields: Mapping[str, Field] | None,
     columns: dict[str, Feature] | None,
     target_spec: Target | None,
 ) -> dict[str, Field]:
@@ -491,11 +523,12 @@ def _normalize_fields(
 def dataset(
     source: str,
     *,
-    fields: dict[str, Field] | None = ...,
+    fields: Mapping[str, Field] | None = ...,
     columns: dict[str, Feature] | None = ...,
     target: Target | None = ...,
     drop_nulls: list[str] | None = ...,
     split: Split | None = ...,
+    key: str | None = ...,
     con: Connection | None = ...,
     backend: Literal["numpy"] = ...,
     device: Any = ...,
@@ -504,11 +537,12 @@ def dataset(
 def dataset(
     source: str,
     *,
-    fields: dict[str, Field] | None = ...,
+    fields: Mapping[str, Field] | None = ...,
     columns: dict[str, Feature] | None = ...,
     target: Target | None = ...,
     drop_nulls: list[str] | None = ...,
     split: Split | None = ...,
+    key: str | None = ...,
     con: Connection | None = ...,
     backend: Literal["jax"],
     device: Any = ...,
@@ -517,11 +551,12 @@ def dataset(
 def dataset(
     source: str,
     *,
-    fields: dict[str, Field] | None = ...,
+    fields: Mapping[str, Field] | None = ...,
     columns: dict[str, Feature] | None = ...,
     target: Target | None = ...,
     drop_nulls: list[str] | None = ...,
     split: Split | None = ...,
+    key: str | None = ...,
     con: Connection | None = ...,
     backend: Literal["torch"],
     device: Any = ...,
@@ -530,11 +565,12 @@ def dataset(
 def dataset(
     source: str,
     *,
-    fields: dict[str, Field] | None = ...,
+    fields: Mapping[str, Field] | None = ...,
     columns: dict[str, Feature] | None = ...,
     target: Target | None = ...,
     drop_nulls: list[str] | None = ...,
     split: Split | None = ...,
+    key: str | None = ...,
     con: Connection | None = ...,
     backend: Literal["mlx"],
     device: Any = ...,
@@ -543,11 +579,12 @@ def dataset(
 def dataset(
     source: str,
     *,
-    fields: dict[str, Field] | None = ...,
+    fields: Mapping[str, Field] | None = ...,
     columns: dict[str, Feature] | None = ...,
     target: Target | None = ...,
     drop_nulls: list[str] | None = ...,
     split: Split | None = ...,
+    key: str | None = ...,
     con: Connection | None = ...,
     backend: str,
     device: Any = ...,
@@ -555,19 +592,22 @@ def dataset(
 def dataset(
     source: str,
     *,
-    fields: dict[str, Field] | None = None,
+    fields: Mapping[str, Field] | None = None,
     columns: dict[str, Feature] | None = None,
     target: Target | None = None,
     drop_nulls: list[str] | None = None,
     split: Split | None = None,
+    key: str | None = None,
     con: Connection | None = None,
     backend: str = "numpy",
     device: Any = None,
 ) -> Dataset[Any]:
     """Load a DuckDB-readable source into split NumPy, JAX, Torch, or MLX arrays.
 
-    ``fields`` maps names to vectors or matrices. ``columns`` and ``target``
-    provide the ``X``/``y`` shorthand. Standardization uses only the train fold.
+    ``fields`` maps names to vectors, matrices, or tensors. ``columns`` and
+    ``target`` provide the ``X``/``y`` shorthand. Standardization uses only the
+    train fold. ``key`` is a SQL expression identifying each row, which assigns
+    it to its fold; without one, a row's position in the scan does.
     """
     if backend not in _BACKENDS:
         raise ValueError(f"unknown backend {backend!r}; supported backends: {list(_BACKENDS)}")
@@ -576,7 +616,7 @@ def dataset(
 
     field_specs = _normalize_fields(fields, columns, target)
 
-    sql, ranges = _compile_sql(source, field_specs, drop_nulls, split)
+    sql, ranges = _compile_sql(source, field_specs, drop_nulls, split, key)
     own_connection = con is None
     if own_connection:
         con = connect()
