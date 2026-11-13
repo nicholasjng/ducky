@@ -27,6 +27,7 @@ from ._dataset import (
     _normalize_fields,
     _null_filter,
     _quote_literal,
+    _resolve_categories,
     _row_id_expr,
     _select_item,
 )
@@ -249,7 +250,8 @@ def _register_with_torch() -> None:
 class Stream[ArrayT: AbstractArray]:
     """Batches of one fold, streamed from the source; iterate once per epoch.
 
-    Each full pass advances :attr:`epoch`, which reseeds the shuffle. Under
+    :attr:`categories` holds each category field's categories, indexed by its
+    codes. Each full pass advances :attr:`epoch`, which reseeds the shuffle. Under
     DataLoader workers, call :meth:`set_epoch` every epoch instead: workers
     iterate copies, so the stream itself never sees an epoch end.
     """
@@ -301,7 +303,18 @@ class Stream[ArrayT: AbstractArray]:
         self._plans: dict[tuple[int, bool], tuple[list[str] | None, int | None]] = {}
         # Computed here, so DataLoader workers inherit them instead of each
         # scanning the source again.
-        self._stats = self._standardization()
+        source_sql = _quote_literal(source)
+        train = self._in_fold("train") if "train" in self._ranges else None
+        conn, own = self._connect()
+        try:
+            resolved, self.categories = _resolve_categories(
+                conn, source_sql, self._from(source_sql), train, field_specs
+            )
+            self._columns = _check_columns(resolved)
+            self._stats = self._standardization(conn)
+        finally:
+            if own:
+                conn.close()
 
     def set_epoch(self, epoch: int) -> None:
         """Start the next iteration at the beginning of ``epoch``."""
@@ -366,7 +379,7 @@ class Stream[ArrayT: AbstractArray]:
         lo, hi = self._ranges[fold]
         return f"_ducky_bucket >= {lo} AND _ducky_bucket < {hi}"
 
-    def _standardization(self) -> dict[str, tuple[str, str]]:
+    def _standardization(self, con: Connection) -> dict[str, tuple[str, str]]:
         """Train-fold mean and standard deviation (as SQL literals) per standardized column."""
         wanted = [(alias, spec) for alias, _, spec in self._columns if spec.standardize]
         if not wanted:
@@ -381,12 +394,7 @@ class Stream[ArrayT: AbstractArray]:
             f"{self._from(_quote_literal(self.source))} "
             f"SELECT count(*), {aggregates} FROM raw WHERE {self._in_fold('train')}"
         )
-        con, own = self._connect()
-        try:
-            row = con.sql(sql).fetchone()
-        finally:
-            if own:
-                con.close()
+        row = con.sql(sql).fetchone()
         assert row is not None
         if row[0] == 0:
             raise ValueError(

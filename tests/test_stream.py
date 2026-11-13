@@ -220,6 +220,15 @@ def test_key_assigns_the_same_folds_as_dataset(parquet_dir):
     np.testing.assert_array_equal(np.sort(whole), np.sort(ds["train"]["x"]))
 
 
+def test_category_codes_match_dataset(parquet_path):
+    fields = {"y": ducky.category("y::VARCHAR"), "id": ducky.vector("id", dtype="i64")}
+    ds = ducky.dataset(parquet_path, fields=fields, split=SPLIT)
+    stream = ducky.stream(parquet_path, fields=fields, split=SPLIT, fold="val", batch_size=500)
+    assert stream.categories == ds.categories == {"y": ["0", "1", "2"]}
+    got = np.concatenate([b["y"] for b in stream])
+    np.testing.assert_array_equal(got, ds["val"]["y"])
+
+
 def test_prefetch_matches_inline(parquet_path):
     kwargs: dict[str, Any] = {
         "fields": FIELDS,

@@ -15,6 +15,7 @@ from ._core import (
 )
 from ._core import connect as _connect
 from ._dataset import (
+    Category,
     Dataset,
     Feature,
     Fold,
@@ -23,6 +24,7 @@ from ._dataset import (
     Target,
     Tensor,
     Vector,
+    category,
     dataset,
     feature,
     matrix,
@@ -69,6 +71,7 @@ __all__ = [
     "DEFAULT",
     "Appender",
     "ArrowSource",
+    "Category",
     "Connection",
     "Dataset",
     "DuckDBConfig",
@@ -86,6 +89,7 @@ __all__ = [
     "Tensor",
     "Vector",
     "__duckdb_version__",
+    "category",
     "config_options",
     "connect",
     "dataset",
