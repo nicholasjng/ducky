@@ -45,6 +45,10 @@ inline duckdb_vector array_leaf(duckdb_vector v, const ArrayLayout& layout) {
     return v;
 }
 
+// An ENUM type's labels, in code order; raises for other types, naming
+// column `name`.
+nb::list enum_categories(duckdb_logical_type logical, const std::string& name);
+
 // Cached NumPy dtypes for structured DuckDB storage.
 struct StructDtypes {
     nb::object hugeint;   // dtype([('lower','<u8'),('upper','<i8')])

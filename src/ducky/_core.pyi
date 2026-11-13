@@ -38,8 +38,12 @@ class Chunk:
 
     def column(self, key: int | str) -> numpy.ndarray:
         """
-        Return a zero-copy ndarray view by index or name; (rows, *dims) for an ARRAY.
+        Return a zero-copy ndarray view by index or name; (rows, *dims) for an ARRAY, codes for
+        an ENUM.
         """
+
+    def categories(self, key: int | str) -> list[str]:
+        """Return an ENUM column's labels, indexed by the codes its views hold."""
 
     def validity(self, key: int | str) -> numpy.ndarray | None:
         """
@@ -105,8 +109,14 @@ class Result:
     def to_numpy(self, columns: Iterable[str] | None = None) -> dict[str, numpy.ndarray]:
         """
         Drain the result into a {name: numpy.ndarray} dict. A fixed-size ARRAY column becomes an
-        (n, *dims) array. NULLs become NaN in FLOAT/DOUBLE columns and raise elsewhere. Raises on
-        VARCHAR/LIST/STRUCT/MAP; use arrow() for those.
+        (n, *dims) array and an ENUM column its integer codes (see categories()). NULLs become
+        NaN in FLOAT/DOUBLE columns and raise elsewhere. Raises on VARCHAR/LIST/STRUCT/MAP; use
+        arrow() for those.
+        """
+
+    def categories(self, key: int | str) -> list[str]:
+        """
+        Return an ENUM column's labels, indexed by the codes NumPy output holds.
         """
 
     def __arrow_c_stream__(self, requested_schema: Any = None) -> Any:
@@ -131,8 +141,8 @@ class Result:
     def fetchnumpy(self) -> dict[str, numpy.ndarray]:
         """
         Return the result as a dict of column name -> numpy array. Numeric and temporal columns,
-        and fixed-size ARRAYs of them, only; use arrow() for strings and other nested types. NULLs
-        become NaN in FLOAT/DOUBLE columns and raise elsewhere.
+        fixed-size ARRAYs of them, and ENUM codes only; use arrow() for strings and other nested
+        types. NULLs become NaN in FLOAT/DOUBLE columns and raise elsewhere.
         """
 
     def chunks(self) -> Iterator[Chunk]:
@@ -412,8 +422,8 @@ class Connection:
     def fetchnumpy(self) -> dict[str, numpy.ndarray]:
         """
         Return the result as a dict of column name -> numpy array. Numeric and temporal columns,
-        and fixed-size ARRAYs of them, only; use arrow() for strings and other nested types. NULLs
-        become NaN in FLOAT/DOUBLE columns and raise elsewhere.
+        fixed-size ARRAYs of them, and ENUM codes only; use arrow() for strings and other nested
+        types. NULLs become NaN in FLOAT/DOUBLE columns and raise elsewhere.
         """
 
     def chunks(self) -> Iterator[Chunk]:

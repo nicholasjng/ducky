@@ -40,6 +40,11 @@ bool Chunk::dense(idx_t i, void*& data, nb::dlpack::dtype& dtype, std::vector<si
         data = duckdb_vector_get_data(vector(i));
         return true;
     }
+    if (tid == DUCKDB_TYPE_ENUM) {  // the dictionary codes
+        (void)dtype_for(duckdb_enum_internal_type(logical_type(i)), dtype);
+        data = duckdb_vector_get_data(vector(i));
+        return true;
+    }
     ArrayLayout layout;
     if (tid != DUCKDB_TYPE_ARRAY || !array_layout(logical_type(i), layout)) return false;
     dtype = layout.leaf->dtype();
@@ -94,22 +99,22 @@ std::vector<std::string> Chunk::column_types() {
     return out;
 }
 
-idx_t Chunk::resolve(nb::object key) const {
+idx_t ChunkSchema::resolve(nb::object key) const {
     if (nb::isinstance<nb::str>(key)) {
         // Borrow PyUnicode's cached UTF-8; the std::string ctor only allocates
         // for the probe key (and once more on miss for the error message).
         Py_ssize_t size = 0;
         const char* data = PyUnicode_AsUTF8AndSize(key.ptr(), &size);
         if (!data) throw nb::python_error();
-        auto it = schema_->name_to_idx.find(std::string(data, (size_t)size));
-        if (it == schema_->name_to_idx.end()) {
+        auto it = name_to_idx.find(std::string(data, (size_t)size));
+        if (it == name_to_idx.end()) {
             throw DuckyError("ducky: no such column: " + std::string(data, (size_t)size));
         }
         return it->second;
     }
     if (nb::isinstance<nb::int_>(key)) {
         int64_t i = nb::cast<int64_t>(key);
-        int64_t n = (int64_t)schema_->names.size();
+        int64_t n = (int64_t)names.size();
         if (i < 0) i += n;
         if (i < 0 || i >= n) throw DuckyError("ducky: column index out of range");
         return (idx_t)i;
@@ -184,6 +189,11 @@ nb::object Chunk::mlx(nb::object key, nb::handle owner) {
     }
     return nb::cast(
         nb::ndarray<nb::mlx, nb::ro>(data, shape.size(), shape.data(), owner, nullptr, dtype));
+}
+
+nb::list Chunk::categories(nb::object key) {
+    idx_t i = resolve(key);
+    return enum_categories(logical_type(i), schema_->names[i]);
 }
 
 int Chunk::decimal_scale(nb::object key) {

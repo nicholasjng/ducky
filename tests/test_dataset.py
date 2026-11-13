@@ -446,3 +446,77 @@ def test_tensor_shape_validates():
         ducky.tensor("emb", ())
     with pytest.raises(ValueError, match="positive ints"):
         ducky.tensor("emb", (3, 0))
+
+
+@pytest.fixture
+def labels_path(tmp_path):
+    p = tmp_path / "labels.parquet"
+    ducky.connect().execute(
+        f"COPY (SELECT i AS id, (['b', 'a', 'c'])[1 + i % 3] AS s, "
+        f"CASE WHEN i = 5 THEN NULL ELSE i % 4 END AS n FROM range(300) t(i)) TO '{p}'"
+    )
+    return str(p)
+
+
+def test_category_learns_sorted_train_values(labels_path):
+    ds = ducky.dataset(
+        labels_path,
+        fields={"s": ducky.category("s"), "n": ducky.category("n"), "id": ducky.vector("id")},
+        split=ducky.split(0.8, seed=0),
+    )
+    assert ds.categories == {"s": ["a", "b", "c"], "n": [0, 1, 2, 3]}
+    for fold in ds.folds.values():
+        ids = fold["id"].astype(int)
+        assert fold["s"].dtype == np.int64
+        np.testing.assert_array_equal(fold["s"], ["abc".index("bac"[i % 3]) for i in ids])
+        np.testing.assert_array_equal(fold["n"], [-1 if i == 5 else i % 4 for i in ids])
+
+
+def test_category_with_given_categories(labels_path):
+    ds = ducky.dataset(labels_path, fields={"s": ducky.category("s", ["c", "b"], dtype="i8")})
+    assert ds.categories == {"s": ["c", "b"]}
+    codes = ds["train"]["s"]
+    assert codes.dtype == np.int8
+    np.testing.assert_array_equal(codes[:3], [1, -1, 0])  # unknown "a" is -1
+
+
+def test_category_matches_given_categories_as_duckdb_writes_them(labels_path):
+    ds = ducky.dataset(
+        labels_path,
+        fields={
+            "b": ducky.category("n = 1", [True, False]),  # DuckDB writes true, Python True
+            "d": ducky.category("n::DECIMAL(4,1)", [3, 2, 1, 0]),  # 3.0, not 3
+            "n": ducky.vector("n"),
+        },
+    )
+    n = ds["train"]["n"]
+    np.testing.assert_array_equal(ds["train"]["b"], np.where(np.isnan(n), -1, n != 1))
+    np.testing.assert_array_equal(ds["train"]["d"], np.where(np.isnan(n), -1, 3 - n))
+
+
+def test_category_uses_an_enum_dictionary(labels_path):
+    con = ducky.connect()
+    con.execute("CREATE TYPE letter AS ENUM ('c', 'b', 'a')")
+    ds = ducky.dataset(labels_path, fields={"s": ducky.category("s::letter")}, con=con)
+    assert ds.categories == {"s": ["c", "b", "a"]}
+    np.testing.assert_array_equal(ds["train"]["s"][:3], [1, 2, 0])
+
+
+def test_category_validation(labels_path):
+    with pytest.raises(ValueError, match="signed integer dtype"):
+        ducky.category("s", dtype="u8")
+    for expr, given in [("s", ["a", "a"]), ("n", [1.0, 1])]:  # 1.0 and 1 are both BIGINT 1
+        with pytest.raises(ValueError, match="distinct"):
+            ducky.dataset(labels_path, fields={"s": ducky.category(expr, given)})
+    with pytest.raises(ducky.Error, match="Could not convert"):
+        ducky.dataset(labels_path, fields={"n": ducky.category("n", ["x"])})
+    with pytest.raises(ValueError, match="more than i8 codes"):
+        ducky.dataset(labels_path, fields={"id": ducky.category("id", dtype="i8")})
+    with pytest.raises(ValueError, match="fold named 'train'"):
+        ducky.dataset(
+            labels_path,
+            fields={"s": ducky.category("s")},
+            split=ducky.split({"fit": 0.5, "val": 0.5}),
+        )
+    with pytest.raises(ValueError, match="no values in the 'train' fold"):
+        ducky.dataset(labels_path, fields={"s": ducky.category("NULL::VARCHAR")})

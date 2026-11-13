@@ -72,6 +72,9 @@ class Result {
     // to_numpy() does.
     nb::object fetch_numpy_chunk(bool fill_nulls);
 
+    // An ENUM column's labels, indexed by the codes NumPy output holds.
+    nb::list categories(nb::object key) const;
+
     // Drain selected flat columns into NumPy arrays.
     nb::object to_numpy(nb::object columns);
 

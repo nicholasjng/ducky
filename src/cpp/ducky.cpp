@@ -61,9 +61,8 @@ void def_conversions(Cls& cls, Src src) {
         [src](nb::object self) { return conversions().attr("fetchnumpy")(src(self)); },
         nb::sig("def fetchnumpy(self) -> dict[str, numpy.ndarray]"),
         "Return the result as a dict of column name -> numpy array. Numeric and temporal columns,\n"
-        "and fixed-size ARRAYs of them, only; use arrow() for strings and other nested types. "
-        "NULLs\n"
-        "become NaN in FLOAT/DOUBLE columns and raise elsewhere.");
+        "fixed-size ARRAYs of them, and ENUM codes only; use arrow() for strings and other nested\n"
+        "types. NULLs become NaN in FLOAT/DOUBLE columns and raise elsewhere.");
     cls.def(
         "chunks", [src](nb::object self) { return conversions().attr("chunks")(src(self)); },
         nb::sig("def chunks(self) -> collections.abc.Iterator[Chunk]"),
@@ -180,7 +179,12 @@ NB_MODULE(_core, m) {
                 return nb::cast<Chunk&>(self).column(key, self);
             },
             "key"_a, nb::sig("def column(self, key: int | str) -> numpy.ndarray"),
-            "Return a zero-copy ndarray view by index or name; (rows, *dims) for an ARRAY.")
+            "Return a zero-copy ndarray view by index or name; (rows, *dims) for an ARRAY, codes "
+            "for\n"
+            "an ENUM.")
+        .def("categories", &Chunk::categories, "key"_a,
+             nb::sig("def categories(self, key: int | str) -> list[str]"),
+             "Return an ENUM column's labels, indexed by the codes its views hold.")
         .def(
             "validity",
             [](nb::object self, nb::object key) {
@@ -240,11 +244,15 @@ NB_MODULE(_core, m) {
                     "| None = None) -> dict[str, numpy.ndarray]"),
             "Drain the result into a {name: numpy.ndarray} dict. A fixed-size ARRAY column becomes "
             "an\n"
-            "(n, *dims) array. NULLs become NaN in FLOAT/DOUBLE columns and raise elsewhere. "
-            "Raises "
-            "on\n"
-            "VARCHAR/LIST/STRUCT/MAP; use arrow() for those.",
+            "(n, *dims) array and an ENUM column its integer codes (see categories()). NULLs "
+            "become\n"
+            "NaN in FLOAT/DOUBLE columns and raise elsewhere. Raises on VARCHAR/LIST/STRUCT/MAP; "
+            "use\n"
+            "arrow() for those.",
             nb::lock_self())
+        .def("categories", &Result::categories, "key"_a,
+             nb::sig("def categories(self, key: int | str) -> list[str]"),
+             "Return an ENUM column's labels, indexed by the codes NumPy output holds.")
         .def(
             "__arrow_c_stream__",
             [](nb::object self, nb::object) {

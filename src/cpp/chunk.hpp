@@ -18,6 +18,9 @@ namespace nb = nanobind;
 struct ChunkSchema {
     std::vector<std::string> names;
     tsl::robin_map<std::string, idx_t> name_to_idx;
+
+    // Resolve an int index (negative counts from the end) or str name.
+    idx_t resolve(nb::object key) const;
 };
 
 // Reusable data-chunk buffers for one result.
@@ -87,13 +90,16 @@ class Chunk {
     // Return a flat column as an MLX array.
     nb::object mlx(nb::object key, nb::handle owner);
 
+    // Returns an ENUM column's labels, indexed by the codes its views hold.
+    nb::list categories(nb::object key);
+
     // Returns a uint8 ndarray (1 = valid, 0 = null) of length `size`, or None
     // if the column has no validity mask (i.e. no nulls). The mask is unpacked
     // from DuckDB's bitmap on first access and cached.
     nb::object validity(nb::object key, nb::handle owner);
 
    private:
-    idx_t resolve(nb::object key) const;
+    idx_t resolve(nb::object key) const { return schema_->resolve(key); }
     // Point at column `i`'s values if they are one contiguous buffer (a flat
     // column, or an ARRAY of one) and give its dtype and (rows, *dims) shape.
     bool dense(idx_t i, void*& data, nb::dlpack::dtype& dtype, std::vector<size_t>& shape);

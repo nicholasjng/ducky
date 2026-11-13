@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, Protocol, overload
 
@@ -52,13 +52,28 @@ class Tensor:
 
 
 @dataclass(frozen=True)
+class Category:
+    """A categorical field, materialised as ``(n,)`` integer codes.
+
+    Codes index the field's categories: the given ones, else an ENUM's labels,
+    else the train fold's distinct values in sorted order. NULLs and values
+    outside the categories become -1.
+    """
+
+    expr: str
+    categories: tuple[Any, ...] | None = None
+    dtype: str = "i64"
+    standardize: ClassVar[bool] = False
+
+
+@dataclass(frozen=True)
 class Matrix:
     """Ordered feature columns materialized as an ``(n, d)`` array."""
 
     columns: dict[str, Feature] = field(default_factory=dict)
 
 
-Field = Vector | Matrix | Tensor
+Field = Vector | Matrix | Tensor | Category
 
 
 @dataclass(frozen=True)
@@ -90,6 +105,24 @@ def tensor(expr: str, shape: int | tuple[int, ...], *, dtype: str = "f32") -> Te
     if not dims or not all(isinstance(d, int) and d > 0 for d in dims):
         raise ValueError(f"tensor shape must be one or more positive ints; got {shape!r}")
     return Tensor(expr=expr, shape=dims, dtype=dtype)
+
+
+_CODE_DTYPES = ("i8", "i16", "i32", "i64")
+
+
+def category(expr: str, categories: Iterable[Any] | None = None, *, dtype: str = "i64") -> Category:
+    """Shorthand for :class:`Category`; ``categories`` fixes the codes' order."""
+    if dtype not in _CODE_DTYPES:
+        raise ValueError(
+            f"category codes need a signed integer dtype, one of {list(_CODE_DTYPES)}; "
+            f"got {dtype!r}"
+        )
+    if categories is None:
+        return Category(expr=expr, dtype=dtype)
+    given = tuple(categories)
+    if not given:
+        raise ValueError("categories must not be empty")
+    return Category(expr=expr, categories=given, dtype=dtype)
 
 
 def matrix(columns: dict[str, Feature]) -> Matrix:
@@ -295,6 +328,8 @@ class Dataset[ArrayT: AbstractArray]:
 
     folds: dict[str, Fold[ArrayT]]
     field_specs: dict[str, Field] = field(default_factory=dict)
+    categories: dict[str, list[Any]] = field(default_factory=dict)
+    """Each category field's categories, indexed by its codes."""
 
     @property
     def train(self) -> Fold[ArrayT] | None:
@@ -363,12 +398,13 @@ def _fold_ranges(fractions: dict[str, float]) -> list[tuple[str, int, int]]:
     return ranges
 
 
-def _iter_field_columns(
-    fields: dict[str, Field],
-) -> Iterator[tuple[str, str, Feature | Vector | Tensor]]:
+Column = Feature | Vector | Tensor | Category
+
+
+def _iter_field_columns(fields: dict[str, Field]) -> Iterator[tuple[str, str, Column]]:
     """Yield each materialized column's alias, field name, and specification."""
     for field_name, spec in fields.items():
-        if isinstance(spec, Vector | Tensor):
+        if isinstance(spec, Vector | Tensor | Category):
             yield field_name, field_name, spec
         else:
             for col_name, feat in spec.columns.items():
@@ -393,10 +429,110 @@ def _null_filter(drop_nulls: list[str] | None) -> str:
     return " WHERE " + " AND ".join(f"{_quote_ident(c)} IS NOT NULL" for c in drop_nulls)
 
 
-def _select_item(
-    alias: str, spec: Feature | Vector | Tensor, mean: str | None = None, std: str | None = None
-) -> str:
+def _train_filter(ranges: list[tuple[str, int, int]], bucket: str) -> str | None:
+    """SQL selecting the train fold's rows by their ``bucket``, if there is one."""
+    train = next((r for r in ranges if r[0] == "train"), None)
+    if train is None:
+        return None
+    _, lo, hi = train
+    return f"{bucket} >= {lo} AND {bucket} < {hi}"
+
+
+def _resolve_categories(
+    con: Connection,
+    from_clause: str,
+    ctes: str,
+    train: str | None,
+    fields: dict[str, Field],
+) -> tuple[dict[str, Field], dict[str, list[Any]]]:
+    """Replace category fields by vectors of their codes, and find their categories.
+
+    ``ctes`` define a table ``raw`` of the source's rows, of which ``train``
+    selects the train fold.
+    """
+    wanted = {name: spec for name, spec in fields.items() if isinstance(spec, Category)}
+    if not wanted:
+        return fields, {}
+    probe = con.sql(
+        f"SELECT {', '.join(s.expr for s in wanted.values())} FROM {from_clause} LIMIT 0"
+    )
+    found: dict[str, tuple[list[Any], list[str] | None]] = {}  # categories, labels
+    given, learn = [], []
+    for i, (name, spec) in enumerate(wanted.items()):
+        if spec.categories is not None:
+            given.append(name)
+        elif probe.types[i] == "ENUM":
+            found[name] = probe.categories(i), None  # its codes already
+        else:
+            learn.append(name)
+    if given:
+        # Values match by their text, so DuckDB writes the given categories as it
+        # writes the field's values (true, 1.0); one it can't represent raises.
+        exprs = ", ".join(f"{wanted[n].expr} AS _g{i}" for i, n in enumerate(given))
+        typeofs = ", ".join(f"typeof(s._g{i})" for i in range(len(given)))
+        sql_types = con.sql(
+            f"SELECT {typeofs} FROM (SELECT 1) LEFT JOIN "
+            f"(SELECT {exprs} FROM {from_clause} LIMIT 0) s ON true"
+        ).fetchone()
+        assert sql_types is not None
+        for name, sql_type in zip(given, sql_types, strict=True):
+            categories = list(wanted[name].categories or ())
+            casts = ", ".join(f"CAST(CAST(? AS {sql_type}) AS VARCHAR)" for _ in categories)
+            labels = con.execute(f"SELECT {casts}", categories).fetchone()
+            assert labels is not None
+            if len(set(labels)) != len(labels):
+                raise ValueError(
+                    f"category field {name!r}: categories must be distinct as {sql_type}"
+                )
+            found[name] = categories, list(labels)
+    if learn:
+        if train is None:
+            raise ValueError(
+                "category() learns its categories from a fold named 'train'; either "
+                "rename your training fold or pass categories="
+            )
+        lists = ", ".join(
+            f"list(DISTINCT {wanted[n].expr} ORDER BY {wanted[n].expr}) "
+            f"FILTER (WHERE {wanted[n].expr} IS NOT NULL) AS _c{i}"
+            for i, n in enumerate(learn)
+        )
+        both = ", ".join(
+            f"_c{i}, list_transform(_c{i}, lambda v: v::VARCHAR)" for i in range(len(learn))
+        )
+        row = con.sql(f"{ctes} SELECT {both} FROM (SELECT {lists} FROM raw WHERE {train})")
+        values = row.fetchone()
+        assert values is not None
+        for i, name in enumerate(learn):
+            if not values[2 * i]:
+                raise ValueError(
+                    f"category field {name!r} has no values in the 'train' fold; "
+                    "pass categories= explicitly"
+                )
+            found[name] = values[2 * i], values[2 * i + 1]
+
+    resolved = dict(fields)
+    for name, spec in wanted.items():
+        largest = 2 ** (int(spec.dtype[1:]) - 1) - 1
+        if len(found[name][0]) - 1 > largest:
+            raise ValueError(
+                f"category field {name!r} has {len(found[name][0])} categories, more than "
+                f"{spec.dtype} codes can number; use a wider dtype"
+            )
+        labels = found[name][1]
+        if labels is None:
+            codes = f"coalesce(enum_code({spec.expr}), -1)"
+        else:
+            enum = ", ".join(_quote_literal(label) for label in labels)
+            codes = (
+                f"coalesce(enum_code(TRY_CAST(CAST({spec.expr} AS VARCHAR) AS ENUM({enum}))), -1)"
+            )
+        resolved[name] = Vector(expr=codes, dtype=spec.dtype)
+    return resolved, {name: found[name][0] for name in wanted}
+
+
+def _select_item(alias: str, spec: Column, mean: str | None = None, std: str | None = None) -> str:
     """Cast one field column, standardized with ``mean``/``std`` SQL if given."""
+    assert not isinstance(spec, Category), "resolved by _resolve_categories"
     expr = spec.expr
     if mean is not None and std is not None:
         # coalesce(nullif(std, 0), 1): a constant column (std = 0) yields 0
@@ -410,9 +546,7 @@ def _select_item(
     return f"CAST({expr} AS {sql_type}) AS {_quote_ident(alias)}"
 
 
-def _check_columns(
-    fields: dict[str, Field],
-) -> list[tuple[str, str, Feature | Vector | Tensor]]:
+def _check_columns(fields: dict[str, Field]) -> list[tuple[str, str, Column]]:
     """Return the fields' columns, rejecting empty, duplicate and reserved aliases."""
     if not fields:
         raise ValueError("at least one field is required")
@@ -433,6 +567,20 @@ def _check_columns(
     return columns
 
 
+def _raw_sql(
+    source: str, drop_nulls: list[str] | None, split_spec: Split | None, key: str | None
+) -> tuple[str, list[tuple[str, int, int]]]:
+    """SQL for the source's rows with their fold ``_bucket``, and the folds' ranges."""
+    if split_spec is not None:
+        ranges = _fold_ranges(split_spec.fractions)
+        bucket_expr = _bucket_expr(_row_id_expr(key), split_spec, key)
+    else:
+        ranges = [("train", 0, _N_BUCKETS)]
+        bucket_expr = "0::BIGINT"
+    null_filter = _null_filter(drop_nulls)
+    return f"SELECT *, {bucket_expr} AS _bucket FROM {_quote_literal(source)}{null_filter}", ranges
+
+
 def _compile_sql(
     source: str,
     fields: dict[str, Field],
@@ -443,17 +591,7 @@ def _compile_sql(
     """Compile fields, filtering, splitting, and standardization into SQL."""
     columns = _check_columns(fields)
 
-    from_clause = _quote_literal(source)
-
-    if split_spec is not None:
-        ranges = _fold_ranges(split_spec.fractions)
-        bucket_expr = _bucket_expr(_row_id_expr(key), split_spec, key)
-    else:
-        ranges = [("train", 0, _N_BUCKETS)]
-        bucket_expr = "0::BIGINT"
-
-    null_filter = _null_filter(drop_nulls)
-    raw_sql = f"SELECT *, {bucket_expr} AS _bucket FROM {from_clause}{null_filter}"
+    raw_sql, ranges = _raw_sql(source, drop_nulls, split_spec, key)
 
     needs_stats = any(spec.standardize for _, _, spec in columns)
     if needs_stats:
@@ -492,8 +630,8 @@ def _compile_sql(
 
 
 def _assemble_field(name: str, spec: Field, columns_data: dict[str, Any], backend: Backend) -> Any:
-    """Stack a matrix field's columns / return a vector or tensor field's lone column."""
-    if isinstance(spec, Vector | Tensor):
+    """Stack a matrix field's columns / return a single-column field's column."""
+    if isinstance(spec, Vector | Tensor | Category):
         return columns_data[name]
     cols = [columns_data[f"{name}__{c}"] for c in spec.columns]
     return _stack(cols, backend)
@@ -605,8 +743,9 @@ def dataset(
     """Load a DuckDB-readable source into split NumPy, JAX, Torch, or MLX arrays.
 
     ``fields`` maps names to vectors, matrices, or tensors. ``columns`` and
-    ``target`` provide the ``X``/``y`` shorthand. Standardization uses only the
-    train fold. ``key`` is a SQL expression identifying each row, which assigns
+    ``target`` provide the ``X``/``y`` shorthand. Standardization, and the
+    categories of category fields that need to learn them, use only the train
+    fold. ``key`` is a SQL expression identifying each row, which assigns
     it to its fold; without one, a row's position in the scan does.
     """
     if backend not in _BACKENDS:
@@ -615,12 +754,21 @@ def dataset(
         raise ValueError(f"backend {backend!r} does not take a device argument")
 
     field_specs = _normalize_fields(fields, columns, target)
+    _check_columns(field_specs)
 
-    sql, ranges = _compile_sql(source, field_specs, drop_nulls, split, key)
     own_connection = con is None
     if own_connection:
         con = connect()
     try:
+        raw_sql, ranges = _raw_sql(source, drop_nulls, split, key)
+        resolved, categories = _resolve_categories(
+            con,
+            _quote_literal(source),
+            f"WITH raw AS ({raw_sql})",
+            _train_filter(ranges, "_bucket"),
+            field_specs,
+        )
+        sql, ranges = _compile_sql(source, resolved, drop_nulls, split, key)
         columns_data = _materialize(con.sql(sql), backend, device)
     finally:
         if own_connection:
@@ -650,4 +798,4 @@ def dataset(
         idx = np.nonzero((bucket >= lo) & (bucket < hi))[0]
         gathered = {field_name: _gather(arr, idx, backend) for field_name, arr in assembled.items()}
         folds[name] = Fold(backend=backend, _fields=gathered)
-    return Dataset(folds=folds, field_specs=field_specs)
+    return Dataset(folds=folds, field_specs=field_specs, categories=categories)

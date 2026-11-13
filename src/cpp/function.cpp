@@ -631,6 +631,23 @@ bool array_layout(duckdb_logical_type logical, ArrayLayout& out) {
     return out.leaf != nullptr;
 }
 
+nb::list enum_categories(duckdb_logical_type logical, const std::string& name) {
+    duckdb_type tid = duckdb_get_type_id(logical);
+    if (tid != DUCKDB_TYPE_ENUM) {
+        throw DuckyError("ducky: categories: column '" + name + "' is " + duckdb_type_name(tid) +
+                         ", not ENUM");
+    }
+    nb::list out;
+    uint32_t n = duckdb_enum_dictionary_size(logical);
+    for (uint32_t i = 0; i < n; ++i) {
+        char* value = duckdb_enum_dictionary_value(logical, i);
+        nb::str label(value);
+        duckdb_free(value);
+        out.append(label);
+    }
+    return out;
+}
+
 void create_scalar_function(Connection& con, const std::string& name, nb::callable fn,
                             nb::object parameters, nb::object return_type, nb::object varargs,
                             nb::object init, bool is_volatile, bool special_handling) {

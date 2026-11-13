@@ -1147,6 +1147,10 @@ NumpyColumnPlan plan_column(duckdb_type tid, duckdb_logical_type logical, const 
             const TypeSpec* spec = typespec_for(internal);  // always primitive here
             return NumpyColumnPlan{spec->size, spec->dtype(), nb::object(), tid, {}};
         }
+        case DUCKDB_TYPE_ENUM: {  // the dictionary codes
+            const TypeSpec* spec = typespec_for(duckdb_enum_internal_type(logical));
+            return NumpyColumnPlan{spec->size, spec->dtype(), nb::object(), tid, {}};
+        }
         case DUCKDB_TYPE_ARRAY:
             if (array_layout(logical, array)) {
                 const TypeSpec* leaf = array.leaf;
@@ -1243,6 +1247,11 @@ nb::capsule numpy_buffer(size_t bytes, char*& buf) {
 }
 
 }  // namespace
+
+nb::list Result::categories(nb::object key) const {
+    idx_t i = schema_->resolve(key);
+    return enum_categories(column_types_[i], schema_->names[i]);
+}
 
 nb::object Result::fetch_numpy_chunk(bool fill_nulls) {
     // Validate every column before pulling, so an unsupported type doesn't
