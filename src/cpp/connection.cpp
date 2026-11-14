@@ -499,39 +499,47 @@ Connection::Connection(const std::string& database, nb::object config) {
 
     // Iterate via .items() so we accept any read-only Mapping (TypedDict,
     // MappingProxy, user mappings), not just nb::dict.
-    duckdb_config cfg = nullptr;
+    std::vector<std::string> names, values;
     if (!config.is_none()) {
-        if (duckdb_create_config(&cfg) == DuckDBError) {
-            throw DuckyError("ducky: failed to allocate duckdb_config");
+        for (nb::handle item : config.attr("items")()) {
+            nb::tuple kv = nb::cast<nb::tuple>(item);
+            names.push_back(nb::cast<std::string>(kv[0]));
+            values.push_back(nb::cast<std::string>(kv[1]));
         }
-        try {
-            for (nb::handle item : config.attr("items")()) {
-                nb::tuple kv = nb::cast<nb::tuple>(item);
-                std::string name = nb::cast<std::string>(kv[0]);
-                std::string value = nb::cast<std::string>(kv[1]);
-                if (duckdb_set_config(cfg, name.c_str(), value.c_str()) == DuckDBError) {
-                    throw DuckyError("ducky: invalid config option '" + name + "' = '" + value +
-                                     "'");
-                }
-            }
-        } catch (...) {
-            duckdb_destroy_config(&cfg);
-            throw;
-        }
+    }
+    // An instance has no database path to put its spill files next to, as
+    // opening one does.
+    std::string path = database.empty() ? ":memory:" : database;
+    if (path != ":memory:" &&
+        std::find(names.begin(), names.end(), "temp_directory") == names.end()) {
+        names.push_back("temp_directory");
+        values.push_back(path + ".tmp");
+    }
+    std::vector<const char*> name_ptrs, value_ptrs;
+    std::vector<idx_t> name_lengths, value_lengths;
+    for (size_t i = 0; i < names.size(); i++) {
+        name_ptrs.push_back(names[i].data());
+        name_lengths.push_back(names[i].size());
+        value_ptrs.push_back(values[i].data());
+        value_lengths.push_back(values[i].size());
     }
 
-    char* error = nullptr;
-    duckdb_state state = duckdb_open_ext(database.c_str(), &handle->database, cfg, &error);
-    duckdb_destroy_config(&cfg);
-    if (state == DuckDBError) {
-        std::string message = error ? error : "unknown error";
-        duckdb_free(error);
-        // ~DuckDBHandle closes the (opened-or-not) database as `handle` unwinds.
-        throw DuckyError("ducky: failed to open '" + database + "': " + message);
-    }
-    if (duckdb_connect(handle->database, &handle->connection) == DuckDBError) {
-        throw DuckyError("ducky: failed to connect to '" + database + "'");
-    }
+    // An instance starts with no database: attach the path as its default, the
+    // way opening it would. ~DuckDBHandle tears down what exists as `handle`
+    // unwinds.
+    std::string failed = "ducky: failed to open '" + database + "': ";
+    V2Error err;
+    err.check(duckdb_v2_instance_create_with_options(
+                  v2_environment(), name_ptrs.data(), name_lengths.data(), value_ptrs.data(),
+                  value_lengths.data(), names.size(), &handle->instance, err.out()),
+              failed);
+    err.check(duckdb_v2_instance_attach(handle->instance, "", 0, path.data(), path.size(), nullptr,
+                                        /*make_default=*/true, err.out()),
+              failed);
+    err.check(duckdb_v2_connection_create(handle->instance, &handle->connection_v2, err.out()),
+              "ducky: failed to connect to '" + database + "': ");
+    err.check(duckdb_v2_instance_open_v1(handle->instance, &handle->database, err.out()), failed);
+    handle->connection = duckdb_v2_connection_get_v1(handle->connection_v2);
     handle_ = std::move(handle);
     profile_sink_ = nb::none();
 }
