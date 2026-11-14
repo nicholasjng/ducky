@@ -141,7 +141,7 @@ def test_interrupt_cancels_born_as_arrow_query():
 
     def runner():
         try:
-            # count(*): a long scan but a one-row result, so the Arrow collector
+            # count(*): a long scan but a one-row result, so the Arrow result
             # materializes ~nothing — the time is all interruptible scan work.
             con.arrow("SELECT count(*) FROM range(10_000_000_000) t(i) WHERE i % 7 = 0")
         except Exception as e:

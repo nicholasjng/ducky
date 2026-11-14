@@ -6,10 +6,12 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <optional>
 #include <thread>
 
 #include "arrow_scan.hpp"
@@ -106,15 +108,12 @@ void bind_check(duckdb_state state, idx_t idx) {
     }
 }
 
-// Bind a decimal.Decimal as an exact DECIMAL(width, scale). NaN and infinities
-// have no DECIMAL form and bind as DOUBLE.
-void bind_decimal(duckdb_prepared_statement stmt, idx_t idx, nb::handle value) {
+// A decimal.Decimal's exact DECIMAL(width, scale) form. NaN and infinities
+// have none.
+std::optional<duckdb_decimal> decimal_parts(nb::handle value, idx_t idx) {
     nb::object parts = value.attr("as_tuple")();
     nb::object exponent = parts.attr("exponent");
-    if (!nb::isinstance<nb::int_>(exponent)) {  // 'n', 'N' or 'F'
-        bind_check(duckdb_bind_double(stmt, idx, nb::cast<double>(nb::float_(value))), idx);
-        return;
-    }
+    if (!nb::isinstance<nb::int_>(exponent)) return std::nullopt;  // 'n', 'N' or 'F'
     // Build the unscaled integer from the exact digit tuple; Decimal
     // arithmetic would round to the context precision (28 digits by default).
     int64_t exp = nb::cast<int64_t>(exponent);
@@ -135,8 +134,17 @@ void bind_decimal(duckdb_prepared_statement stmt, idx_t idx, nb::handle value) {
     }
     uint64_t lo = 0, hi = 0;
     py_long_to_int128(unscaled, /*is_signed=*/true, lo, hi);
-    duckdb_decimal d{(uint8_t)width, (uint8_t)scale, duckdb_hugeint{lo, (int64_t)hi}};
-    bind_check(duckdb_bind_decimal(stmt, idx, d), idx);
+    return duckdb_decimal{(uint8_t)width, (uint8_t)scale, duckdb_hugeint{lo, (int64_t)hi}};
+}
+
+// Bind a decimal.Decimal as an exact DECIMAL, or as DOUBLE when it has no
+// DECIMAL form.
+void bind_decimal(duckdb_prepared_statement stmt, idx_t idx, nb::handle value) {
+    if (std::optional<duckdb_decimal> d = decimal_parts(value, idx)) {
+        bind_check(duckdb_bind_decimal(stmt, idx, *d), idx);
+    } else {
+        bind_check(duckdb_bind_double(stmt, idx, nb::cast<double>(nb::float_(value))), idx);
+    }
 }
 
 // Match the planned width to avoid DuckDB replanning on each execute.
@@ -367,6 +375,187 @@ void bind_parameters(duckdb_prepared_statement stmt, nb::handle parameters) {
     }
 }
 
+// One execution's parameters as C API v2 values, which bind when the
+// statement executes.
+class V2Parameters {
+   public:
+    V2Parameters(duckdb_v2_factory_handle factory, nb::handle parameters);
+    ~V2Parameters() {
+        for (duckdb_v2_value_handle& value : values_) duckdb_v2_value_destroy(&value);
+    }
+
+    V2Parameters(const V2Parameters&) = delete;
+    V2Parameters& operator=(const V2Parameters&) = delete;
+
+    // NULL when binding positionally.
+    const char** names() { return names_.empty() ? nullptr : name_ptrs_.data(); }
+    const idx_t* name_lengths() { return names_.empty() ? nullptr : name_lengths_.data(); }
+    const duckdb_v2_value_handle* values() const { return values_.data(); }
+    idx_t count() const { return values_.size(); }
+
+   private:
+    // Converts `value` as bind_one binds it. Without a statement's planned
+    // types, an int is a BIGINT and a float a DOUBLE.
+    duckdb_v2_value_handle convert(nb::handle value, idx_t idx);
+
+    duckdb_v2_factory_handle factory_;
+    std::vector<std::string> names_;
+    std::vector<const char*> name_ptrs_;
+    std::vector<idx_t> name_lengths_;
+    std::vector<duckdb_v2_value_handle> values_;
+};
+
+V2Parameters::V2Parameters(duckdb_v2_factory_handle factory, nb::handle parameters)
+    : factory_(factory) {
+    if (parameters.is_none()) return;
+    // A throwing constructor runs no destructor.
+    try {
+        idx_t idx = 0;
+        if (nb::isinstance<nb::dict>(parameters)) {
+            for (auto [k, v] : nb::borrow<nb::dict>(parameters)) {
+                names_.push_back(nb::cast<std::string>(k));
+                values_.push_back(convert(v, ++idx));
+            }
+            for (const std::string& name : names_) {
+                name_ptrs_.push_back(name.data());
+                name_lengths_.push_back(name.size());
+            }
+        } else {
+            for (nb::handle v : parameters) values_.push_back(convert(v, ++idx));
+        }
+    } catch (...) {
+        for (duckdb_v2_value_handle& value : values_) duckdb_v2_value_destroy(&value);
+        throw;
+    }
+}
+
+duckdb_v2_value_handle V2Parameters::convert(nb::handle value, idx_t idx) {
+    const BindTypes& T = bind_types();
+    duckdb_v2_value_handle out = nullptr;
+    V2Error err;
+    auto made = [&](DUCKDB_V2_ERROR code) {
+        err.check(code, "ducky: failed to bind parameter " + std::to_string(idx) + ": ");
+        return out;
+    };
+
+    if (value.is_none()) {
+        // An untyped NULL, as duckdb_bind_null binds it; no type id creates
+        // SQLNULL.
+        duckdb_v2_logical_type_handle null_type = nullptr;
+        made(duckdb_v2_factory_create_type_from_text(factory_, "NULL", 4, &null_type, err.out()));
+        DUCKDB_V2_ERROR code = duckdb_v2_value_create_null(factory_, null_type, &out, err.out());
+        duckdb_v2_logical_type_destroy(&null_type);
+        return made(code);
+    }
+    if (nb::isinstance<nb::bool_>(value)) {
+        return made(duckdb_v2_value_create_bool(factory_, nb::cast<bool>(value), &out, err.out()));
+    }
+    if (nb::isinstance<nb::int_>(value)) {
+        int64_t v = PyLong_AsLongLong(value.ptr());
+        if (v != -1 || !PyErr_Occurred()) {
+            return made(duckdb_v2_value_create_bigint(factory_, v, &out, err.out()));
+        }
+        PyErr_Clear();
+        bool negative = PyObject_RichCompareBool(value.ptr(), nb::int_(0).ptr(), Py_LT) == 1;
+        uint64_t lo = 0, hi = 0;
+        py_long_to_int128(value, /*is_signed=*/negative, lo, hi);
+        if (negative) {
+            duckdb_v2_hugeint_t h{lo, (int64_t)hi};
+            return made(duckdb_v2_value_create_hugeint(factory_, &h, &out, err.out()));
+        }
+        duckdb_v2_uhugeint_t h{lo, hi};
+        return made(duckdb_v2_value_create_uhugeint(factory_, &h, &out, err.out()));
+    }
+    if (nb::isinstance<nb::float_>(value)) {
+        return made(
+            duckdb_v2_value_create_double(factory_, nb::cast<double>(value), &out, err.out()));
+    }
+    if (nb::isinstance<nb::str>(value)) {
+        Py_ssize_t size = 0;
+        const char* data = PyUnicode_AsUTF8AndSize(value.ptr(), &size);
+        if (!data) throw nb::python_error();
+        return made(duckdb_v2_value_create_varchar(factory_, data, (idx_t)size, &out, err.out()));
+    }
+    if (nb::isinstance<nb::bytes>(value)) {
+        char* data = nullptr;
+        Py_ssize_t size = 0;
+        if (PyBytes_AsStringAndSize(value.ptr(), &data, &size) != 0) throw nb::python_error();
+        return made(duckdb_v2_value_create_blob(factory_, data, (idx_t)size, &out, err.out()));
+    }
+    // datetime.datetime is a subclass of datetime.date, so check it first.
+    PyObject* raw = value.ptr();
+    if (PyDateTime_Check(raw)) {
+        if (!value.attr("tzinfo").is_none()) {
+            return made(duckdb_v2_value_create_timestamp_tz(
+                factory_, aware_datetime_to_utc_micros(value), &out, err.out()));
+        }
+        duckdb_timestamp_struct s{};
+        s.date.year = PyDateTime_GET_YEAR(raw);
+        s.date.month = (int8_t)PyDateTime_GET_MONTH(raw);
+        s.date.day = (int8_t)PyDateTime_GET_DAY(raw);
+        s.time.hour = (int8_t)PyDateTime_DATE_GET_HOUR(raw);
+        s.time.min = (int8_t)PyDateTime_DATE_GET_MINUTE(raw);
+        s.time.sec = (int8_t)PyDateTime_DATE_GET_SECOND(raw);
+        s.time.micros = PyDateTime_DATE_GET_MICROSECOND(raw);
+        return made(duckdb_v2_value_create_timestamp(factory_, duckdb_to_timestamp(s).micros, &out,
+                                                     err.out()));
+    }
+    if (PyDate_Check(raw)) {
+        duckdb_date_struct s{};
+        s.year = PyDateTime_GET_YEAR(raw);
+        s.month = (int8_t)PyDateTime_GET_MONTH(raw);
+        s.day = (int8_t)PyDateTime_GET_DAY(raw);
+        return made(duckdb_v2_value_create_date(factory_, duckdb_to_date(s).days, &out, err.out()));
+    }
+    if (PyTime_Check(raw)) {
+        duckdb_time_struct s{};
+        s.hour = (int8_t)PyDateTime_TIME_GET_HOUR(raw);
+        s.min = (int8_t)PyDateTime_TIME_GET_MINUTE(raw);
+        s.sec = (int8_t)PyDateTime_TIME_GET_SECOND(raw);
+        s.micros = PyDateTime_TIME_GET_MICROSECOND(raw);
+        return made(
+            duckdb_v2_value_create_time(factory_, duckdb_to_time(s).micros, &out, err.out()));
+    }
+    if (PyDelta_Check(raw)) {
+        int64_t seconds = PyDateTime_DELTA_GET_SECONDS(raw);
+        duckdb_v2_interval_t iv{0, PyDateTime_DELTA_GET_DAYS(raw),
+                                seconds * 1000000 + PyDateTime_DELTA_GET_MICROSECONDS(raw)};
+        return made(duckdb_v2_value_create_interval(factory_, &iv, &out, err.out()));
+    }
+    if (nb::isinstance(value, T.decimal)) {
+        std::optional<duckdb_decimal> d = decimal_parts(value, idx);
+        if (!d) {
+            return made(duckdb_v2_value_create_double(factory_, nb::cast<double>(nb::float_(value)),
+                                                      &out, err.out()));
+        }
+        duckdb_v2_hugeint_t h{d->value.lower, d->value.upper};
+        return made(
+            duckdb_v2_value_create_decimal(factory_, &h, d->width, d->scale, &out, err.out()));
+    }
+    if (nb::isinstance(value, T.uuid)) {
+        // UUID.int is the natural unsigned value; storage flips its top bit so
+        // UUIDs sort as signed integers.
+        uint64_t lo = 0, hi = 0;
+        py_long_to_int128(value.attr("int"), /*is_signed=*/false, lo, hi);
+        duckdb_v2_hugeint_t h{lo, (int64_t)(hi ^ (uint64_t(1) << 63))};
+        return made(duckdb_v2_value_create_uuid(factory_, &h, &out, err.out()));
+    }
+    // Unbox NumPy scalars.
+    if (nb::hasattr(value, "item")) {
+        nb::object item;
+        try {
+            item = value.attr("item")();
+        } catch (...) {
+            item = nb::object();
+        }
+        if (item && item.type().ptr() != value.type().ptr()) return convert(item, idx);
+    }
+
+    throw DuckyError(std::string("ducky: unsupported parameter type at position ") +
+                     std::to_string(idx) + " (" + nb::cast<std::string>(nb::str(value.type())) +
+                     ")");
+}
+
 // Shared executemany loop with periodic signal checks.
 void executemany_loop(duckdb_prepared_statement stmt, nb::handle seq) {
     constexpr idx_t SIGNAL_CHECK_PERIOD = 1024;
@@ -468,29 +657,152 @@ void arrow_stream_capsule_destructor(PyObject* capsule) {
     }
 }
 
-// Move an Arrow-collected result into a stream capsule.
-nb::object arrow_stream_capsule_from_result(duckdb_result* result) {
-    auto* stream = (ArrowArrayStream*)calloc(1, sizeof(ArrowArrayStream));
-    if (!stream) {
-        duckdb_destroy_result(result);
-        throw std::bad_alloc();
-    }
+// The arrays of a finished v2 Arrow result, served as an ArrowArrayStream.
+// The result stays open to report the schema, and the handle to keep the
+// result's connection.
+struct CollectedArrow {
+    std::shared_ptr<DuckDBHandle> handle;
+    duckdb_v2_arrow_result_handle result = nullptr;
+    std::vector<ArrowArray> arrays;
+    size_t next = 0;
     std::string error;
-    bool failed = drain_arrow_error(duckdb_result_arrow_array_stream(result, stream), error);
-    duckdb_destroy_result(result);
-    if (failed) {
-        free(stream);
-        throw DuckyError("ducky: " + error);
+
+    ~CollectedArrow() {
+        release_arrays(arrays, next);
+        duckdb_v2_arrow_result_destroy(&result);
     }
-    PyObject* capsule =
-        PyCapsule_New(stream, "arrow_array_stream", arrow_stream_capsule_destructor);
-    if (!capsule) {
-        stream->release(stream);
-        free(stream);
-        throw nb::python_error();
+
+    static void release_arrays(std::vector<ArrowArray>& arrays, size_t from = 0) {
+        for (size_t i = from; i < arrays.size(); i++) {
+            if (arrays[i].release) arrays[i].release(&arrays[i]);
+        }
     }
-    return nb::steal(capsule);
+
+    static CollectedArrow& of(ArrowArrayStream* stream) {
+        return *(CollectedArrow*)stream->private_data;
+    }
+    static int get_schema(ArrowArrayStream* stream, ArrowSchema* out) {
+        CollectedArrow& self = of(stream);
+        V2Error err;
+        if (duckdb_v2_arrow_result_get_schema(self.result, out, err.out()) !=
+            DUCKDB_V2_ERROR_NONE) {
+            self.error = err.text();
+            return EIO;
+        }
+        return 0;
+    }
+    static int get_next(ArrowArrayStream* stream, ArrowArray* out) {
+        CollectedArrow& self = of(stream);
+        if (self.next == self.arrays.size()) {
+            out->release = nullptr;
+            return 0;
+        }
+        *out = self.arrays[self.next];
+        self.arrays[self.next++].release = nullptr;
+        return 0;
+    }
+    static const char* get_last_error(ArrowArrayStream* stream) {
+        CollectedArrow& self = of(stream);
+        return self.error.empty() ? nullptr : self.error.c_str();
+    }
+    static void release(ArrowArrayStream* stream) {
+        delete &of(stream);
+        stream->release = nullptr;
+    }
+};
+
+// Steps `result` to its end with the GIL released and returns its arrays.
+// Resurfaces every 10 ms for Python signals; one interrupts the query.
+std::vector<ArrowArray> collect_arrow(duckdb_v2_connection_handle con,
+                                      duckdb_v2_arrow_result_handle result) {
+    std::vector<ArrowArray> arrays;
+    try {
+        V2Error err;
+        for (;;) {
+            DUCKDB_V2_ERROR code;
+            DUCKDB_V2_RESULT_STEP_STATUS status;
+            {
+                nb::gil_scoped_release release;
+                auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(10);
+                do {
+                    ArrowArray array{};
+                    code = duckdb_v2_arrow_result_step(result, &array, &status, err.out());
+                    if (code != DUCKDB_V2_ERROR_NONE) break;
+                    if (status == DUCKDB_V2_RESULT_STEP_STATUS_CHUNK) {
+                        arrays.push_back(array);
+                    } else if (status == DUCKDB_V2_RESULT_STEP_STATUS_WAITING) {
+                        // Bounded, and woken when a task completes.
+                        duckdb_v2_arrow_result_wait(result, nullptr);
+                    } else {
+                        break;
+                    }
+                } while (std::chrono::steady_clock::now() < deadline);
+            }
+            err.check(code);
+            if (status == DUCKDB_V2_RESULT_STEP_STATUS_FINISHED) return arrays;
+            if (status == DUCKDB_V2_RESULT_STEP_STATUS_CANCELLED) {
+                throw DuckyError("ducky: query cancelled");
+            }
+            if (PyErr_CheckSignals() != 0) {
+                // Typically KeyboardInterrupt. The signal's exception stays set
+                // while the query winds down; its workers may need the GIL.
+                nb::gil_scoped_release release;
+                duckdb_v2_connection_interrupt(con, nullptr);
+                for (;;) {
+                    ArrowArray array{};
+                    if (duckdb_v2_arrow_result_step(result, &array, &status, nullptr) !=
+                            DUCKDB_V2_ERROR_NONE ||
+                        status == DUCKDB_V2_RESULT_STEP_STATUS_FINISHED ||
+                        status == DUCKDB_V2_RESULT_STEP_STATUS_CANCELLED) {
+                        break;
+                    }
+                    if (array.release) array.release(&array);
+                    duckdb_v2_arrow_result_wait(result, nullptr);
+                }
+                throw nb::python_error();
+            }
+        }
+    } catch (...) {
+        CollectedArrow::release_arrays(arrays);
+        throw;
+    }
 }
+
+// Owns the single statement of `query`, parsed for execution.
+class ParsedStatement {
+   public:
+    ParsedStatement(duckdb_v2_connection_handle con, const std::string& query) {
+        V2Error err;
+        duckdb_v2_statement_iterator_handle statements = nullptr;
+        err.check(duckdb_v2_parse_sql(con, query.data(), query.size(),
+                                      /*apply_invalidation_policy=*/true, &statements, err.out()));
+        duckdb_v2_sql_statement_handle extra = nullptr;
+        DUCKDB_V2_ERROR code = duckdb_v2_statement_iterator_next(statements, &stmt_, err.out());
+        if (code == DUCKDB_V2_ERROR_NONE && stmt_) {
+            code = duckdb_v2_statement_iterator_next(statements, &extra, err.out());
+        }
+        duckdb_v2_statement_iterator_destroy(&statements);
+        if (extra) {
+            duckdb_v2_sql_statement_destroy(&extra);
+            duckdb_v2_sql_statement_destroy(&stmt_);
+            throw DuckyError("ducky: expected one statement, got several");
+        }
+        if (code != DUCKDB_V2_ERROR_NONE) {
+            duckdb_v2_sql_statement_destroy(&stmt_);
+            err.check(code);
+        }
+        if (!stmt_) throw DuckyError("ducky: no statement to execute");
+    }
+    ~ParsedStatement() { duckdb_v2_sql_statement_destroy(&stmt_); }
+
+    ParsedStatement(const ParsedStatement&) = delete;
+    ParsedStatement& operator=(const ParsedStatement&) = delete;
+
+    duckdb_v2_sql_statement_handle get() const { return stmt_; }
+
+   private:
+    duckdb_v2_sql_statement_handle stmt_ = nullptr;
+};
 
 }  // namespace
 
@@ -981,20 +1293,42 @@ void Connection::executemany(const std::string& query, nb::object seq) {
 nb::object Connection::arrow_collected_stream(const std::string& query, nb::object parameters,
                                               uint64_t rows_per_batch) {
     std::shared_ptr<DuckDBHandle> handle = open_handle();
-    duckdb_connection con = handle->connection;
+    duckdb_v2_connection_handle con = handle->connection_v2;
 
-    StatementLease stmt(*this, con, query);
-    if (!parameters.is_none()) bind_parameters(stmt.get(), parameters);
+    V2Error err;
+    duckdb_v2_factory_handle factory = nullptr;
+    err.check(duckdb_v2_connection_get_factory(con, &factory, err.out()));
+    V2Parameters params(factory, parameters);
+    ParsedStatement stmt(con, query);
 
-    // duckdb_pending_prepared_arrow plans the query with DuckDB's Arrow result
-    // collector, so execution assembles Arrow batches directly; the normal
-    // pending tick loop keeps it Ctrl-C interruptible.
-    duckdb_pending_result pending = nullptr;
-    duckdb_state init = duckdb_pending_prepared_arrow(stmt.get(), rows_per_batch, &pending);
-    duckdb_result result = drive_pending(con, pending, init);
-    nb::object capsule = arrow_stream_capsule_from_result(&result);
-    stmt.retire();
-    return capsule;
+    // An Arrow result's workers assemble the Arrow arrays during execution.
+    auto collected = std::make_unique<CollectedArrow>();
+    collected->handle = handle;
+    DUCKDB_V2_ERROR code;
+    {
+        release_gil_if_held release;
+        code = duckdb_v2_statement_execute_arrow(
+            con, stmt.get(), params.names(), params.name_lengths(), params.values(), params.count(),
+            rows_per_batch, &collected->result, err.out());
+    }
+    err.check(code);
+    collected->arrays = collect_arrow(con, collected->result);
+
+    auto* stream = (ArrowArrayStream*)calloc(1, sizeof(ArrowArrayStream));
+    if (!stream) throw std::bad_alloc();
+    stream->get_schema = &CollectedArrow::get_schema;
+    stream->get_next = &CollectedArrow::get_next;
+    stream->get_last_error = &CollectedArrow::get_last_error;
+    stream->release = &CollectedArrow::release;
+    stream->private_data = collected.release();
+    PyObject* capsule =
+        PyCapsule_New(stream, "arrow_array_stream", arrow_stream_capsule_destructor);
+    if (!capsule) {
+        stream->release(stream);
+        free(stream);
+        throw nb::python_error();
+    }
+    return nb::steal(capsule);
 }
 
 PendingResult::PendingResult(duckdb_pending_result pending, duckdb_prepared_statement stmt,

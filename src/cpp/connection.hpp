@@ -90,7 +90,7 @@ class Connection {
     // Run once per parameter set and discard the results.
     void executemany(const std::string& query, nb::object seq);
 
-    // Execute with the Arrow collector and return a stream capsule.
+    // Execute as an Arrow result and return a stream capsule over its arrays.
     nb::object arrow_collected_stream(const std::string& query, nb::object parameters,
                                       uint64_t rows_per_batch);
 
