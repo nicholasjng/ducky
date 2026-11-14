@@ -770,7 +770,11 @@ def test_reregistered_arrow_source_is_rebound(con):
     pa = pytest.importorskip("pyarrow")
     con.register_arrow("p", pa.table({"a": [1, 2]}))
     stmt = con.prepare("SELECT * FROM p")
+    assert stmt.types == ["BIGINT"]
     con.register_arrow("p", pa.table({"a": ["x", "y"]}))
+    # The statement prepares again, so its metadata follows the new schema too.
+    assert stmt.types == ["VARCHAR"]
+    assert stmt.execute().fetchall() == [("x",), ("y",)]
     assert stmt.execute().fetchall() == [("x",), ("y",)]
 
 

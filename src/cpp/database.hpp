@@ -1,5 +1,7 @@
 #pragma once
 
+#include <atomic>
+#include <cstdint>
 #include <vector>
 
 #include "duckdb.h"
@@ -14,6 +16,10 @@ struct DuckDBHandle {
     duckdb_v2_connection_handle connection_v2 = nullptr;
     duckdb_database database = nullptr;      // owned
     duckdb_connection connection = nullptr;  // borrowed from connection_v2
+    // Bumped by every Arrow source registration. A plan reads a source's schema
+    // when it is bound, so prepared statements made before a registration
+    // prepare again (see PreparedStatement).
+    std::atomic<uint64_t> arrow_generation{0};
 
     DuckDBHandle() = default;
     DuckDBHandle(const DuckDBHandle&) = delete;

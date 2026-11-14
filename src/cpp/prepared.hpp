@@ -80,7 +80,9 @@ inline const char* duckdb_statement_type_name(duckdb_statement_type type) {
 // A reusable prepared statement sharing its connection handle.
 class PreparedStatement {
    public:
-    PreparedStatement(duckdb_prepared_statement stmt, std::shared_ptr<DuckDBHandle> handle);
+    // `stmt` was prepared from `query` at Arrow registration `arrow_generation`.
+    PreparedStatement(duckdb_prepared_statement stmt, std::shared_ptr<DuckDBHandle> handle,
+                      std::string query, uint64_t arrow_generation);
     ~PreparedStatement();
 
     PreparedStatement(const PreparedStatement&) = delete;
@@ -110,11 +112,16 @@ class PreparedStatement {
     void close();
 
    private:
-    // Locks the statement and raises if it is closed.
+    // Locks the statement and raises if it is closed. Prepares the statement
+    // again if an Arrow source was registered since, which may have changed
+    // the schema its plan read.
     std::unique_lock<std::mutex> lock_valid() const;
 
-    duckdb_prepared_statement stmt_ = nullptr;
+    // Replaced when the statement prepares again; still logically const.
+    mutable duckdb_prepared_statement stmt_ = nullptr;
     std::shared_ptr<DuckDBHandle> handle_;
+    std::string query_;
+    mutable uint64_t arrow_generation_ = 0;
     // Guards stmt_ and its bindings. Executions run with the GIL released, so
     // nb::lock_self alone doesn't keep close() or a rebind out of them.
     mutable std::mutex mu_;

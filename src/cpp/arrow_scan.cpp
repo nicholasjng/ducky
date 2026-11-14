@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -17,9 +18,6 @@ namespace nb = nanobind;
 namespace {
 
 const char* const SCAN_FUNCTION = "ducky_arrow_scan";
-// Column ids at or above this are DuckDB's virtual columns (row id, the
-// empty projection of `count(*)`); a scan only has to produce their row count.
-constexpr idx_t kVirtualColumnStart = idx_t(1) << 63;
 
 std::string lowercase(const std::string& s) {
     std::string out = s;
@@ -28,13 +26,26 @@ std::string lowercase(const std::string& s) {
     return out;
 }
 
-// The registry reference DuckDB holds in its extra-info slots. Heap-allocated so
+// The registry reference DuckDB holds in its user-data slots. Heap-allocated so
 // the C void*/destroy-callback pair can carry a strong reference.
 using RegistryRef = std::shared_ptr<ArrowRegistry>;
 
 void registry_ref_destroy(void* ptr) { delete (RegistryRef*)ptr; }
 
-ArrowRegistry* registry_of(void* extra_info) { return ((RegistryRef*)extra_info)->get(); }
+duckdb_v2_opaque registry_ref(const std::shared_ptr<ArrowRegistry>& reg) {
+    return duckdb_v2_opaque{new RegistryRef(reg), &registry_ref_destroy, nullptr};
+}
+
+ArrowRegistry* registry_of(void* user_data) { return ((RegistryRef*)user_data)->get(); }
+
+// Runs a callback body, reporting what it throws through the callback's `err`.
+template <typename Body>
+void report(duckdb_v2_error_info_handle* err, Body&& body) {
+    guard(std::forward<Body>(body), [&](const char* what) {
+        duckdb_v2_error_info_set_code(*err, DUCKDB_V2_ERROR_INPUT_INVALID);
+        duckdb_v2_error_info_set_text(*err, what, std::strlen(what));
+    });
+}
 
 // Plan-time state, immutable after bind. Plans outlive single executions —
 // Connection.run()'s statement cache and explicit PreparedStatements re-execute
@@ -42,48 +53,46 @@ ArrowRegistry* registry_of(void* extra_info) { return ((RegistryRef*)extra_info)
 // that is per-execution state and goes in ArrowScanState below.
 struct ArrowScanBind {
     std::string key;                   // registry key (lowercased name)
-    ArrowRegistry* reg = nullptr;      // kept alive by the table function's extra info
-    duckdb_connection con = nullptr;   // borrowed
+    ArrowRegistry* reg = nullptr;      // kept alive by the table function's user data
     std::vector<std::string> formats;  // per column: the plan's Arrow layout, checked
     std::vector<std::string> names;    // against each execution's stream
 };
 
 void arrow_scan_bind_destroy(void* ptr) { delete (ArrowScanBind*)ptr; }
 
-// One converted batch, shared by the workers emitting windows of it. Output
-// vectors reference its buffers, which therefore outlive it as needed.
-struct ConvertedBatch {
-    duckdb_data_chunk chunk = nullptr;  // nullptr when no real column is projected
-    idx_t size = 0;
-    ~ConvertedBatch() {
-        if (chunk) duckdb_destroy_data_chunk(&chunk);
-    }
-};
-
 // Per-execution state. Batches are pulled lazily, one at a time, by whichever
-// worker needs the next one (holding `mu`, and the GIL while the producer
+// worker needs the next window (holding `mu`, and the GIL while the producer
 // runs), so a LIMIT stops reading early and memory stays bounded to the
-// batches still being emitted. Workers emit vector-size windows of the current
-// batch in parallel without the GIL.
+// batches still being emitted. Workers convert vector-size windows of the
+// current batch in parallel without the GIL, each with its own importer.
 struct ArrowScanState {
     std::mutex mu;
-    nb::object capsule;                                 // owns the stream; dropped under the GIL
-    ArrowArrayStream* stream = nullptr;                 // borrowed from capsule
-    duckdb_connection con = nullptr;                    // borrowed
-    duckdb_arrow_converted_schema converted = nullptr;  // projected columns, owned
-    // Output column -> projected chunk column, or -1 for a virtual column.
-    std::vector<int64_t> output_to_chunk;
-    // Source column for each projected chunk column.
+    nb::object capsule;                  // owns the stream; dropped under the GIL
+    ArrowArrayStream* stream = nullptr;  // borrowed from capsule
+    ArrowSchema schema{};                // the stream's, owned
+    // Source column for each output column, and the schema of those columns:
+    // a view of `schema`.
     std::vector<idx_t> projection;
-    std::shared_ptr<ConvertedBatch> current;
+    std::vector<ArrowSchema*> projected_children;
+    ArrowSchema projected{};
+    std::shared_ptr<ArrowArray> current;  // projected batch being windowed
     idx_t next_offset = 0;
     bool done = false;
 
     // Destroyed via gil_delete (the capsule is a Python object).
     ~ArrowScanState() {
-        if (converted) duckdb_destroy_arrow_converted_schema(&converted);
+        if (schema.release) schema.release(&schema);
     }
 };
+
+// A worker's converter. It borrows the query's client context, which outlives
+// the scan.
+struct ArrowScanLocal {
+    duckdb_v2_arrow_importer_handle importer = nullptr;
+    ~ArrowScanLocal() { duckdb_v2_arrow_importer_destroy(&importer); }
+};
+
+void arrow_scan_local_destroy(void* ptr) { delete (ArrowScanLocal*)ptr; }
 
 [[noreturn]] void throw_stream_error(ArrowArrayStream* stream, const char* what) {
     const char* m = stream->get_last_error ? stream->get_last_error(stream) : nullptr;
@@ -155,11 +164,13 @@ ArrowArray project_array(ArrowArray& source, const std::vector<idx_t>& columns) 
     return view;
 }
 
-// Pull the next non-empty batch, converting its projected columns; nullptr at
-// the end. Requires the scan state's lock; takes the GIL for the producer only,
-// since the conversion doesn't touch Python.
-std::shared_ptr<ConvertedBatch> pull_batch(ArrowScanState& s) {
-    for (;;) {
+// The next window of at most a vector of rows, pulling batches until one has
+// rows; a released array at the end. Requires the scan state's lock; takes the
+// GIL for the producer only.
+ArrowArray next_window(ArrowScanState& s) {
+    while (!s.current || s.next_offset >= (idx_t)s.current->length) {
+        s.current.reset();
+        if (s.done) return ArrowArray{};
         ArrowArray array{};
         {
             nb::gil_scoped_acquire gil;
@@ -167,196 +178,256 @@ std::shared_ptr<ConvertedBatch> pull_batch(ArrowScanState& s) {
                 throw_stream_error(s.stream, "get_next");
             }
         }
-        if (!array.release) return nullptr;  // end of stream
+        if (!array.release) {  // end of stream
+            s.done = true;
+            return ArrowArray{};
+        }
         ArrayRelease array_guard{&array};
-        auto batch = std::make_shared<ConvertedBatch>();
-        batch->size = (idx_t)array.length;
-        if (batch->size == 0) continue;
-        if (s.projection.empty()) return batch;  // only virtual columns: rows, no data
-
+        if (array.length == 0) continue;
         ArrowArray view = project_array(array, s.projection);
-        ArrayRelease view_guard{&view};
-        std::string err;
-        if (drain_arrow_error(
-                duckdb_data_chunk_from_arrow(s.con, &view, s.converted, &batch->chunk), err)) {
-            throw DuckyError("ducky: failed to convert an Arrow batch to a DuckDB chunk: " + err);
-        }
-        view.release = nullptr;  // from_arrow took ownership
-        return batch;
+        s.current = share_batch(view);
+        s.next_offset = 0;
     }
+    idx_t count = std::min(duckdb_vector_size(), (idx_t)s.current->length - s.next_offset);
+    ArrowArray window = window_of(s.current, s.next_offset, count);
+    s.next_offset += count;
+    return window;
 }
 
-void arrow_scan_bind(duckdb_bind_info info) {
-    auto* reg = registry_of(duckdb_bind_get_extra_info(info));
+// The registered table name, the scan's sole argument.
+std::string scan_key(duckdb_v2_function_bind_info_handle info) {
+    V2Error err;
+    duckdb_v2_value_handle value = nullptr;
+    err.check(duckdb_v2_function_bind_get_arg_value(info, 0, &value, err.out()));
+    const char* text = nullptr;
+    idx_t length = 0;
+    DUCKDB_V2_ERROR code = duckdb_v2_value_get_varchar(value, &text, &length, err.out());
+    std::string key = code == DUCKDB_V2_ERROR_NONE ? lowercase(std::string(text, length)) : "";
+    duckdb_v2_value_destroy(&value);
+    err.check(code);
+    return key;
+}
+
+void arrow_scan_bind(duckdb_v2_function_bind_info_handle info,
+                     duckdb_v2_table_function_bind_info_handle result,
+                     duckdb_v2_context_handle context, duckdb_v2_error_info_handle* err) {
     nb::gil_scoped_acquire gil;
-    guard(
-        [&] {
-            // Sole parameter: the registered table name.
-            duckdb_value name_val = duckdb_bind_get_parameter(info, 0);
-            char* name_c = duckdb_get_varchar(name_val);
-            std::string key = lowercase(name_c);
-            duckdb_free(name_c);
-            duckdb_destroy_value(&name_val);
+    report(err, [&] {
+        V2Error e;
+        void* user_data = nullptr;
+        e.check(duckdb_v2_function_bind_get_user_data(info, &user_data, e.out()));
+        auto bind = std::make_unique<ArrowScanBind>();
+        bind->key = scan_key(info);
+        bind->reg = registry_of(user_data);
 
-            // Only the schema is read here: a one-shot source must keep its
-            // batches for the scan, and resolving the column types needs no data.
-            ArrowArrayStream* stream = nullptr;
-            nb::object capsule = source_stream(reg, key, /*consume=*/false, stream);
-            ArrowSchema schema{};
-            if (stream->get_schema(stream, &schema) != 0) throw_stream_error(stream, "get_schema");
-            SchemaRelease schema_guard{&schema};
+        // Only the schema is read here: a one-shot source must keep its
+        // batches for the scan, and resolving the column types needs no data.
+        ArrowArrayStream* stream = nullptr;
+        nb::object capsule = source_stream(bind->reg, bind->key, /*consume=*/false, stream);
+        ArrowSchema schema{};
+        if (stream->get_schema(stream, &schema) != 0) throw_stream_error(stream, "get_schema");
+        SchemaRelease schema_guard{&schema};
 
-            auto* b = new ArrowScanBind{};
-            b->key = key;
-            b->reg = reg;
-            b->con = reg->con;
-            duckdb_bind_set_bind_data(info, b, &arrow_scan_bind_destroy);
-
-            std::string err;
-            ConvertedSchemaRelease converted;
-            if (drain_arrow_error(duckdb_schema_from_arrow(b->con, &schema, &converted.schema),
-                                  err)) {
-                throw DuckyError("ducky: failed to convert the Arrow schema of '" + key +
-                                 "': " + err);
-            }
-            idx_t n_cols = duckdb_arrow_converted_schema_column_count(converted.schema);
-            for (idx_t i = 0; i < n_cols; ++i) {
-                ArrowSchema* child = schema.children ? schema.children[i] : nullptr;
-                const char* col_name = child && child->name ? child->name : "";
-                b->names.emplace_back(col_name);
-                b->formats.emplace_back(child && child->format ? child->format : "");
-                duckdb_logical_type t =
-                    duckdb_arrow_converted_schema_column_type(converted.schema, i);
-                duckdb_bind_add_result_column(info, col_name, t);
-                duckdb_destroy_logical_type(&t);
-            }
-        },
-        [&](const char* what) { duckdb_bind_set_error(info, what); });
-}
-
-void arrow_scan_init(duckdb_init_info info) {
-    auto* b = (ArrowScanBind*)duckdb_init_get_bind_data(info);
-    nb::gil_scoped_acquire gil;
-    guard(
-        [&] {
-            auto* s = new ArrowScanState{};
-            duckdb_init_set_init_data(info, s, &gil_delete<ArrowScanState>);
-            s->con = b->con;
-            // Fresh stream per execution, looked up again so a re-registered
-            // source is picked up.
-            s->capsule = source_stream(b->reg, b->key, /*consume=*/true, s->stream);
-            ArrowSchema schema{};
-            if (s->stream->get_schema(s->stream, &schema) != 0) {
-                throw_stream_error(s->stream, "get_schema");
-            }
-            SchemaRelease schema_guard{&schema};
-            // The plan's types came from the schema at bind time.
-            bool same = (idx_t)schema.n_children == b->formats.size();
-            for (idx_t i = 0; same && i < b->formats.size(); ++i) {
-                ArrowSchema* child = schema.children[i];
-                same = child && child->format && b->formats[i] == child->format &&
-                       b->names[i] == (child->name ? child->name : "");
-            }
-            if (!same) {
-                throw DuckyError("ducky: the Arrow source '" + b->key +
-                                 "' changed its schema since the query was planned; prepare "
-                                 "the query again");
-            }
-
-            // Projection pushdown: convert only the columns the query reads.
-            idx_t n_out = duckdb_init_get_column_count(info);
-            for (idx_t i = 0; i < n_out; ++i) {
-                idx_t col = duckdb_init_get_column_index(info, i);
-                if (col >= kVirtualColumnStart || col >= (idx_t)schema.n_children) {
-                    s->output_to_chunk.push_back(-1);
-                } else {
-                    s->output_to_chunk.push_back((int64_t)s->projection.size());
-                    s->projection.push_back(col);
-                }
-            }
-            if (!s->projection.empty()) {
-                std::vector<ArrowSchema*> children;
-                for (idx_t c : s->projection) children.push_back(schema.children[c]);
-                ArrowSchema view = schema;  // borrowed children; never released
-                view.n_children = (int64_t)children.size();
-                view.children = children.data();
-                view.release = nullptr;
-                std::string err;
-                if (drain_arrow_error(duckdb_schema_from_arrow(s->con, &view, &s->converted),
-                                      err)) {
-                    throw DuckyError("ducky: failed to convert the Arrow schema of '" + b->key +
-                                     "': " + err);
-                }
-            }
-            // Workers share the stream; DuckDB caps this at its thread count.
-            duckdb_init_set_max_threads(info, 1024);
-        },
-        [&](const char* what) { duckdb_init_set_error(info, what); });
-}
-
-void arrow_scan_function(duckdb_function_info info, duckdb_data_chunk output) {
-    auto* s = (ArrowScanState*)duckdb_function_get_init_data(info);
-
-    std::shared_ptr<ConvertedBatch> batch;
-    idx_t offset = 0, count = 0;
-    bool ok = guard(
-        [&] {
-            std::lock_guard<std::mutex> lock(s->mu);
-            if (!s->current || s->next_offset >= s->current->size) {
-                s->current.reset();
-                if (!s->done) {
-                    s->current = pull_batch(*s);
-                    s->next_offset = 0;
-                    if (!s->current) s->done = true;
-                }
-            }
-            if (!s->current) return;
-            batch = s->current;
-            offset = s->next_offset;
-            count = std::min(duckdb_vector_size(), batch->size - offset);
-            s->next_offset += count;
-        },
-        [&](const char* what) { duckdb_function_set_error(info, what); });
-    if (!ok || !batch) {
-        duckdb_data_chunk_set_size(output, 0);
-        return;
-    }
-
-    // Zero-copy emit: output vectors reference a window of the batch's
-    // vectors, whose buffers (for primitive types) are the Arrow source's own.
-    // The window keeps a flat vector flat, so consumers that need flat input
-    // (an INSERT, for one) don't copy it.
-    if (batch->chunk) {
-        bool whole = offset == 0 && count == batch->size;
-        for (idx_t o = 0; o < (idx_t)s->output_to_chunk.size(); ++o) {
-            int64_t c = s->output_to_chunk[o];
-            if (c < 0) continue;  // virtual column: only the row count matters
-            duckdb_vector out = duckdb_data_chunk_get_vector(output, o);
-            duckdb_vector in = duckdb_data_chunk_get_vector(batch->chunk, c);
-            if (whole) {
-                duckdb_vector_reference_vector(out, in);
-            } else {
-                duckdb_vector_reference_slice(out, in, offset, count);
-            }
+        const std::string failed =
+            "ducky: failed to convert the Arrow schema of '" + bind->key + "': ";
+        duckdb_v2_arrow_importer_handle importer = nullptr;
+        e.check(duckdb_v2_arrow_importer_create(context, &schema, 0, &importer, e.out()), failed);
+        duckdb_v2_schema_handle types = nullptr;
+        DUCKDB_V2_ERROR code = duckdb_v2_arrow_importer_get_schema(importer, &types, e.out());
+        duckdb_v2_arrow_importer_destroy(&importer);
+        e.check(code, failed);
+        idx_t n_cols = 0;
+        code = duckdb_v2_schema_get_count(types, &n_cols, e.out());
+        for (idx_t i = 0; code == DUCKDB_V2_ERROR_NONE && i < n_cols; ++i) {
+            const char* name = nullptr;
+            idx_t length = 0;
+            duckdb_v2_logical_type_handle type = nullptr;
+            code = duckdb_v2_schema_get_field(types, i, &name, &length, &type, e.out());
+            if (code != DUCKDB_V2_ERROR_NONE) break;
+            code = duckdb_v2_table_function_bind_add_result_column(result, name, length, type,
+                                                                   e.out());
+            ArrowSchema* child = schema.children ? schema.children[i] : nullptr;
+            bind->names.emplace_back(name, length);
+            bind->formats.emplace_back(child && child->format ? child->format : "");
         }
-    }
-    duckdb_data_chunk_set_size(output, count);
+        duckdb_v2_schema_destroy(&types);
+        e.check(code, failed);
+
+        duckdb_v2_opaque data{bind.release(), &arrow_scan_bind_destroy, nullptr};
+        DUCKDB_V2_ERROR set = duckdb_v2_function_bind_set_bind_data(info, &data, e.out());
+        if (set != DUCKDB_V2_ERROR_NONE) arrow_scan_bind_destroy(data.ptr);
+        e.check(set);
+    });
+}
+
+void arrow_scan_init(duckdb_v2_table_function_init_global_info_handle info,
+                     duckdb_v2_context_handle context, duckdb_v2_error_info_handle* err) {
+    nb::gil_scoped_acquire gil;
+    report(err, [&] {
+        V2Error e;
+        void* bind_data = nullptr;
+        e.check(duckdb_v2_table_function_init_global_get_bind_data(info, &bind_data, e.out()));
+        auto* b = (ArrowScanBind*)bind_data;
+        auto state = std::make_unique<ArrowScanState>();
+        ArrowScanState* s = state.get();
+        // Fresh stream per execution, looked up again so a re-registered
+        // source is picked up.
+        s->capsule = source_stream(b->reg, b->key, /*consume=*/true, s->stream);
+        ArrowSchema& schema = s->schema;
+        if (s->stream->get_schema(s->stream, &schema) != 0) {
+            throw_stream_error(s->stream, "get_schema");
+        }
+        // The plan's types came from the schema at bind time.
+        bool same = (idx_t)schema.n_children == b->formats.size();
+        for (idx_t i = 0; same && i < b->formats.size(); ++i) {
+            ArrowSchema* child = schema.children[i];
+            same = child && child->format && b->formats[i] == child->format &&
+                   b->names[i] == (child->name ? child->name : "");
+        }
+        if (!same) {
+            throw DuckyError("ducky: the Arrow source '" + b->key +
+                             "' changed its schema since the query was planned; prepare "
+                             "the query again");
+        }
+
+        // Projection pushdown: convert only the columns the query reads.
+        idx_t n_out = 0;
+        e.check(duckdb_v2_table_function_init_global_get_column_count(info, &n_out, e.out()));
+        for (idx_t i = 0; i < n_out; ++i) {
+            idx_t col = 0;
+            e.check(duckdb_v2_table_function_init_global_get_column_index(info, i, &col, e.out()));
+            s->projection.push_back(col);
+            s->projected_children.push_back(schema.children[col]);
+        }
+        s->projected = schema;  // borrowed children; never released
+        s->projected.n_children = (int64_t)s->projected_children.size();
+        s->projected.children = s->projected_children.data();
+        s->projected.release = nullptr;
+
+        // Workers share the stream; DuckDB caps this at its thread count.
+        e.check(duckdb_v2_table_function_init_global_set_max_threads(info, 1024, e.out()));
+        duckdb_v2_opaque data{state.release(), &gil_delete<ArrowScanState>, nullptr};
+        DUCKDB_V2_ERROR set =
+            duckdb_v2_table_function_init_global_set_global_state(info, &data, e.out());
+        if (set != DUCKDB_V2_ERROR_NONE) delete s;
+        e.check(set);
+    });
+}
+
+void arrow_scan_init_local(duckdb_v2_table_function_init_local_info_handle info,
+                           duckdb_v2_context_handle context, duckdb_v2_error_info_handle* err) {
+    report(err, [&] {
+        V2Error e;
+        void* global_state = nullptr;
+        void* bind_data = nullptr;
+        e.check(duckdb_v2_table_function_init_local_get_global_state(info, &global_state, e.out()));
+        e.check(duckdb_v2_table_function_init_local_get_bind_data(info, &bind_data, e.out()));
+        auto* s = (ArrowScanState*)global_state;
+        auto local = std::make_unique<ArrowScanLocal>();
+        e.check(duckdb_v2_arrow_importer_create(context, &s->projected, duckdb_vector_size(),
+                                                &local->importer, e.out()),
+                "ducky: failed to convert the Arrow schema of '" +
+                    ((ArrowScanBind*)bind_data)->key + "': ");
+        duckdb_v2_opaque data{local.release(), &arrow_scan_local_destroy, nullptr};
+        DUCKDB_V2_ERROR set =
+            duckdb_v2_table_function_init_local_set_local_state(info, &data, e.out());
+        if (set != DUCKDB_V2_ERROR_NONE) arrow_scan_local_destroy(data.ptr);
+        e.check(set);
+    });
+}
+
+void arrow_scan_function(duckdb_v2_table_function_exec_info_handle info,
+                         duckdb_v2_context_handle context, duckdb_v2_error_info_handle* err) {
+    report(err, [&] {
+        V2Error e;
+        void* global_state = nullptr;
+        void* local_state = nullptr;
+        e.check(duckdb_v2_table_function_exec_get_global_state(info, &global_state, e.out()));
+        e.check(duckdb_v2_table_function_exec_get_local_state(info, &local_state, e.out()));
+        auto* s = (ArrowScanState*)global_state;
+        auto* local = (ArrowScanLocal*)local_state;
+        const std::string failed = "ducky: failed to convert an Arrow batch to a DuckDB chunk: ";
+
+        duckdb_v2_data_chunk_handle chunk = nullptr;
+        for (;;) {
+            e.check(duckdb_v2_arrow_importer_next_chunk(local->importer, &chunk, e.out()), failed);
+            if (chunk) break;
+            ArrowArray window;
+            {
+                std::lock_guard<std::mutex> lock(s->mu);
+                window = next_window(*s);
+            }
+            if (!window.release) return;  // an empty output ends the scan
+            ArrayRelease window_guard{&window};
+            // Consumed for a zero-copy import, and flushed so that no chunk
+            // joins two windows, which would copy.
+            e.check(duckdb_v2_arrow_importer_append(local->importer, &window, /*consume=*/true,
+                                                    /*flush=*/true, e.out()),
+                    failed);
+        }
+
+        // Zero-copy emit: the output vectors share the chunk's buffers, whose
+        // flat vectors (for primitive types) are views of the Arrow batch's
+        // own. Sharing a buffer shares its size, which the engine reads off
+        // the first vector.
+        duckdb_v2_data_chunk_handle output = nullptr;
+        DUCKDB_V2_ERROR code =
+            duckdb_v2_table_function_exec_get_output_chunk(info, &output, e.out());
+        for (idx_t c = 0; code == DUCKDB_V2_ERROR_NONE && c < s->projection.size(); ++c) {
+            duckdb_v2_vector_handle out = nullptr, in = nullptr;
+            code = duckdb_v2_data_chunk_get_vector(output, c, &out, e.out());
+            if (code == DUCKDB_V2_ERROR_NONE) {
+                code = duckdb_v2_data_chunk_get_vector(chunk, c, &in, e.out());
+            }
+            if (code == DUCKDB_V2_ERROR_NONE) code = duckdb_v2_vector_reference(out, in, e.out());
+        }
+        duckdb_v2_data_chunk_destroy(&chunk);
+        e.check(code);
+    });
 }
 
 // When DuckDB can't resolve a table name, rewrite it to ducky_arrow_scan('name')
 // if that name is in the registry. Runs during planning; only touches the map
 // structure (no nb::object), so no GIL needed here.
-void arrow_replacement_scan(duckdb_replacement_scan_info info, const char* table_name, void* data) {
-    auto* reg = registry_of(data);
-    std::string key = lowercase(table_name);
-    {
-        std::lock_guard<std::mutex> lock(reg->mu);
-        if (reg->sources.find(key) == reg->sources.end()) return;
-    }
-    duckdb_replacement_scan_set_function_name(info, SCAN_FUNCTION);
-    duckdb_value param = duckdb_create_varchar(key.c_str());
-    duckdb_replacement_scan_add_parameter(info, param);
-    duckdb_destroy_value(&param);
+void arrow_replacement_scan(duckdb_v2_replacement_scan_info_handle info,
+                            duckdb_v2_context_handle context, duckdb_v2_error_info_handle* err) {
+    report(err, [&] {
+        V2Error e;
+        void* user_data = nullptr;
+        e.check(duckdb_v2_replacement_scan_get_user_data(info, &user_data, e.out()));
+        auto* reg = registry_of(user_data);
+        // The table name, ignoring any qualification, as v1 handed it over.
+        duckdb_v2_qname_handle name = nullptr;
+        e.check(duckdb_v2_replacement_scan_get_name(info, &name, e.out()));
+        idx_t parts = 0;
+        const char* part = nullptr;
+        idx_t length = 0;
+        DUCKDB_V2_ERROR code = duckdb_v2_qname_get_part_count(name, &parts, e.out());
+        if (code == DUCKDB_V2_ERROR_NONE) {
+            code = duckdb_v2_qname_get_part(name, parts - 1, &part, &length, e.out());
+        }
+        std::string key = code == DUCKDB_V2_ERROR_NONE ? lowercase(std::string(part, length)) : "";
+        duckdb_v2_qname_destroy(&name);
+        e.check(code);
+        {
+            std::lock_guard<std::mutex> lock(reg->mu);
+            if (reg->sources.find(key) == reg->sources.end()) return;
+        }
+
+        const char* function = SCAN_FUNCTION;
+        idx_t function_length = std::strlen(SCAN_FUNCTION);
+        e.check(duckdb_v2_qname_create(&function, &function_length, 1, &name, e.out()));
+        code = duckdb_v2_replacement_scan_set_function_name(info, name, e.out());
+        duckdb_v2_qname_destroy(&name);
+        e.check(code);
+        duckdb_v2_factory_handle factory = nullptr;
+        e.check(duckdb_v2_context_get_factory(context, &factory, e.out()));
+        duckdb_v2_value_handle arg = nullptr;
+        e.check(duckdb_v2_value_create_varchar(factory, key.data(), key.size(), &arg, e.out()));
+        code = duckdb_v2_replacement_scan_add_argument(info, arg, e.out());
+        duckdb_v2_value_destroy(&arg);
+        e.check(code);
+    });
 }
 
 // Readers and query results yield their batches once; tables and data frames
@@ -386,35 +457,75 @@ void register_arrow_source(ArrowRegistry& registry, const std::string& name, nb:
 
 std::shared_ptr<ArrowRegistry> install_arrow_scan(Connection& con) {
     std::shared_ptr<DuckDBHandle> handle = con.open_handle();
+    duckdb_v2_connection_handle connection = handle->connection_v2;
     auto reg = std::make_shared<ArrowRegistry>();
-    reg->con = handle->connection;
 
-    duckdb_table_function f = duckdb_create_table_function();
-    duckdb_table_function_set_name(f, SCAN_FUNCTION);
-    duckdb_logical_type varchar = duckdb_create_logical_type(DUCKDB_TYPE_VARCHAR);
-    duckdb_table_function_add_parameter(f, varchar);
-    duckdb_destroy_logical_type(&varchar);
-    // Strong reference: the function is catalogued on the database and can be
-    // re-bound (a cached plan, a PreparedStatement) after the Connection is gone.
-    duckdb_table_function_set_extra_info(f, new RegistryRef(reg), &registry_ref_destroy);
-    duckdb_table_function_set_bind(f, &arrow_scan_bind);
-    duckdb_table_function_set_init(f, &arrow_scan_init);
-    duckdb_table_function_set_function(f, &arrow_scan_function);
-    duckdb_table_function_supports_projection_pushdown(f, true);
+    const std::string failed = "ducky: failed to register the Arrow scan table function: ";
+    V2Error err;
+    auto check = [&](DUCKDB_V2_ERROR code) { err.check(code, failed); };
+    duckdb_v2_factory_handle factory = nullptr;
+    check(duckdb_v2_connection_get_factory(connection, &factory, err.out()));
+    // Strong references: the function and the replacement scan are catalogued
+    // on the database and can be re-bound (a cached plan, a PreparedStatement)
+    // after the Connection is gone. A setter that fails leaves the data with us.
+    auto set_registry = [&](auto setter, auto handle) {
+        duckdb_v2_opaque data = registry_ref(reg);
+        DUCKDB_V2_ERROR code = setter(handle, &data, err.out());
+        if (code != DUCKDB_V2_ERROR_NONE) registry_ref_destroy(data.ptr);
+        check(code);
+    };
 
-    duckdb_state state;
     {
-        // Registration takes the client context lock, which a query running
-        // Python callbacks on another thread may hold while it waits for the GIL.
-        release_gil_if_held release;
-        state = duckdb_register_table_function(handle->connection, f);
-        duckdb_destroy_table_function(&f);
-    }
-    if (state == DuckDBError) {
-        throw DuckyError("ducky: failed to register the Arrow scan table function");
+        duckdb_v2_table_function_handle f = nullptr;
+        check(duckdb_v2_table_function_create(factory, &f, err.out()));
+        std::unique_ptr<duckdb_v2_table_function_handle, void (*)(duckdb_v2_table_function_handle*)>
+            f_guard(&f, [](duckdb_v2_table_function_handle* p) {
+                duckdb_v2_table_function_destroy(p);
+            });
+        set_registry(&duckdb_v2_table_function_set_user_data, f);
+        check(duckdb_v2_table_function_set_name(f, SCAN_FUNCTION, std::strlen(SCAN_FUNCTION),
+                                                err.out()));
+        // Sole parameter: the registered table name.
+        duckdb_v2_function_signature_handle sig = nullptr;
+        check(duckdb_v2_table_function_get_signature(f, &sig, err.out()));
+        duckdb_v2_logical_type_handle varchar = nullptr;
+        check(duckdb_v2_factory_create_type_from_id(factory, DUCKDB_V2_LOGICAL_TYPE_ID_VARCHAR,
+                                                    nullptr, nullptr, nullptr, 0, &varchar,
+                                                    err.out()));
+        DUCKDB_V2_ERROR code = duckdb_v2_function_signature_add_parameter(
+            sig, "name", 4, varchar, nullptr, DUCKDB_V2_FUNCTION_PARAMETER_KIND_STANDARD,
+            err.out());
+        duckdb_v2_logical_type_destroy(&varchar);
+        check(code);
+        check(duckdb_v2_table_function_set_bind_callback(f, &arrow_scan_bind, err.out()));
+        check(duckdb_v2_table_function_set_init_global_callback(f, &arrow_scan_init, err.out()));
+        check(
+            duckdb_v2_table_function_set_init_local_callback(f, &arrow_scan_init_local, err.out()));
+        check(duckdb_v2_table_function_set_exec_callback(f, &arrow_scan_function, err.out()));
+        check(duckdb_v2_table_function_set_projection_pushdown(f, true, err.out()));
+        {
+            // Registration takes the client context lock, which a query running
+            // Python callbacks on another thread may hold while it waits for
+            // the GIL.
+            release_gil_if_held release;
+            code = duckdb_v2_connection_register_table_function(connection, f, err.out());
+        }
+        check(code);
     }
 
-    duckdb_add_replacement_scan(handle->database, &arrow_replacement_scan, new RegistryRef(reg),
-                                &registry_ref_destroy);
+    duckdb_v2_replacement_scan_handle scan = nullptr;
+    check(duckdb_v2_replacement_scan_create(factory, &scan, err.out()));
+    std::unique_ptr<duckdb_v2_replacement_scan_handle, void (*)(duckdb_v2_replacement_scan_handle*)>
+        scan_guard(&scan, [](duckdb_v2_replacement_scan_handle* p) {
+            duckdb_v2_replacement_scan_destroy(p);
+        });
+    set_registry(&duckdb_v2_replacement_scan_set_user_data, scan);
+    check(duckdb_v2_replacement_scan_set_callback(scan, &arrow_replacement_scan, err.out()));
+    DUCKDB_V2_ERROR code;
+    {
+        release_gil_if_held release;
+        code = duckdb_v2_connection_register_replacement_scan(connection, scan, err.out());
+    }
+    check(code);
     return reg;
 }
