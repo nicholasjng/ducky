@@ -70,6 +70,26 @@ def test_config_bad_key_raises():
         ducky.connect(not_a_real_setting="x")
 
 
+def test_file_database_spills_next_to_its_file(tmp_path):
+    path = str(tmp_path / "spill.db")
+    con = ducky.connect(path)
+    assert con.execute("SELECT current_setting('temp_directory')").fetchone() == (path + ".tmp",)
+    con.close()
+    con = ducky.connect(path, temp_directory=str(tmp_path / "elsewhere"))
+    assert con.execute("SELECT current_setting('temp_directory')").fetchone() == (
+        str(tmp_path / "elsewhere"),
+    )
+
+
+def test_opening_an_open_file_again_raises(tmp_path):
+    path = str(tmp_path / "open.db")
+    con = ducky.connect(path)
+    with pytest.raises(ducky.Error, match="conflict"):
+        ducky.connect(path)
+    con.close()
+    ducky.connect(path).close()
+
+
 def test_config_options_returns_known_keys():
     options = ducky.config_options()
     assert isinstance(options, list)

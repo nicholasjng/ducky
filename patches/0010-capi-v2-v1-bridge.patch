@@ -1,0 +1,139 @@
+Bridge C API v2 connections and instances to C API v1 handles
+
+C API v2 has no appender, and v1 and v2 handles do not convert into each other,
+so a client that moves its database and connections to v2 loses the v1
+functions v2 has no counterpart for. Both wrap the same engine objects: a v2
+connection is a Connection, which is what a v1 connection handle points to, and
+a v1 database handle shares a DuckDB instance. Add, in duckdb_v2_bridge.h:
+  - duckdb_v2_connection_get_v1(conn): the borrowed v1 handle of a v2
+    connection, valid until the v2 connection is destroyed.
+  - duckdb_v2_instance_open_v1(instance, &database, &err): an owned v1 database
+    handle onto the instance, closed with duckdb_close.
+A query run through the v1 handle does not count as the v2 connection's running
+statement.
+
+Note for upstreaming: duckdb_v2.h is generated; an upstream PR would add these
+to its generator's definitions, or keep them in a hand-written header like this
+one.
+diff --git a/src/include/duckdb_v2_bridge.h b/src/include/duckdb_v2_bridge.h
+new file mode 100644
+index 00000000..43490e6a
+--- /dev/null
++++ b/src/include/duckdb_v2_bridge.h
+@@ -0,0 +1,58 @@
++//===----------------------------------------------------------------------===//
++//
++//                         DuckDB
++//
++// duckdb_v2_bridge.h
++//
++//
++//===----------------------------------------------------------------------===//
++
++#pragma once
++
++#include "duckdb.h"
++#include "duckdb_v2.h"
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#if DUCKDB_V2_API_ALLOW_UNSTABLE
++/*!
++ * Returns the C API v1 handle of a v2 connection, for v1 functions that v2 has no counterpart for, such as the
++ * appender.
++ *
++ * The handle is borrowed: it is valid until `duckdb_v2_connection_destroy()`, and must not be passed to
++ * `duckdb_disconnect()`. A query run through it does not count as the v2 connection's running statement, so do not
++ * run one while a v2 result on the connection is live.
++ *
++ * history:
++ * - unstable: v2.0.0
++ *
++ * @param conn The v2 connection.
++ * @return The v1 connection handle, or NULL when `conn` is NULL.
++ */
++DUCKDB_C_API duckdb_connection duckdb_v2_connection_get_v1(duckdb_v2_connection_handle conn);
++
++/*!
++ * Opens a C API v1 database handle onto a v2 instance, for v1 functions that take a database, such as
++ * `duckdb_add_replacement_scan()`.
++ *
++ * The handle keeps the instance's database alive. Close it with `duckdb_close()`.
++ *
++ * history:
++ * - unstable: v2.0.0
++ *
++ * @param instance The v2 instance.
++ * @param out_database Receives the new v1 database handle.
++ * @param err Optional. On failure, receives an opaque info handle the caller must destroy via
++ * `duckdb_v2_error_info_destroy()`.
++ * @return DUCKDB_V2_ERROR
++ */
++DUCKDB_C_API DUCKDB_V2_ERROR duckdb_v2_instance_open_v1(duckdb_v2_instance_handle instance,
++                                                        duckdb_database *out_database,
++                                                        duckdb_v2_error_info_handle *err);
++#endif
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/src/main/capi/v2/capi_v2_connection.cpp b/src/main/capi/v2/capi_v2_connection.cpp
+index 2d88d63c..d735a385 100644
+--- a/src/main/capi/v2/capi_v2_connection.cpp
++++ b/src/main/capi/v2/capi_v2_connection.cpp
+@@ -1,4 +1,5 @@
+ #include "duckdb/main/capi_v2/capi_v2_internal.hpp"
++#include "duckdb_v2_bridge.h"
+ 
+ using namespace duckdb::capiv2;
+ 
+@@ -26,6 +27,12 @@ DUCKDB_V2_ERROR duckdb_v2_connection_destroy(duckdb_v2_connection_handle *conn)
+ 	});
+ }
+ 
++duckdb_connection duckdb_v2_connection_get_v1(duckdb_v2_connection_handle conn) {
++	// A v1 connection handle is the Connection itself
++	duckdb::Connection *connection = conn ? Convert(conn) : nullptr;
++	return reinterpret_cast<duckdb_connection>(connection);
++}
++
+ // ---------------------------------------------------------------------------
+ // Query process management
+ // ---------------------------------------------------------------------------
+diff --git a/src/main/capi/v2/capi_v2_instance.cpp b/src/main/capi/v2/capi_v2_instance.cpp
+index 402d5905..fb2d93f5 100644
+--- a/src/main/capi/v2/capi_v2_instance.cpp
++++ b/src/main/capi/v2/capi_v2_instance.cpp
+@@ -1,9 +1,11 @@
+ #include "duckdb/main/capi_v2/capi_v2_internal.hpp"
++#include "duckdb_v2_bridge.h"
+ 
+ #include "duckdb/catalog/catalog.hpp"
+ #include "duckdb/common/file_system.hpp"
+ #include "duckdb/common/types/value.hpp"
+ #include "duckdb/main/attached_database.hpp"
++#include "duckdb/main/capi/capi_internal.hpp"
+ #include "duckdb/main/database_manager.hpp"
+ #include "duckdb/main/database_path_and_type.hpp"
+ #include "duckdb/main/settings.hpp"
+@@ -154,6 +156,18 @@ DUCKDB_V2_ERROR duckdb_v2_instance_destroy(duckdb_v2_instance_handle *instance)
+ 	});
+ }
+ 
++DUCKDB_V2_ERROR duckdb_v2_instance_open_v1(duckdb_v2_instance_handle instance, duckdb_database *out_database,
++                                           duckdb_v2_error_info_handle *err) {
++	DUCKDB_CHECK_ARG(instance);
++	DUCKDB_CHECK_ARG(out_database);
++	*out_database = nullptr;
++	return WithErrorHandler(err, [&]() {
++		auto wrapper = duckdb::make_uniq<duckdb::DatabaseWrapper>();
++		wrapper->database = duckdb::make_shared_ptr<duckdb::DuckDB>(*Convert(instance)->GetDatabase().instance);
++		*out_database = reinterpret_cast<duckdb_database>(wrapper.release());
++	});
++}
++
+ DUCKDB_V2_ERROR duckdb_v2_instance_attach(duckdb_v2_instance_handle instance, const char *name, idx_t name_length,
+                                           const char *path, idx_t path_length, duckdb_v2_attach_options_handle options,
+                                           bool make_default, duckdb_v2_error_info_handle *err) {

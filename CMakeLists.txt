@@ -109,8 +109,9 @@ duckdb_link_extensions(
   _core PRIVATE httplib loadable_extensions ${DUCKDB_STATIC_EXTENSIONS})
 target_link_libraries(_core PRIVATE duckdb_static tsl::robin_map)
 
-# Prevent dllimport annotations when statically linking on Windows.
-target_compile_definitions(_core PRIVATE DUCKDB_STATIC_BUILD)
+# Prevent dllimport annotations when statically linking on Windows, and declare
+# the unstable C API v2, whose shape the DuckDB pin fixes.
+target_compile_definitions(_core PRIVATE DUCKDB_STATIC_BUILD DUCKDB_V2_API_ALLOW_UNSTABLE=1)
 
 # Export only the module's init function. The statically linked DuckDB would
 # otherwise export its C++ symbols, and the loader binds another DuckDB in the
