@@ -38,15 +38,6 @@ duckdb_v2_opaque registry_ref(const std::shared_ptr<ArrowRegistry>& reg) {
 
 ArrowRegistry* registry_of(void* user_data) { return ((RegistryRef*)user_data)->get(); }
 
-// Runs a callback body, reporting what it throws through the callback's `err`.
-template <typename Body>
-void report(duckdb_v2_error_info_handle* err, Body&& body) {
-    guard(std::forward<Body>(body), [&](const char* what) {
-        duckdb_v2_error_info_set_code(*err, DUCKDB_V2_ERROR_INPUT_INVALID);
-        duckdb_v2_error_info_set_text(*err, what, std::strlen(what));
-    });
-}
-
 // Plan-time state, immutable after bind. Plans outlive single executions —
 // Connection.run()'s statement cache and explicit PreparedStatements re-execute
 // the same plan — so nothing consumable (the stream, its cursor) may live here;

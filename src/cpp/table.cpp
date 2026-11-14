@@ -5,76 +5,108 @@
 
 #include <cstdint>
 #include <cstring>
+#include <memory>
 
 #include "connection.hpp"
 #include "ducky.hpp"
-#include "function.hpp"
 #include "py_datetime.hpp"
 
 namespace nb = nanobind;
 
 namespace {
 
-// Convert a duckdb_value (bound SQL parameter) to a Python object.
-nb::object duckdb_value_to_python(duckdb_value val) {
-    if (duckdb_is_null_value(val)) return nb::none();
-    // duckdb_get_value_type returns a borrowed pointer — do not destroy.
-    duckdb_type tid = duckdb_get_type_id(duckdb_get_value_type(val));
+// Convert a bound SQL argument to a Python object. `factory` renders types
+// without a Python counterpart as text.
+nb::object value_to_python(duckdb_v2_factory_handle factory, duckdb_v2_value_handle val) {
+    V2Error e;
+    bool is_null = false;
+    e.check(duckdb_v2_value_is_null(val, &is_null, e.out()));
+    if (is_null) return nb::none();
+    duckdb_v2_logical_type_handle type = nullptr;
+    e.check(duckdb_v2_value_get_logical_type(val, &type, e.out()));
+    DUCKDB_V2_LOGICAL_TYPE_ID tid = DUCKDB_V2_LOGICAL_TYPE_ID_INVALID;
+    DUCKDB_V2_ERROR code = duckdb_v2_logical_type_get_id(type, &tid, e.out());
+    duckdb_v2_logical_type_destroy(&type);
+    e.check(code);
 
+    // Reads the payload through `getter`, which converts it to its own type.
+    auto get = [&](auto getter, auto out) {
+        e.check(getter(val, &out, e.out()));
+        return out;
+    };
     switch (tid) {
-        case DUCKDB_TYPE_BOOLEAN:
-            return nb::bool_(duckdb_get_bool(val));
-        case DUCKDB_TYPE_TINYINT:
-            return nb::int_((int8_t)duckdb_get_int8(val));
-        case DUCKDB_TYPE_SMALLINT:
-            return nb::int_((int16_t)duckdb_get_int16(val));
-        case DUCKDB_TYPE_INTEGER:
-            return nb::int_((int32_t)duckdb_get_int32(val));
-        case DUCKDB_TYPE_BIGINT:
-            return nb::int_((int64_t)duckdb_get_int64(val));
-        case DUCKDB_TYPE_UTINYINT:
-            return nb::int_((uint8_t)duckdb_get_uint8(val));
-        case DUCKDB_TYPE_USMALLINT:
-            return nb::int_((uint16_t)duckdb_get_uint16(val));
-        case DUCKDB_TYPE_UINTEGER:
-            return nb::int_((uint32_t)duckdb_get_uint32(val));
-        case DUCKDB_TYPE_UBIGINT:
-            return nb::int_((uint64_t)duckdb_get_uint64(val));
-        case DUCKDB_TYPE_FLOAT:
-        case DUCKDB_TYPE_DOUBLE:
-            return nb::float_(duckdb_get_double(val));
+        case DUCKDB_V2_LOGICAL_TYPE_ID_BOOLEAN:
+            return nb::bool_(get(duckdb_v2_value_get_bool, false));
+        case DUCKDB_V2_LOGICAL_TYPE_ID_TINYINT:
+            return nb::int_(get(duckdb_v2_value_get_tinyint, (int8_t)0));
+        case DUCKDB_V2_LOGICAL_TYPE_ID_SMALLINT:
+            return nb::int_(get(duckdb_v2_value_get_smallint, (int16_t)0));
+        case DUCKDB_V2_LOGICAL_TYPE_ID_INTEGER:
+            return nb::int_(get(duckdb_v2_value_get_int, (int32_t)0));
+        case DUCKDB_V2_LOGICAL_TYPE_ID_BIGINT:
+            return nb::int_(get(duckdb_v2_value_get_bigint, (int64_t)0));
+        case DUCKDB_V2_LOGICAL_TYPE_ID_UTINYINT:
+            return nb::int_(get(duckdb_v2_value_get_utinyint, (uint8_t)0));
+        case DUCKDB_V2_LOGICAL_TYPE_ID_USMALLINT:
+            return nb::int_(get(duckdb_v2_value_get_usmallint, (uint16_t)0));
+        case DUCKDB_V2_LOGICAL_TYPE_ID_UINTEGER:
+            return nb::int_(get(duckdb_v2_value_get_uint, (uint32_t)0));
+        case DUCKDB_V2_LOGICAL_TYPE_ID_UBIGINT:
+            return nb::int_(get(duckdb_v2_value_get_ubigint, (uint64_t)0));
+        case DUCKDB_V2_LOGICAL_TYPE_ID_FLOAT:
+        case DUCKDB_V2_LOGICAL_TYPE_ID_DOUBLE:
+            return nb::float_(get(duckdb_v2_value_get_double, 0.0));
+        case DUCKDB_V2_LOGICAL_TYPE_ID_VARCHAR: {
+            const char* text = nullptr;
+            idx_t length = 0;
+            e.check(duckdb_v2_value_get_varchar(val, &text, &length, e.out()));
+            return nb::str(text, length);
+        }
         default: {
-            char* s = duckdb_get_varchar(val);
-            nb::object result = nb::str(s);
-            duckdb_free(s);
-            return result;
+            duckdb_v2_logical_type_handle varchar = nullptr;
+            e.check(duckdb_v2_factory_create_type_from_id(
+                factory, DUCKDB_V2_LOGICAL_TYPE_ID_VARCHAR, nullptr, nullptr, nullptr, 0, &varchar,
+                e.out()));
+            duckdb_v2_value_handle cast = nullptr;
+            code = duckdb_v2_value_cast(factory, val, varchar, &cast, e.out());
+            duckdb_v2_logical_type_destroy(&varchar);
+            e.check(code);
+            nb::object out;
+            try {
+                out = value_to_python(factory, cast);
+            } catch (...) {
+                duckdb_v2_value_destroy(&cast);
+                throw;
+            }
+            duckdb_v2_value_destroy(&cast);
+            return out;
         }
     }
 }
 
 // Column types supported by write_column_value.
-bool table_output_type_supported(duckdb_type t) {
+bool table_output_type_supported(DUCKDB_V2_LOGICAL_TYPE_ID t) {
     switch (t) {
-        case DUCKDB_TYPE_BOOLEAN:
-        case DUCKDB_TYPE_TINYINT:
-        case DUCKDB_TYPE_SMALLINT:
-        case DUCKDB_TYPE_INTEGER:
-        case DUCKDB_TYPE_BIGINT:
-        case DUCKDB_TYPE_UTINYINT:
-        case DUCKDB_TYPE_USMALLINT:
-        case DUCKDB_TYPE_UINTEGER:
-        case DUCKDB_TYPE_UBIGINT:
-        case DUCKDB_TYPE_FLOAT:
-        case DUCKDB_TYPE_DOUBLE:
-        case DUCKDB_TYPE_VARCHAR:
-        case DUCKDB_TYPE_BLOB:
-        case DUCKDB_TYPE_DATE:
-        case DUCKDB_TYPE_TIME:
-        case DUCKDB_TYPE_TIMESTAMP:
-        case DUCKDB_TYPE_TIMESTAMP_S:
-        case DUCKDB_TYPE_TIMESTAMP_MS:
-        case DUCKDB_TYPE_TIMESTAMP_NS:
-        case DUCKDB_TYPE_TIMESTAMP_TZ:
+        case DUCKDB_V2_LOGICAL_TYPE_ID_BOOLEAN:
+        case DUCKDB_V2_LOGICAL_TYPE_ID_TINYINT:
+        case DUCKDB_V2_LOGICAL_TYPE_ID_SMALLINT:
+        case DUCKDB_V2_LOGICAL_TYPE_ID_INTEGER:
+        case DUCKDB_V2_LOGICAL_TYPE_ID_BIGINT:
+        case DUCKDB_V2_LOGICAL_TYPE_ID_UTINYINT:
+        case DUCKDB_V2_LOGICAL_TYPE_ID_USMALLINT:
+        case DUCKDB_V2_LOGICAL_TYPE_ID_UINTEGER:
+        case DUCKDB_V2_LOGICAL_TYPE_ID_UBIGINT:
+        case DUCKDB_V2_LOGICAL_TYPE_ID_FLOAT:
+        case DUCKDB_V2_LOGICAL_TYPE_ID_DOUBLE:
+        case DUCKDB_V2_LOGICAL_TYPE_ID_VARCHAR:
+        case DUCKDB_V2_LOGICAL_TYPE_ID_BLOB:
+        case DUCKDB_V2_LOGICAL_TYPE_ID_DATE:
+        case DUCKDB_V2_LOGICAL_TYPE_ID_TIME:
+        case DUCKDB_V2_LOGICAL_TYPE_ID_TIMESTAMP:
+        case DUCKDB_V2_LOGICAL_TYPE_ID_TIMESTAMP_SEC:
+        case DUCKDB_V2_LOGICAL_TYPE_ID_TIMESTAMP_MS:
+        case DUCKDB_V2_LOGICAL_TYPE_ID_TIMESTAMP_NS:
+        case DUCKDB_V2_LOGICAL_TYPE_ID_TIMESTAMP_TZ:
             return true;
         default:
             return false;
@@ -112,23 +144,53 @@ int64_t micros_to_nanos(int64_t micros) {
     return micros * 1000;
 }
 
-// Write a Python scalar value into a duckdb_vector at position `row`.
-void write_column_value(duckdb_vector vec, idx_t row, nb::object val, duckdb_type tid) {
+// An output column of the chunk being filled.
+struct OutColumn {
+    duckdb_v2_vector_handle vector = nullptr;
+    void* data = nullptr;
+    DUCKDB_V2_LOGICAL_TYPE_ID type = DUCKDB_V2_LOGICAL_TYPE_ID_INVALID;
+    uint64_t* validity = nullptr;            // taken on the first NULL
+    duckdb_v2_arena_handle arena = nullptr;  // taken on the first long string
+};
+
+// Store `size` bytes as row `row` of a VARCHAR or BLOB column. Bytes may
+// include NULs.
+void write_bytes(OutColumn& col, idx_t row, const char* bytes, size_t size) {
+    if (size > UINT32_MAX) throw DuckyError("ducky: string value is too long");
+    duckdb_v2_bytes& out = ((duckdb_v2_bytes*)col.data)[row];
+    if (size <= DUCKDB_V2_BYTES_INLINE_LENGTH) {
+        out.value.inlined.length = (uint32_t)size;
+        std::memset(out.value.inlined.inlined, 0, sizeof(out.value.inlined.inlined));
+        std::memcpy(out.value.inlined.inlined, bytes, size);
+        return;
+    }
+    V2Error e;
+    if (!col.arena) e.check(duckdb_v2_vector_get_arena(col.vector, &col.arena, e.out()));
+    uint8_t* stored = nullptr;
+    e.check(duckdb_v2_arena_allocate(col.arena, size, &stored, e.out()));
+    std::memcpy(stored, bytes, size);
+    out.value.pointer.length = (uint32_t)size;
+    std::memcpy(out.value.pointer.prefix, bytes, sizeof(out.value.pointer.prefix));
+    out.value.pointer.ptr = (char*)stored;
+}
+
+// Write a Python scalar value into row `row` of `col`.
+void write_column_value(OutColumn& col, idx_t row, nb::handle val) {
     if (val.is_none()) {
-        duckdb_vector_ensure_validity_writable(vec);
-        uint64_t* validity = duckdb_vector_get_validity(vec);
-        duckdb_validity_set_row_invalid(validity, row);
+        if (!col.validity) {
+            V2Error e;
+            e.check(duckdb_v2_vector_flat_get_validity_mutable(col.vector, &col.validity, e.out()));
+        }
+        col.validity[row / 64] &= ~((uint64_t)1 << (row % 64));
         return;
     }
 
-    if (tid == DUCKDB_TYPE_BLOB) {
-        // Length-aware assignment: blobs (and Python strings) may carry
-        // embedded NUL bytes, which the strlen-based variant would truncate at.
+    if (col.type == DUCKDB_V2_LOGICAL_TYPE_ID_BLOB) {
         nb::bytes b = nb::cast<nb::bytes>(val);
-        duckdb_vector_assign_string_element_len(vec, row, b.c_str(), b.size());
+        write_bytes(col, row, b.c_str(), b.size());
         return;
     }
-    if (tid == DUCKDB_TYPE_VARCHAR) {
+    if (col.type == DUCKDB_V2_LOGICAL_TYPE_ID_VARCHAR) {
         // Borrow PyUnicode's cached UTF-8 buffer; no std::string copy.
         if (!nb::isinstance<nb::str>(val)) {
             throw DuckyError("ducky: expected str for VARCHAR column");
@@ -136,51 +198,50 @@ void write_column_value(duckdb_vector vec, idx_t row, nb::object val, duckdb_typ
         Py_ssize_t size = 0;
         const char* s = PyUnicode_AsUTF8AndSize(val.ptr(), &size);
         if (!s) throw nb::python_error();
-        duckdb_vector_assign_string_element_len(vec, row, s, (idx_t)size);
+        write_bytes(col, row, s, (size_t)size);
         return;
     }
 
-    void* data = duckdb_vector_get_data(vec);
-
-    switch (tid) {
-        case DUCKDB_TYPE_BOOLEAN:
+    void* data = col.data;
+    switch (col.type) {
+        case DUCKDB_V2_LOGICAL_TYPE_ID_BOOLEAN:
             ((bool*)data)[row] = nb::cast<bool>(val);
             break;
-        case DUCKDB_TYPE_TINYINT:
+        case DUCKDB_V2_LOGICAL_TYPE_ID_TINYINT:
             ((int8_t*)data)[row] = (int8_t)checked_signed(val, INT8_MIN, INT8_MAX, "TINYINT");
             break;
-        case DUCKDB_TYPE_SMALLINT:
+        case DUCKDB_V2_LOGICAL_TYPE_ID_SMALLINT:
             ((int16_t*)data)[row] = (int16_t)checked_signed(val, INT16_MIN, INT16_MAX, "SMALLINT");
             break;
-        case DUCKDB_TYPE_INTEGER:
+        case DUCKDB_V2_LOGICAL_TYPE_ID_INTEGER:
             ((int32_t*)data)[row] = (int32_t)checked_signed(val, INT32_MIN, INT32_MAX, "INTEGER");
             break;
-        case DUCKDB_TYPE_BIGINT:
+        case DUCKDB_V2_LOGICAL_TYPE_ID_BIGINT:
             ((int64_t*)data)[row] = nb::cast<int64_t>(val);
             break;
-        case DUCKDB_TYPE_UTINYINT:
+        case DUCKDB_V2_LOGICAL_TYPE_ID_UTINYINT:
             ((uint8_t*)data)[row] = (uint8_t)checked_unsigned(val, UINT8_MAX, "UTINYINT");
             break;
-        case DUCKDB_TYPE_USMALLINT:
+        case DUCKDB_V2_LOGICAL_TYPE_ID_USMALLINT:
             ((uint16_t*)data)[row] = (uint16_t)checked_unsigned(val, UINT16_MAX, "USMALLINT");
             break;
-        case DUCKDB_TYPE_UINTEGER:
+        case DUCKDB_V2_LOGICAL_TYPE_ID_UINTEGER:
             ((uint32_t*)data)[row] = (uint32_t)checked_unsigned(val, UINT32_MAX, "UINTEGER");
             break;
-        case DUCKDB_TYPE_UBIGINT:
+        case DUCKDB_V2_LOGICAL_TYPE_ID_UBIGINT:
             ((uint64_t*)data)[row] = nb::cast<uint64_t>(val);
             break;
-        case DUCKDB_TYPE_FLOAT:
+        case DUCKDB_V2_LOGICAL_TYPE_ID_FLOAT:
             ((float*)data)[row] = (float)nb::cast<double>(val);
             break;
-        case DUCKDB_TYPE_DOUBLE:
+        case DUCKDB_V2_LOGICAL_TYPE_ID_DOUBLE:
             ((double*)data)[row] = nb::cast<double>(val);
             break;
         // Temporal columns accept the matching datetime object or the raw
         // integer storage value (days for DATE, the timestamp's native unit
         // otherwise). datetime.datetime is a date subclass, so DATE excludes it
         // rather than silently truncating the time part.
-        case DUCKDB_TYPE_DATE: {
+        case DUCKDB_V2_LOGICAL_TYPE_ID_DATE: {
             PyObject* raw = val.ptr();
             if (PyDate_Check(raw) && !PyDateTime_Check(raw)) {
                 ((int32_t*)data)[row] = pydt::date_to_duckdb(raw).days;
@@ -189,7 +250,7 @@ void write_column_value(duckdb_vector vec, idx_t row, nb::object val, duckdb_typ
             }
             break;
         }
-        case DUCKDB_TYPE_TIME: {
+        case DUCKDB_V2_LOGICAL_TYPE_ID_TIME: {
             PyObject* raw = val.ptr();
             if (PyTime_Check(raw)) {
                 ((int64_t*)data)[row] = pydt::time_to_duckdb(raw).micros;
@@ -198,22 +259,22 @@ void write_column_value(duckdb_vector vec, idx_t row, nb::object val, duckdb_typ
             }
             break;
         }
-        case DUCKDB_TYPE_TIMESTAMP:
-        case DUCKDB_TYPE_TIMESTAMP_TZ:
+        case DUCKDB_V2_LOGICAL_TYPE_ID_TIMESTAMP:
+        case DUCKDB_V2_LOGICAL_TYPE_ID_TIMESTAMP_TZ:
             ((int64_t*)data)[row] = PyDateTime_Check(val.ptr()) ? pydt::datetime_to_micros(val)
                                                                 : nb::cast<int64_t>(val);
             break;
-        case DUCKDB_TYPE_TIMESTAMP_S:
+        case DUCKDB_V2_LOGICAL_TYPE_ID_TIMESTAMP_SEC:
             ((int64_t*)data)[row] = PyDateTime_Check(val.ptr())
                                         ? floor_div(pydt::datetime_to_micros(val), 1000000)
                                         : nb::cast<int64_t>(val);
             break;
-        case DUCKDB_TYPE_TIMESTAMP_MS:
+        case DUCKDB_V2_LOGICAL_TYPE_ID_TIMESTAMP_MS:
             ((int64_t*)data)[row] = PyDateTime_Check(val.ptr())
                                         ? floor_div(pydt::datetime_to_micros(val), 1000)
                                         : nb::cast<int64_t>(val);
             break;
-        case DUCKDB_TYPE_TIMESTAMP_NS:
+        case DUCKDB_V2_LOGICAL_TYPE_ID_TIMESTAMP_NS:
             ((int64_t*)data)[row] = PyDateTime_Check(val.ptr())
                                         ? micros_to_nanos(pydt::datetime_to_micros(val))
                                         : nb::cast<int64_t>(val);
@@ -221,113 +282,142 @@ void write_column_value(duckdb_vector vec, idx_t row, nb::object val, duckdb_typ
         default:
             // Unreachable: create_table_function rejects unsupported column
             // types at registration (table_output_type_supported).
-            throw DuckyError(std::string("ducky: table function column type ") +
-                             duckdb_type_name(tid) + " is not supported");
+            throw DuckyError("ducky: table function column type is not supported");
     }
 }
 
-void table_bind(duckdb_bind_info info) {
-    auto* ctx = (TableUDFContext*)duckdb_bind_get_extra_info(info);
+void table_bind(duckdb_v2_function_bind_info_handle info,
+                duckdb_v2_table_function_bind_info_handle result, duckdb_v2_context_handle context,
+                duckdb_v2_error_info_handle* err) {
     nb::gil_scoped_acquire gil;
-    guard(
-        [&] {
-            idx_t n_params = duckdb_bind_get_parameter_count(info);
-            nb::list python_args;
-            for (idx_t i = 0; i < n_params; ++i) {
-                duckdb_value val = duckdb_bind_get_parameter(info, i);
-                nb::object py_val;
-                try {
-                    py_val = duckdb_value_to_python(val);
-                } catch (...) {
-                    duckdb_destroy_value(&val);
-                    throw;
-                }
-                duckdb_destroy_value(&val);
-                python_args.append(py_val);
-            }
+    report(err, [&] {
+        V2Error e;
+        void* user_data = nullptr;
+        e.check(duckdb_v2_function_bind_get_user_data(info, &user_data, e.out()));
+        auto* ctx = (TableUDFContext*)user_data;
+        duckdb_v2_factory_handle factory = nullptr;
+        e.check(duckdb_v2_context_get_factory(context, &factory, e.out()));
 
-            for (idx_t i = 0; i < (idx_t)ctx->col_names.size(); ++i) {
-                duckdb_bind_add_result_column(info, ctx->col_names[i].c_str(), ctx->col_types[i]);
+        idx_t n_params = 0;
+        e.check(duckdb_v2_function_bind_get_arg_count(info, &n_params, nullptr, nullptr, nullptr,
+                                                      e.out()));
+        nb::list python_args;
+        for (idx_t i = 0; i < n_params; ++i) {
+            duckdb_v2_value_handle val = nullptr;
+            e.check(duckdb_v2_function_bind_get_arg_value(info, i, &val, e.out()));
+            nb::object py_val;
+            try {
+                py_val = value_to_python(factory, val);
+            } catch (...) {
+                duckdb_v2_value_destroy(&val);
+                throw;
             }
+            duckdb_v2_value_destroy(&val);
+            python_args.append(py_val);
+        }
 
-            auto* bd =
-                new TableUDFBindData{ctx->factory, python_args, ctx->col_type_ids, ctx->col_names};
-            duckdb_bind_set_bind_data(info, bd, &gil_delete<TableUDFBindData>);
-        },
-        [&](const char* what) { duckdb_bind_set_error(info, what); });
+        for (size_t i = 0; i < ctx->col_names.size(); ++i) {
+            const std::string& col_name = ctx->col_names[i];
+            e.check(duckdb_v2_table_function_bind_add_result_column(
+                result, col_name.data(), col_name.size(), ctx->col_types[i], e.out()));
+        }
+
+        auto bd = std::make_unique<TableUDFBindData>(TableUDFBindData{ctx->factory, python_args});
+        duckdb_v2_opaque data{bd.get(), &gil_delete<TableUDFBindData>, nullptr};
+        e.check(duckdb_v2_function_bind_set_bind_data(info, &data, e.out()));
+        // NOLINTNEXTLINE(bugprone-unused-return-value)
+        (void)bd.release();
+    });
 }
 
-void table_init(duckdb_init_info info) {
-    auto* bd = (TableUDFBindData*)duckdb_init_get_bind_data(info);
-    // Single-threaded: Python generators are not thread-safe.
-    duckdb_init_set_max_threads(info, 1);
+void table_init(duckdb_v2_table_function_init_global_info_handle info,
+                duckdb_v2_context_handle context, duckdb_v2_error_info_handle* err) {
     nb::gil_scoped_acquire gil;
-    guard(
-        [&] {
-            nb::object gen = bd->factory(*nb::tuple(bd->python_args));
-            auto* id = new TableUDFInitData{std::move(gen)};
-            duckdb_init_set_init_data(info, id, &gil_delete<TableUDFInitData>);
-        },
-        [&](const char* what) { duckdb_init_set_error(info, what); });
+    report(err, [&] {
+        V2Error e;
+        void* bind_data = nullptr;
+        e.check(duckdb_v2_table_function_init_global_get_bind_data(info, &bind_data, e.out()));
+        auto* bd = (TableUDFBindData*)bind_data;
+        // Single-threaded: Python generators are not thread-safe.
+        e.check(duckdb_v2_table_function_init_global_set_max_threads(info, 1, e.out()));
+        nb::object gen = bd->factory(*nb::tuple(bd->python_args));
+        auto id = std::make_unique<TableUDFInitData>(TableUDFInitData{std::move(gen)});
+        duckdb_v2_opaque data{id.get(), &gil_delete<TableUDFInitData>, nullptr};
+        e.check(duckdb_v2_table_function_init_global_set_global_state(info, &data, e.out()));
+        // NOLINTNEXTLINE(bugprone-unused-return-value)
+        (void)id.release();
+    });
 }
 
-void table_main(duckdb_function_info info, duckdb_data_chunk output) {
-    auto* bd = (TableUDFBindData*)duckdb_function_get_bind_data(info);
-    auto* id = (TableUDFInitData*)duckdb_function_get_init_data(info);
+void table_main(duckdb_v2_table_function_exec_info_handle info, duckdb_v2_context_handle context,
+                duckdb_v2_error_info_handle* err) {
+    nb::gil_scoped_acquire gil;
+    report(err, [&] {
+        V2Error e;
+        void* user_data = nullptr;
+        void* global_state = nullptr;
+        e.check(duckdb_v2_table_function_exec_get_user_data(info, &user_data, e.out()));
+        e.check(duckdb_v2_table_function_exec_get_global_state(info, &global_state, e.out()));
+        auto* ctx = (TableUDFContext*)user_data;
+        auto* id = (TableUDFInitData*)global_state;
+        if (id->exhausted) return;  // an empty output ends the scan
 
-    if (id->exhausted) {
-        duckdb_data_chunk_set_size(output, 0);
-        return;
+        duckdb_v2_data_chunk_handle output = nullptr;
+        e.check(duckdb_v2_table_function_exec_get_output_chunk(info, &output, e.out()));
+        size_t n_cols = ctx->col_type_ids.size();
+        std::vector<OutColumn> cols(n_cols);
+        for (size_t c = 0; c < n_cols; ++c) {
+            OutColumn& col = cols[c];
+            col.type = ctx->col_type_ids[c];
+            e.check(duckdb_v2_data_chunk_get_vector(output, c, &col.vector, e.out()));
+            e.check(duckdb_v2_vector_get_data_mutable(col.vector, &col.data, e.out()));
+        }
+
+        idx_t rows = 0;
+        idx_t vec_size = duckdb_vector_size();
+        PyObject* gen = id->generator.ptr();
+        while (rows < vec_size) {
+            // PyIter_Next: returns NULL at exhaustion (no error) or NULL +
+            // error set on failure. Avoids a `builtins.next` attr lookup
+            // and a StopIteration throw per row.
+            PyObject* raw = PyIter_Next(gen);
+            if (!raw) {
+                if (PyErr_Occurred()) throw nb::python_error();
+                id->exhausted = true;
+                break;
+            }
+            nb::object row_obj = nb::steal(raw);
+
+            // Accept single-value non-tuple rows as a 1-element tuple.
+            nb::tuple row;
+            if (nb::isinstance<nb::tuple>(row_obj)) {
+                row = nb::cast<nb::tuple>(row_obj);
+            } else {
+                row = nb::make_tuple(row_obj);
+            }
+            // row[c] below is unchecked (PyTuple_GET_ITEM), so a wrong-arity
+            // row must be rejected here, not discovered by reading past the
+            // tuple's end.
+            if (nb::len(row) != n_cols) {
+                throw DuckyError("ducky: table function row has " + std::to_string(nb::len(row)) +
+                                 " values; expected " + std::to_string(n_cols));
+            }
+
+            for (size_t c = 0; c < n_cols; ++c) write_column_value(cols[c], rows, row[c]);
+            ++rows;
+        }
+        // The engine takes the first vector's size as the chunk's.
+        if (rows > 0) e.check(duckdb_v2_vector_set_size(cols[0].vector, rows, e.out()));
+    });
+}
+
+// Owns the logical types parsed for one registration.
+struct ParsedTypes {
+    std::vector<duckdb_v2_logical_type_handle> types;
+    ~ParsedTypes() {
+        for (duckdb_v2_logical_type_handle& t : types) duckdb_v2_logical_type_destroy(&t);
     }
-
-    nb::gil_scoped_acquire gil;
-    idx_t n_cols = (idx_t)bd->col_type_ids.size();
-    idx_t rows = 0;
-    idx_t vec_size = duckdb_vector_size();
-
-    bool ok = guard(
-        [&] {
-            PyObject* gen = id->generator.ptr();
-            while (rows < vec_size) {
-                // PyIter_Next: returns NULL at exhaustion (no error) or NULL +
-                // error set on failure. Avoids a `builtins.next` attr lookup
-                // and a StopIteration throw per row.
-                PyObject* raw = PyIter_Next(gen);
-                if (!raw) {
-                    if (PyErr_Occurred()) throw nb::python_error();
-                    id->exhausted = true;
-                    break;
-                }
-                nb::object row_obj = nb::steal(raw);
-
-                // Accept single-value non-tuple rows as a 1-element tuple.
-                nb::tuple row;
-                if (nb::isinstance<nb::tuple>(row_obj)) {
-                    row = nb::cast<nb::tuple>(row_obj);
-                } else {
-                    row = nb::make_tuple(row_obj);
-                }
-                // row[c] below is unchecked (PyTuple_GET_ITEM), so a wrong-arity
-                // row must be rejected here, not discovered by reading past the
-                // tuple's end.
-                if (nb::len(row) != (size_t)n_cols) {
-                    throw DuckyError("ducky: table function row has " +
-                                     std::to_string(nb::len(row)) + " values; expected " +
-                                     std::to_string(n_cols));
-                }
-
-                for (idx_t c = 0; c < n_cols; ++c) {
-                    duckdb_vector vec = duckdb_data_chunk_get_vector(output, c);
-                    write_column_value(vec, rows, row[c], bd->col_type_ids[c]);
-                }
-                ++rows;
-            }
-        },
-        [&](const char* what) { duckdb_function_set_error(info, what); });
-    if (!ok) return;
-
-    duckdb_data_chunk_set_size(output, rows);
-}
+};
 
 }  // namespace
 
@@ -338,8 +428,10 @@ void create_table_function(Connection& con, const std::string& name, nb::callabl
     // Registration always precedes execution, so priming here suffices.
     if (!PyDateTimeAPI) PyDateTime_IMPORT;
     std::shared_ptr<DuckDBHandle> handle = con.open_handle();
-    duckdb_connection raw = handle->connection;
-    TypeParser types(handle->database, raw);
+    duckdb_v2_connection_handle connection = handle->connection_v2;
+    V2Error err;
+    duckdb_v2_factory_handle types = nullptr;
+    err.check(duckdb_v2_connection_get_factory(connection, &types, err.out()));
     auto ctx = std::make_unique<TableUDFContext>();
     ctx->factory = handle->keep(factory);
 
@@ -347,9 +439,9 @@ void create_table_function(Connection& con, const std::string& name, nb::callabl
     if (!nb::isinstance<nb::sequence>(parameters)) {
         throw DuckyError("ducky: table function '" + name + "': parameters must be a list");
     }
-    nb::sequence pseq = nb::cast<nb::sequence>(parameters);
-    for (auto item : pseq) {
-        ctx->param_types.push_back(types.parse(nb::cast<std::string>(item)));
+    ParsedTypes param_types;
+    for (auto item : nb::cast<nb::sequence>(parameters)) {
+        param_types.types.push_back(v2_parse_type(types, nb::cast<std::string>(item)));
     }
 
     // Parse output columns from dict {name: type}.
@@ -362,47 +454,59 @@ void create_table_function(Connection& con, const std::string& name, nb::callabl
     }
     for (auto item : cols) {
         std::string col_name = nb::cast<std::string>(item.first);
-        std::string type_str = nb::cast<std::string>(item.second);
-        duckdb_logical_type lt = types.parse(type_str);
+        duckdb_v2_logical_type_handle lt = v2_parse_type(types, nb::cast<std::string>(item.second));
         // Push before validating so ~TableUDFContext owns (and frees) lt on throw.
         ctx->col_names.push_back(col_name);
         ctx->col_types.push_back(lt);
-        ctx->col_type_ids.push_back(duckdb_get_type_id(lt));
-        if (!table_output_type_supported(ctx->col_type_ids.back())) {
+        DUCKDB_V2_LOGICAL_TYPE_ID tid = DUCKDB_V2_LOGICAL_TYPE_ID_INVALID;
+        err.check(duckdb_v2_logical_type_get_id(lt, &tid, err.out()));
+        ctx->col_type_ids.push_back(tid);
+        if (!table_output_type_supported(tid)) {
             throw DuckyError("ducky: table function '" + name + "': column '" + col_name +
-                             "' has unsupported type " +
-                             duckdb_type_name(ctx->col_type_ids.back()) +
+                             "' has unsupported type " + v2_type_name(lt) +
                              " (supported: BOOLEAN, [U]TINYINT..BIGINT, FLOAT, DOUBLE, VARCHAR, "
                              "BLOB, DATE, TIME, TIMESTAMP[_S/MS/NS/TZ])");
         }
     }
 
-    duckdb_table_function f = duckdb_create_table_function();
-    duckdb_table_function_set_name(f, name.c_str());
-    for (duckdb_logical_type t : ctx->param_types) {
-        duckdb_table_function_add_parameter(f, t);
+    const std::string failed = "ducky: failed to register table function '" + name + "': ";
+    auto check = [&](DUCKDB_V2_ERROR code) { err.check(code, failed); };
+    duckdb_v2_table_function_handle f = nullptr;
+    check(duckdb_v2_table_function_create(types, &f, err.out()));
+    std::unique_ptr<duckdb_v2_table_function_handle, void (*)(duckdb_v2_table_function_handle*)>
+        f_guard(&f, [](duckdb_v2_table_function_handle* p) {
+            // A failed registration's function drops the last reference to the
+            // context, whose destructor takes the GIL.
+            release_gil_if_held release;
+            duckdb_v2_table_function_destroy(p);
+        });
+    check(duckdb_v2_table_function_set_name(f, name.data(), name.size(), err.out()));
+    duckdb_v2_function_signature_handle sig = nullptr;
+    check(duckdb_v2_table_function_get_signature(f, &sig, err.out()));
+    for (size_t i = 0; i < param_types.types.size(); ++i) {
+        std::string param = "arg" + std::to_string(i + 1);
+        check(duckdb_v2_function_signature_add_parameter(
+            sig, param.data(), param.size(), param_types.types[i], nullptr,
+            DUCKDB_V2_FUNCTION_PARAMETER_KIND_POSITIONAL_ONLY, err.out()));
     }
     // Ownership of ctx passes to the function object here: its destroy callback
-    // runs whether or not registration succeeds (a failed registration's
-    // duckdb_destroy_table_function drops the last reference).
-    duckdb_table_function_set_extra_info(f, ctx.get(), &gil_delete<TableUDFContext>);
+    // runs whether or not registration succeeds.
+    duckdb_v2_opaque data{ctx.get(), &gil_delete<TableUDFContext>, nullptr};
+    check(duckdb_v2_table_function_set_user_data(f, &data, err.out()));
     // NOLINTNEXTLINE(bugprone-unused-return-value)
     (void)ctx.release();
-    duckdb_table_function_set_bind(f, &table_bind);
-    duckdb_table_function_set_init(f, &table_init);
-    duckdb_table_function_set_function(f, &table_main);
-    duckdb_table_function_supports_projection_pushdown(f, false);
+    check(duckdb_v2_table_function_set_bind_callback(f, &table_bind, err.out()));
+    check(duckdb_v2_table_function_set_init_global_callback(f, &table_init, err.out()));
+    check(duckdb_v2_table_function_set_exec_callback(f, &table_main, err.out()));
+    check(duckdb_v2_table_function_set_projection_pushdown(f, false, err.out()));
 
-    duckdb_state state;
+    DUCKDB_V2_ERROR code;
     {
         // Registration takes the client context lock, which a query running
         // Python callbacks on another thread may hold while it waits for the
-        // GIL; a failed registration's destructor takes the GIL itself.
+        // GIL.
         release_gil_if_held release;
-        state = duckdb_register_table_function(raw, f);
-        duckdb_destroy_table_function(&f);
+        code = duckdb_v2_connection_register_table_function(connection, f, err.out());
     }
-    if (state == DuckDBError) {
-        throw DuckyError("ducky: failed to register table function '" + name + "'");
-    }
+    check(code);
 }

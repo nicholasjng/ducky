@@ -5,36 +5,30 @@
 #include <string>
 #include <vector>
 
-#include "duckdb.h"
-#include "function.hpp"
+#include "v2.hpp"
 
 namespace nb = nanobind;
 
 class Connection;
 
 struct TableUDFContext {
-    nb::handle factory;                            // kept alive by the DuckDBHandle
-    std::vector<duckdb_logical_type> param_types;  // owned
+    nb::handle factory;  // kept alive by the DuckDBHandle
     std::vector<std::string> col_names;
-    std::vector<duckdb_logical_type> col_types;  // owned
-    std::vector<duckdb_type> col_type_ids;
+    std::vector<duckdb_v2_logical_type_handle> col_types;  // owned
+    std::vector<DUCKDB_V2_LOGICAL_TYPE_ID> col_type_ids;
 
     TableUDFContext() = default;
     TableUDFContext(const TableUDFContext&) = delete;
     TableUDFContext& operator=(const TableUDFContext&) = delete;
 
-    // Owns logical types during parsing and registration.
     ~TableUDFContext() {
-        for (duckdb_logical_type& t : param_types) duckdb_destroy_logical_type(&t);
-        for (duckdb_logical_type& t : col_types) duckdb_destroy_logical_type(&t);
+        for (duckdb_v2_logical_type_handle& t : col_types) duckdb_v2_logical_type_destroy(&t);
     }
 };
 
 struct TableUDFBindData {
     nb::handle factory;  // borrowed from TableUDFContext
     nb::list python_args;
-    std::vector<duckdb_type> col_type_ids;
-    std::vector<std::string> col_names;
 };
 
 struct TableUDFInitData {

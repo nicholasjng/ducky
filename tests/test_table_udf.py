@@ -190,3 +190,44 @@ def test_out_of_range_int_raises(con):
     con.create_table_function("overflow_gen", gen, parameters=[], columns={"v": "TINYINT"})
     with pytest.raises(ducky.Error, match="out of range for TINYINT"):
         con.sql("SELECT v FROM overflow_gen()").fetchall()
+
+
+def test_strings_inline_and_out_of_line(con):
+    # DuckDB inlines strings of up to 12 bytes and stores longer ones apart.
+    rows = [
+        ("", b""),
+        ("a" * 12, b"\x00" * 12),
+        ("b" * 13, b"\x00x" * 7),
+        ("héllo, wörld — long enough", None),
+        (None, b"z"),
+    ]
+    con.create_table_function("strs", lambda: iter(rows), [], {"s": "VARCHAR", "b": "BLOB"})
+    assert con.sql("SELECT * FROM strs()").fetchall() == rows
+
+
+def test_rows_span_several_chunks(con):
+    expected = [(i, None if i % 3 == 0 else f"value number {i}") for i in range(5000)]
+    con.create_table_function("many", lambda: iter(expected), [], {"i": "BIGINT", "s": "VARCHAR"})
+    assert con.sql("SELECT * FROM many()").fetchall() == expected
+
+
+def test_parameter_of_a_type_created_in_the_open_transaction(con):
+    con.execute("BEGIN")
+    con.execute("CREATE TYPE mood AS ENUM ('sad', 'happy')")
+    con.create_table_function("echo_mood", lambda m: iter([(m,)]), ["mood"], {"m": "VARCHAR"})
+    assert con.sql("SELECT m FROM echo_mood('happy')").fetchall() == [("happy",)]
+    con.execute("COMMIT")
+
+
+def test_prepared_statement_calls_the_factory_per_execution(con):
+    calls = []
+
+    def upto(n):
+        calls.append(n)
+        return ((i,) for i in range(n))
+
+    con.create_table_function("upto", upto, ["BIGINT"], {"v": "BIGINT"})
+    stmt = con.prepare("SELECT sum(v) FROM upto(4)")
+    assert stmt.execute().fetchall() == [(6,)]
+    assert stmt.execute().fetchall() == [(6,)]
+    assert calls == [4, 4]
