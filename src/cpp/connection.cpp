@@ -739,6 +739,7 @@ void Connection::register_arrow(const std::string& name, nb::object obj) {
     // Re-registering may change the schema.
     statement_cache_clear();
     register_arrow_source(*arrow_registry_, name, std::move(obj));
+    open_handle()->arrow_generation++;
 }
 
 Connection::~Connection() { close(); }
@@ -1130,8 +1131,10 @@ PendingResult* Connection::make_pending(const std::string& query, nb::object par
 
 PreparedStatement* Connection::prepare(const std::string& query) {
     std::shared_ptr<DuckDBHandle> handle = open_handle();
+    // Read first: a registration racing the prepare makes it prepare again.
+    uint64_t generation = handle->arrow_generation.load();
     duckdb_prepared_statement stmt = prepare_statement(handle->connection, query);
-    return new PreparedStatement(stmt, std::move(handle));
+    return new PreparedStatement(stmt, std::move(handle), query, generation);
 }
 
 std::shared_ptr<Result> Connection::current_result() {
@@ -1155,14 +1158,25 @@ nb::object Connection::columns() const {
 }
 
 PreparedStatement::PreparedStatement(duckdb_prepared_statement stmt,
-                                     std::shared_ptr<DuckDBHandle> handle)
-    : stmt_(stmt), handle_(std::move(handle)) {}
+                                     std::shared_ptr<DuckDBHandle> handle, std::string query,
+                                     uint64_t arrow_generation)
+    : stmt_(stmt),
+      handle_(std::move(handle)),
+      query_(std::move(query)),
+      arrow_generation_(arrow_generation) {}
 
 PreparedStatement::~PreparedStatement() { destroy_prepared(stmt_); }
 
 std::unique_lock<std::mutex> PreparedStatement::lock_valid() const {
     std::unique_lock<std::mutex> lock = lock_releasing_gil(mu_);
     if (!stmt_) throw DuckyError("ducky: prepared statement is closed");
+    uint64_t generation = handle_->arrow_generation.load();
+    if (generation != arrow_generation_) {
+        duckdb_prepared_statement stmt = prepare_statement(handle_->connection, query_);
+        destroy_prepared(stmt_);
+        stmt_ = stmt;
+        arrow_generation_ = generation;
+    }
     return lock;
 }
 

@@ -752,11 +752,11 @@ void Appender::append_arrow(nb::object source) {
     duckdb_connection con = connection_->connection;
     if (!con) throw DuckyError("ducky: the appender's connection is closed");
 
-    // Convert one Arrow batch (an ArrowArray matching `converted`) into a data
-    // chunk and append it. duckdb_data_chunk_from_arrow takes ownership of the
+    // Convert Arrow rows (an ArrowArray matching `converted`) into a data chunk
+    // and append it. duckdb_data_chunk_from_arrow takes ownership of the
     // array's buffers, so we null its release afterward to stop the caller's
     // RAII / PyCapsule destructor from double-freeing.
-    auto append_batch = [&](duckdb_arrow_converted_schema converted, ArrowArray* array) {
+    auto append_rows = [&](duckdb_arrow_converted_schema converted, ArrowArray* array) {
         std::string err;
         duckdb_data_chunk chunk = nullptr;
         if (drain_arrow_error(duckdb_data_chunk_from_arrow(con, array, converted, &chunk), err)) {
@@ -764,41 +764,28 @@ void Appender::append_arrow(nb::object source) {
             throw DuckyError("ducky: failed to convert Arrow data to a DuckDB chunk: " + err);
         }
         array->release = nullptr;
-        // A batch converts to one chunk of the batch's length, but appending
-        // a chunk that needs a cast goes through a vector-size buffer: append
-        // in windows of at most duckdb_vector_size() rows.
-        duckdb_state st = DuckDBSuccess;
-        {
-            release_gil_if_held release;
-            idx_t rows = duckdb_data_chunk_get_size(chunk);
-            idx_t window = duckdb_vector_size();
-            if (rows <= window) {
-                st = duckdb_append_data_chunk(handle_, chunk);
-            } else {
-                idx_t n_cols = duckdb_data_chunk_get_column_count(chunk);
-                std::vector<duckdb_logical_type> types(n_cols);
-                for (idx_t c = 0; c < n_cols; ++c) {
-                    types[c] =
-                        duckdb_vector_get_column_type(duckdb_data_chunk_get_vector(chunk, c));
-                }
-                duckdb_data_chunk slice = duckdb_create_data_chunk(types.data(), n_cols);
-                for (duckdb_logical_type& t : types) duckdb_destroy_logical_type(&t);
-                for (idx_t offset = 0; offset < rows && st == DuckDBSuccess; offset += window) {
-                    idx_t count = std::min(window, rows - offset);
-                    // Zero-copy windows: a flat vector stays flat.
-                    for (idx_t c = 0; c < n_cols; ++c) {
-                        duckdb_vector_reference_slice(duckdb_data_chunk_get_vector(slice, c),
-                                                      duckdb_data_chunk_get_vector(chunk, c),
-                                                      offset, count);
-                    }
-                    duckdb_data_chunk_set_size(slice, count);
-                    st = duckdb_append_data_chunk(handle_, slice);
-                }
-                duckdb_destroy_data_chunk(&slice);
-            }
-            duckdb_destroy_data_chunk(&chunk);
-        }
+        duckdb_state st = duckdb_append_data_chunk(handle_, chunk);
+        duckdb_destroy_data_chunk(&chunk);
         check_state(st, "appending an Arrow batch failed");
+    };
+    // Appending a chunk that needs a cast goes through a vector-size buffer, so
+    // a longer batch goes in as zero-copy windows of at most
+    // duckdb_vector_size() rows.
+    auto append_batch = [&](duckdb_arrow_converted_schema converted, ArrowArray* array) {
+        // Appending can flush a full buffer (see the constructor).
+        release_gil_if_held release;
+        idx_t rows = (idx_t)array->length;
+        idx_t window = duckdb_vector_size();
+        if (rows <= window) {
+            append_rows(converted, array);
+            return;
+        }
+        std::shared_ptr<ArrowArray> batch = share_batch(*array);
+        for (idx_t offset = 0; offset < rows; offset += window) {
+            ArrowArray view = window_of(batch, offset, std::min(window, rows - offset));
+            ArrayRelease view_guard{&view};
+            append_rows(converted, &view);
+        }
     };
 
     if (nb::hasattr(source, "__arrow_c_stream__")) {

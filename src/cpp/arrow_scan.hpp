@@ -36,7 +36,6 @@ struct ArrowRegistry {
     // Keyed by the lowercased name: DuckDB resolves table names
     // case-insensitively.
     tsl::robin_map<std::string, ArrowSource> sources;
-    duckdb_connection con = nullptr;  // borrowed; for Arrow conversions
 };
 
 // Install Arrow table and replacement scans, returning their shared registry.
