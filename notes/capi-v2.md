@@ -79,8 +79,8 @@ connections, created by the shared `Database` and pool proposed in
   column data collection to one statement as a named common table expression,
   read again on every execution. Collections support parallel append and scan.
 - **Type parsing.** `factory_create_type_from_text` parses SQL type text,
-  including nested, enum, and catalog types. It would replace `TypeParser`'s
-  `SELECT CAST(NULL AS ...)` query on a private connection.
+  including nested, enum, and catalog types, without the
+  `SELECT CAST(NULL AS ...)` query `TypeParser` runs on a private connection.
 - **Smaller additions.** Typed query metrics (`connection_get_query_metrics`),
   a thread-safe progress snapshot (`connection_progress_get`), scalar functions
   whose return type depends on their arguments (a resolve types callback),
@@ -152,13 +152,19 @@ execution, so a plan keeps the Arrow schema it was bound with. A ducky
 `PreparedStatement` therefore prepares again after any Arrow registration on its
 connection; SQL `PREPARE` reports the changed schema instead.
 
+Python table functions are v2 table functions. Their types parse through the
+connection's factory, which resolves catalog types in its open transaction and
+runs no query, so they need neither `TypeParser`'s private connection nor its
+fallback. A function writes each chunk through cached data pointers, and is
+about 1.4x faster than through v1's per-cell vector calls.
+
 Next candidates:
 
 - `result_step` for the asynchronous driver, replacing pending results, the
   `execute_tasks` budget, and the sleep backoff.
-- Python UDFs as v2 scalar, aggregate, and table functions, with
-  `factory_create_type_from_text` replacing `TypeParser`'s private connection.
-  That retires `duckdb_v2_instance_open_v1`.
+- Python scalar, Arrow scalar, and aggregate UDFs as v2 functions, which
+  retires `TypeParser` and `duckdb_v2_instance_open_v1`. A v2 aggregate's
+  destroy callback runs only on states that are not finalized, unlike v1's.
 - Query execution and results, which would leave the v1 connection to the
   appender alone.
 
