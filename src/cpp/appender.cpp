@@ -57,50 +57,68 @@ struct TableIntrospection {
     std::vector<bool> has_default;
 };
 
-TableIntrospection introspect_table(duckdb_connection con,
+TableIntrospection introspect_table(duckdb_v2_connection_handle con,
                                     const std::optional<std::string>& catalog,
                                     const std::optional<std::string>& schema,
                                     const std::string& table) {
-    duckdb_table_description desc = nullptr;
-    duckdb_state state;
+    // The appender's own resolution: the default schema, not the search path.
+    std::vector<std::string> parts;
+    if (catalog) parts.push_back(*catalog);
+    parts.push_back(schema ? *schema : "main");
+    parts.push_back(table);
+    std::vector<const char*> part_ptrs;
+    std::vector<idx_t> part_lengths;
+    for (const std::string& part : parts) {
+        part_ptrs.push_back(part.data());
+        part_lengths.push_back(part.size());
+    }
+
+    const std::string failed = "ducky: appender table introspection failed: ";
+    V2Error err;
+    duckdb_v2_qname_handle name = nullptr;
+    err.check(duckdb_v2_qname_create(part_ptrs.data(), part_lengths.data(), parts.size(), &name,
+                                     err.out()),
+              failed);
+    duckdb_v2_table_description_handle desc = nullptr;
+    DUCKDB_V2_ERROR code;
     {
         // Takes the client context lock (see Appender::Appender).
         release_gil_if_held release;
-        if (catalog) {
-            state = duckdb_table_description_create_ext(
-                con, catalog->c_str(), schema ? schema->c_str() : nullptr, table.c_str(), &desc);
-        } else {
-            state = duckdb_table_description_create(con, schema ? schema->c_str() : nullptr,
-                                                    table.c_str(), &desc);
-        }
+        code = duckdb_v2_connection_describe_table(con, name, &desc, err.out());
     }
-    // desc must be destroyed even on error (per the C API contract).
-    if (state == DuckDBError) {
-        std::string message = "ducky: appender table introspection failed";
-        if (desc) {
-            const char* m = duckdb_table_description_error(desc);
-            if (m) message += std::string(": ") + m;
-        }
-        duckdb_table_description_destroy(&desc);
-        throw DuckyError(message);
-    }
+    duckdb_v2_qname_destroy(&name);
+    err.check(code, failed);
 
     TableIntrospection out;
-    idx_t n = duckdb_table_description_get_column_count(desc);
-    out.names.reserve(n);
-    out.has_default.reserve(n);
-    for (idx_t i = 0; i < n; ++i) {
-        bool generated = false;
-        duckdb_column_is_generated(desc, i, &generated);
-        if (generated) continue;
-        char* name = duckdb_table_description_get_column_name(desc, i);
-        out.names.emplace_back(name ? name : "");
-        duckdb_free(name);
-        bool def = false;
-        duckdb_column_has_default(desc, i, &def);
-        out.has_default.push_back(def);
+    try {
+        idx_t n = 0;
+        err.check(duckdb_v2_table_description_get_column_count(desc, &n, err.out()), failed);
+        for (idx_t i = 0; i < n; ++i) {
+            duckdb_v2_column_description_handle column = nullptr;
+            err.check(duckdb_v2_table_description_get_column(desc, i, &column, err.out()), failed);
+            bool generated = false, has_default = false;
+            const char* column_name = nullptr;
+            idx_t length = 0;
+            code = duckdb_v2_column_description_has_generated(column, &generated, err.out());
+            if (code == DUCKDB_V2_ERROR_NONE) {
+                code = duckdb_v2_column_description_has_default(column, &has_default, err.out());
+            }
+            if (code == DUCKDB_V2_ERROR_NONE) {
+                code =
+                    duckdb_v2_column_description_get_name(column, &column_name, &length, err.out());
+            }
+            if (code == DUCKDB_V2_ERROR_NONE && !generated) {
+                out.names.emplace_back(column_name, length);
+                out.has_default.push_back(has_default);
+            }
+            duckdb_v2_column_description_destroy(&column);
+            err.check(code, failed);
+        }
+    } catch (...) {
+        duckdb_v2_table_description_destroy(&desc);
+        throw;
     }
-    duckdb_table_description_destroy(&desc);
+    duckdb_v2_table_description_destroy(&desc);
     return out;
 }
 
@@ -163,7 +181,8 @@ Appender::Appender(Connection& connection, std::string table, std::optional<std:
     // Names + DEFAULT-ness need a separate lookup — the appender API exposes
     // neither. table_description gives both directly.
     try {
-        TableIntrospection info = introspect_table(con, catalog, schema, table);
+        TableIntrospection info =
+            introspect_table(connection_->connection_v2, catalog, schema, table);
         if (info.names.size() != n_cols) {
             throw DuckyError("ducky: appender for " + quote_ident(table) + " takes " +
                              std::to_string(n_cols) + " columns, but the table describes " +

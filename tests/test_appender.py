@@ -129,6 +129,17 @@ def test_appender_schema_qualified(con):
     assert con.execute("SELECT SUM(id) FROM s.t").fetchall() == [(3,)]
 
 
+def test_appender_catalog_qualified(con):
+    con.execute("ATTACH ':memory:' AS other")
+    con.execute("CREATE TABLE other.t (id INTEGER, label VARCHAR DEFAULT 'x')")
+    # A same-named table in the default database must not be the one described.
+    con.execute("CREATE TABLE t (a INTEGER, b INTEGER, c INTEGER)")
+    with con.appender("t", catalog="other") as app:
+        assert app.columns == ["id", "label"]
+        app.append_row(1, ducky.DEFAULT)
+    assert con.execute("SELECT * FROM other.t").fetchall() == [(1, "x")]
+
+
 # ── DEFAULT values (append_row + ducky.DEFAULT) ──────────────────────────────
 
 
