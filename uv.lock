@@ -516,7 +516,10 @@ docs = [
     { name = "sphinx-design", specifier = ">=0.6" },
 ]
 duckdb = [{ name = "duckdb", specifier = ">=1.5" }]
-test = [{ name = "pytest", specifier = ">=8" }]
+test = [
+    { name = "coverage", specifier = ">=7.10" },
+    { name = "pytest", specifier = ">=8" },
+]
 
 [[package]]
 name = "ml-dtypes"
