@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import pytest
 
+import ducky
+
 pytest.importorskip("pyarrow")
 
 # One expression per combined-batch-compatible type.
@@ -96,6 +98,48 @@ def test_arrow_collected_parameter_binding(con):
     assert named.column("b").to_pylist() == [24690]
     # A bound query then an unbound one reuses the cached statement, unbound clean.
     assert con.arrow("SELECT count(*) AS n FROM t").column("n").to_pylist() == [20000]
+
+
+def test_arrow_parameters_bind_as_execute_binds_them(con):
+    import datetime as dt
+    import decimal
+    import uuid
+
+    import numpy as np
+
+    params = [
+        None,
+        True,
+        7,
+        2**70,
+        -(2**70),
+        1.5,
+        "héllo",
+        b"\x00\x01",
+        dt.datetime(2024, 1, 2, 3, 4, 5, 6),
+        dt.datetime(2024, 1, 2, tzinfo=dt.UTC),
+        dt.date(2024, 2, 29),
+        dt.time(12, 34, 56, 7),
+        dt.timedelta(days=2, seconds=3, microseconds=4),
+        decimal.Decimal("-123.4500"),
+        decimal.Decimal("NaN"),
+        uuid.UUID("12345678-1234-5678-1234-567812345678"),
+        np.int32(5),
+    ]
+    # Compare as text, which both paths render the same way.
+    query = "SELECT " + ", ".join(f"${i + 1}::VARCHAR AS c{i}" for i in range(len(params)))
+    row = con.arrow(query, params).to_pylist()[0]
+    assert tuple(row.values()) == con.execute(query, params).fetchone()
+    # An untyped NULL, not a NULL of some type.
+    typeof = "SELECT typeof($1) AS t"
+    assert con.arrow(typeof, [None]).column("t").to_pylist() == list(
+        con.execute(typeof, [None]).fetchone()
+    )
+
+
+def test_arrow_takes_one_statement(con):
+    with pytest.raises(ducky.Error, match="one statement"):
+        con.arrow("SELECT 1; SELECT 2")
 
 
 @pytest.mark.parametrize("expr", _FAST_EXPRS.values(), ids=list(_FAST_EXPRS))

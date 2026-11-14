@@ -1,9 +1,9 @@
 Add duckdb_fetch_chunk_into: fetch into a caller-owned, reused data chunk
 
-Companion to 0001 (both born from profiling C-API clients against
-duckdb-python): duckdb_fetch_chunk allocates and initializes a fresh DataChunk
-per call (ChunkRetainedCollection::FetchRaw). On the previous result classes
-that allocation was ~33% of a chunk-streaming SELECT's runtime.
+Born from profiling C-API clients against duckdb-python: duckdb_fetch_chunk
+allocates and initializes a fresh DataChunk per call
+(ChunkRetainedCollection::FetchRaw). On the previous result classes that
+allocation was ~33% of a chunk-streaming SELECT's runtime.
 duckdb_fetch_chunk_into scans the collection directly into a caller-provided
 chunk instead:
 
@@ -14,18 +14,17 @@ chunk instead:
     count and every column type against the result (the scan writes with the
     destination's physical layout, so a mismatch would reinterpret data); errors
     are recorded on the result. Streams fall back to Fetch +
-    DataChunk::Reference (correct, no allocation win). Results in another
-    format (0001) are refused without touching their state.
+    DataChunk::Reference (correct, no allocation win).
 
 Note for upstreaming: duckdb.h is generated from api_spec/v1 by capigen; this
 patch edits the generated header directly. An upstream PR must add a YAML
 definition (unstable lifecycle, extension API offset) and regenerate, plus tests.
 
 diff --git a/src/include/duckdb.h b/src/include/duckdb.h
-index 0b9e29e2736..509e08bad3d 100644
+index 292cd2ed..8adcd456 100644
 --- a/src/include/duckdb.h
 +++ b/src/include/duckdb.h
-@@ -6717,6 +6717,21 @@ DUCKDB_C_API duckdb_result_type duckdb_result_return_type(duckdb_result result);
+@@ -6693,6 +6713,21 @@ DUCKDB_C_API duckdb_result_type duckdb_result_return_type(duckdb_result result);
   * @return duckdb_data_chunk
   */
  DUCKDB_C_API duckdb_data_chunk duckdb_fetch_chunk(duckdb_result result);
@@ -36,8 +35,8 @@ index 0b9e29e2736..509e08bad3d 100644
 +overwrites its contents; the caller retains ownership.
 +
 +For retained results this scans directly into the chunk. Streaming results fall back to fetching and referencing the
-+returned buffers. Returns false without data for results produced by `duckdb_pending_prepared_arrow`. On failure the
-+error is recorded on the result: check `duckdb_result_error` when this returns false.
++returned buffers. On failure the error is recorded on the result: check `duckdb_result_error` when this returns
++false.
 +
 +* @param result The result to fetch from.
 +* @param chunk The caller-owned destination chunk.
@@ -48,10 +47,10 @@ index 0b9e29e2736..509e08bad3d 100644
  
  #if DUCKDB_API_VERSION_AT_LEAST(1, 5, 6)
 diff --git a/src/include/duckdb/main/query_result.hpp b/src/include/duckdb/main/query_result.hpp
-index 2ec03f0fd83..a17cd1df5c3 100644
+index 0ec695e9..2435eea7 100644
 --- a/src/include/duckdb/main/query_result.hpp
 +++ b/src/include/duckdb/main/query_result.hpp
-@@ -174,6 +174,9 @@ public:
+@@ -189,6 +189,9 @@ public:
  	//! Fetches a DataChunk from the query result. The vectors are not normalized and hence any vector types can be
  	//! returned. Will materialize the full result into a CDC if it hadn't yet. Chunk format only
  	DUCKDB_API unique_ptr<DataChunk> FetchRaw();
@@ -62,7 +61,7 @@ index 2ec03f0fd83..a17cd1df5c3 100644
  	DUCKDB_API string ToString();
  	//! Converts the QueryResult to a box-rendered string
 diff --git a/src/include/duckdb/main/retained_result_collection.hpp b/src/include/duckdb/main/retained_result_collection.hpp
-index a871355a2b6..a25d09f5377 100644
+index a871355a..a25d09f5 100644
 --- a/src/include/duckdb/main/retained_result_collection.hpp
 +++ b/src/include/duckdb/main/retained_result_collection.hpp
 @@ -70,6 +70,9 @@ public:
@@ -76,10 +75,10 @@ index a871355a2b6..a25d09f5377 100644
  private:
  	bool batch_ordered;
 diff --git a/src/main/capi/v1/stream-c.cpp b/src/main/capi/v1/stream-c.cpp
-index 79e0057472d..8fc1f967dd1 100644
+index da95a06a..cb2c927d 100644
 --- a/src/main/capi/v1/stream-c.cpp
 +++ b/src/main/capi/v1/stream-c.cpp
-@@ -38,3 +38,56 @@ duckdb_data_chunk duckdb_fetch_chunk(duckdb_result result) {
+@@ -39,3 +39,52 @@ duckdb_data_chunk duckdb_fetch_chunk(duckdb_result result) {
  		return nullptr;
  	}
  }
@@ -90,10 +89,6 @@ index 79e0057472d..8fc1f967dd1 100644
 +	}
 +	auto &result_data = *((duckdb::DuckDBResultData *)result.internal_data);
 +	if (result_data.result_set_type == duckdb::CAPIResultSetType::CAPI_RESULT_TYPE_DEPRECATED) {
-+		return false;
-+	}
-+	if (result_data.IsOtherFormat()) {
-+		// Refuse without touching the result's state, so it can still be exported in its own format
 +		return false;
 +	}
 +	result_data.result_set_type = duckdb::CAPIResultSetType::CAPI_RESULT_TYPE_STREAMING;
@@ -137,10 +132,10 @@ index 79e0057472d..8fc1f967dd1 100644
 +	}
 +}
 diff --git a/src/main/query_result.cpp b/src/main/query_result.cpp
-index 46f5a5ff9ce..261ca8910b8 100644
+index 411dcd4e..72d68cd0 100644
 --- a/src/main/query_result.cpp
 +++ b/src/main/query_result.cpp
-@@ -440,6 +440,24 @@ unique_ptr<DataChunk> QueryResult::FetchRaw() {
+@@ -537,6 +537,24 @@ unique_ptr<DataChunk> QueryResult::FetchRaw() {
  	return collection->Cast<ChunkRetainedCollection>().FetchRaw();
  }
  
@@ -166,7 +161,7 @@ index 46f5a5ff9ce..261ca8910b8 100644
  // Rendering
  //===--------------------------------------------------------------------===//
 diff --git a/src/main/retained_result_collection.cpp b/src/main/retained_result_collection.cpp
-index f3c2b8b9009..7841eabe0ee 100644
+index f3c2b8b9..7841eabe 100644
 --- a/src/main/retained_result_collection.cpp
 +++ b/src/main/retained_result_collection.cpp
 @@ -102,17 +102,28 @@ unique_ptr<DataChunk> ChunkRetainedCollection::FetchRaw() {
