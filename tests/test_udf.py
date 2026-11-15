@@ -550,3 +550,16 @@ def test_special_handling_state_and_mask_combine(con):
     # but at least one of the NULL-replaced rows must reflect a count >= 1).
     assert {1, 3, 5}.issubset(set(rows))
     assert any(r >= 1 and r not in (1, 3, 5) for r in rows)
+
+
+def test_constant_arguments(con):
+    # Constant arguments arrive unflattened; with only constants, the UDF runs
+    # for a single row.
+    con.create_function(
+        "add", lambda a, b: a + b, parameters=["BIGINT", "BIGINT"], return_type="BIGINT"
+    )
+    assert con.sql("SELECT sum(add(i, 7)) FROM range(5000) t(i)").fetchall() == [
+        (sum(range(5000)) + 7 * 5000,)
+    ]
+    assert con.sql("SELECT add(2, 3)").fetchall() == [(5,)]
+    assert con.sql("SELECT count(add(i, NULL)) FROM range(5000) t(i)").fetchall() == [(0,)]
