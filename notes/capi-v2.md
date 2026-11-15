@@ -152,21 +152,22 @@ execution, so a plan keeps the Arrow schema it was bound with. A ducky
 `PreparedStatement` therefore prepares again after any Arrow registration on its
 connection; SQL `PREPARE` reports the changed schema instead.
 
-Python table functions and scalar UDFs are v2 functions. Their types parse
+Python table functions, scalar UDFs, and aggregates are v2 functions. Their types parse
 through the connection's factory, which resolves catalog types in its open
 transaction and runs no query, so the private connection ducky parsed types on,
 and the v1 database handle it needed, are gone. A table function writes each
 chunk through cached data pointers, about 1.4x faster than through v1's
 per-cell vector calls. V2 hands a scalar function its arguments unflattened, so
 the NumPy trampoline flattens them; an Arrow UDF converts through an exporter
-and importer that each worker creates once. Both match their v1 speed.
+and importer that each worker creates once. Both match their v1 speed, as do
+aggregates. A v2 aggregate's destroy callback is documented to run only on
+states discarded without being finalized, but it is the engine's state
+destructor, as v1's is, so it runs on every state.
 
 Next candidates:
 
 - `result_step` for the asynchronous driver, replacing pending results, the
   `execute_tasks` budget, and the sleep backoff.
-- Python aggregates as v2 aggregate functions. A v2 aggregate's destroy
-  callback runs only on states that are not finalized, unlike v1's.
 - Query execution and results, which would leave the v1 connection to the
   appender alone.
 
