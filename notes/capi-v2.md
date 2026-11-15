@@ -80,7 +80,7 @@ connections, created by the shared `Database` and pool proposed in
   read again on every execution. Collections support parallel append and scan.
 - **Type parsing.** `factory_create_type_from_text` parses SQL type text,
   including nested, enum, and catalog types, without the
-  `SELECT CAST(NULL AS ...)` query `TypeParser` runs on a private connection.
+  `SELECT CAST(NULL AS ...)` query ducky ran on a private connection.
 - **Smaller additions.** Typed query metrics (`connection_get_query_metrics`),
   a thread-safe progress snapshot (`connection_progress_get`), scalar functions
   whose return type depends on their arguments (a resolve types callback),
@@ -101,8 +101,8 @@ connections, created by the shared `Database` and pool proposed in
   the Arrow importer or a patch.
 - Registering a Python-backed filesystem still needs a C++ adapter.
 - V1 and v2 handles do not convert into each other through the API.
-  `patches/0010-capi-v2-v1-bridge.patch` gets the v1 handles of a v2 connection
-  and instance, so v1 functions keep working on a database that v2 owns.
+  `patches/0010-capi-v2-v1-bridge.patch` gets the v1 handle of a v2
+  connection, so v1 functions keep working on a database that v2 owns.
 
 ## Migration cost
 
@@ -152,19 +152,21 @@ execution, so a plan keeps the Arrow schema it was bound with. A ducky
 `PreparedStatement` therefore prepares again after any Arrow registration on its
 connection; SQL `PREPARE` reports the changed schema instead.
 
-Python table functions are v2 table functions. Their types parse through the
-connection's factory, which resolves catalog types in its open transaction and
-runs no query, so they need neither `TypeParser`'s private connection nor its
-fallback. A function writes each chunk through cached data pointers, and is
-about 1.4x faster than through v1's per-cell vector calls.
+Python table functions and scalar UDFs are v2 functions. Their types parse
+through the connection's factory, which resolves catalog types in its open
+transaction and runs no query, so the private connection ducky parsed types on,
+and the v1 database handle it needed, are gone. A table function writes each
+chunk through cached data pointers, about 1.4x faster than through v1's
+per-cell vector calls. V2 hands a scalar function its arguments unflattened, so
+the NumPy trampoline flattens them; an Arrow UDF converts through an exporter
+and importer that each worker creates once. Both match their v1 speed.
 
 Next candidates:
 
 - `result_step` for the asynchronous driver, replacing pending results, the
   `execute_tasks` budget, and the sleep backoff.
-- Python scalar, Arrow scalar, and aggregate UDFs as v2 functions, which
-  retires `TypeParser` and `duckdb_v2_instance_open_v1`. A v2 aggregate's
-  destroy callback runs only on states that are not finalized, unlike v1's.
+- Python aggregates as v2 aggregate functions. A v2 aggregate's destroy
+  callback runs only on states that are not finalized, unlike v1's.
 - Query execution and results, which would leave the v1 connection to the
   appender alone.
 

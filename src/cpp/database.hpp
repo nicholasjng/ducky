@@ -9,12 +9,11 @@
 #include "v2.hpp"
 
 // Shared DuckDB database and connection owner. The instance and connection are
-// C API v2 handles; `database` and `connection` bridge them to v1 for the
+// C API v2 handles; `connection` bridges the connection to v1 for the
 // functions v2 lacks.
 struct DuckDBHandle {
     duckdb_v2_instance_handle instance = nullptr;
     duckdb_v2_connection_handle connection_v2 = nullptr;
-    duckdb_database database = nullptr;      // owned
     duckdb_connection connection = nullptr;  // borrowed from connection_v2
     // Bumped by every Arrow source registration. A plan reads a source's schema
     // when it is bound, so prepared statements made before a registration
@@ -33,7 +32,6 @@ struct DuckDBHandle {
             release_gil_if_held release;
             connection = nullptr;
             duckdb_v2_connection_destroy(&connection_v2);
-            if (database) duckdb_close(&database);
             duckdb_v2_instance_destroy(&instance);
         }
         // The functions that borrowed these are gone now.

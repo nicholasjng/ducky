@@ -185,3 +185,21 @@ def test_wrong_row_count_errors(con):
     con.create_arrow_function("shrink", shrink, parameters=["VARCHAR"], return_type="VARCHAR")
     with pytest.raises(ducky.Error, match="rows; expected"):
         con.sql("SELECT shrink(x) FROM (VALUES ('a'), ('b'), ('c')) t(x)").fetchall()
+
+
+def test_arrow_udf_constant_arguments(con):
+    con.create_arrow_function("add", pc.add, parameters=["BIGINT", "BIGINT"], return_type="BIGINT")
+    assert con.sql("SELECT add(2, 3)").fetchall() == [(5,)]
+    assert con.sql("SELECT sum(add(i, 7)) FROM range(5000) t(i)").fetchall() == [
+        (sum(range(5000)) + 7 * 5000,)
+    ]
+
+
+def test_arrow_udf_type_created_in_the_open_transaction(con):
+    con.execute("BEGIN")
+    con.execute("CREATE TYPE mood AS ENUM ('sad', 'happy')")
+    con.create_arrow_function(
+        "label", lambda m: m.cast("string"), parameters=["mood"], return_type="VARCHAR"
+    )
+    assert con.sql("SELECT label('happy'::mood)").fetchall() == [("happy",)]
+    con.execute("COMMIT")
