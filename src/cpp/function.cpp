@@ -231,12 +231,6 @@ nb::object build_input_mask(const uint64_t* validity, idx_t n) {
         nb::ndarray<nb::numpy, nb::ro>(mask, 1, shape, owner, nullptr, nb::dtype<uint8_t>()));
 }
 
-// Forwards a C++ or Python exception as a DuckDB UDF error string.
-void set_udf_error(duckdb_function_info info, const char* what) {
-    std::string msg = std::string("ducky UDF error: ") + what;
-    duckdb_scalar_function_set_error(info, msg.c_str());
-}
-
 // Default NULL handling: DuckDB only short-circuits constant NULL inputs, so a
 // UDF without special handling sees NULL rows of a flat chunk too. Collects
 // the rows where every input is valid into `keep`; returns false when there is
@@ -413,14 +407,13 @@ void udf_trampoline(duckdb_v2_scalar_function_exec_info_handle info,
 // ── Arrow UDF ────────────────────────────────────────────────────────────────
 
 struct ArrowUDFContext {
-    nb::handle callable;              // kept alive by the DuckDBHandle
-    duckdb_connection con = nullptr;  // borrowed; valid while connection is open
-    duckdb_arrow_options options = nullptr;
-    std::vector<std::string> param_names;          // one entry per parameter
-    std::vector<duckdb_logical_type> param_types;  // owned
-    // Pre-computed views into param_names / param_types for zero-alloc trampoline calls.
+    nb::handle callable;                                     // kept alive by the DuckDBHandle
+    std::vector<std::string> param_names;                    // one entry per parameter
+    std::vector<duckdb_v2_logical_type_handle> param_types;  // owned
+    // Pre-computed views into param_names for zero-alloc trampoline calls.
     std::vector<const char*> param_name_ptrs;
-    duckdb_logical_type return_type = nullptr;  // owned
+    std::vector<idx_t> param_name_lengths;
+    duckdb_v2_logical_type_handle return_type = nullptr;  // owned
     // Calling convention for the user's callable:
     //   record_batch=true  → fn(rb: pa.RecordBatch)
     //   record_batch=false, dict_style=false → fn(col0, col1, ...)  [positional pa.Array args]
@@ -438,13 +431,11 @@ struct ArrowUDFContext {
     ArrowUDFContext(const ArrowUDFContext&) = delete;
     ArrowUDFContext& operator=(const ArrowUDFContext&) = delete;
 
-    // Owns the DuckDB heap objects so a create_arrow_scalar_function that
-    // throws mid-parse (e.g. an invalid second parameter type) frees the ones
-    // already built, not just the extra-info destroy path.
+    // Owns the types so a create_arrow_scalar_function that throws mid-parse
+    // (e.g. an invalid second parameter type) frees the ones already built.
     ~ArrowUDFContext() {
-        for (duckdb_logical_type& t : param_types) duckdb_destroy_logical_type(&t);
-        if (return_type) duckdb_destroy_logical_type(&return_type);
-        if (options) duckdb_destroy_arrow_options(&options);
+        for (duckdb_v2_logical_type_handle& t : param_types) duckdb_v2_logical_type_destroy(&t);
+        duckdb_v2_logical_type_destroy(&return_type);
     }
 };
 
@@ -459,18 +450,79 @@ struct ArrowPair {
     }
 };
 
-// Resolve `return_type` into the pa.Schema the output batch is exported with.
-// Cached on the context; called with the GIL held.
-void ensure_out_schema(ArrowUDFContext* ctx) {
+// Owners of the v2 objects one Arrow UDF call converts through.
+struct ExporterGuard {
+    duckdb_v2_arrow_exporter_handle exporter = nullptr;
+    ~ExporterGuard() { duckdb_v2_arrow_exporter_destroy(&exporter); }
+};
+struct ImporterGuard {
+    duckdb_v2_arrow_importer_handle importer = nullptr;
+    ~ImporterGuard() { duckdb_v2_arrow_importer_destroy(&importer); }
+};
+struct ChunkGuard {
+    duckdb_v2_data_chunk_handle chunk = nullptr;
+    ~ChunkGuard() { duckdb_v2_data_chunk_destroy(&chunk); }
+};
+
+// A worker's converters, reused for every chunk the worker processes. They
+// borrow the query's client context, which outlives them.
+struct ArrowUDFLocal {
+    ExporterGuard in;   // the arguments, to Arrow
+    ImporterGuard out;  // the result, from Arrow
+};
+
+void arrow_udf_local_destroy(void* ptr) { delete (ArrowUDFLocal*)ptr; }
+
+void arrow_udf_init(duckdb_v2_scalar_function_init_info_handle info,
+                    duckdb_v2_context_handle context, duckdb_v2_error_info_handle* err) {
+    report(err, [&] {
+        V2Error e;
+        void* user_data = nullptr;
+        e.check(duckdb_v2_scalar_function_init_get_user_data(info, &user_data, e.out()));
+        auto* ctx = (ArrowUDFContext*)user_data;
+        auto local = std::make_unique<ArrowUDFLocal>();
+        e.check(duckdb_v2_arrow_exporter_create(
+                    context, ctx->param_types.data(), ctx->param_name_ptrs.data(),
+                    ctx->param_name_lengths.data(), ctx->param_types.size(), 0, &local->in.exporter,
+                    e.out()),
+                "ducky: failed to build the Arrow schema for UDF input: ");
+        // The result's schema, as exporting the return type gives it.
+        const std::string failed =
+            "ducky: failed to build the Arrow schema for the UDF return type: ";
+        const char* name = "x";
+        idx_t name_length = 1;
+        ExporterGuard result;
+        e.check(duckdb_v2_arrow_exporter_create(context, &ctx->return_type, &name, &name_length, 1,
+                                                0, &result.exporter, e.out()),
+                failed);
+        ArrowSchema schema{};
+        e.check(duckdb_v2_arrow_exporter_get_schema(result.exporter, &schema, e.out()), failed);
+        SchemaRelease schema_guard{&schema};
+        e.check(duckdb_v2_arrow_importer_create(context, &schema, 0, &local->out.importer, e.out()),
+                failed);
+        duckdb_v2_opaque data{local.get(), &arrow_udf_local_destroy, nullptr};
+        e.check(duckdb_v2_scalar_function_init_set_init_data(info, &data, e.out()));
+        // NOLINTNEXTLINE(bugprone-unused-return-value)
+        (void)local.release();
+    });
+}
+
+// Resolve `return_type` into the pa.Schema the output batch is exported with,
+// under the session's Arrow settings. Cached on the context; called with the
+// GIL held.
+void ensure_out_schema(ArrowUDFContext* ctx, duckdb_v2_context_handle context) {
     nb::ft_lock_guard lock(ctx->out_schema_mu);
     if (ctx->out_type.is_valid()) return;
-    ArrowSchema target{};
+    const std::string failed = "ducky: failed to build the Arrow schema for the UDF return type: ";
+    V2Error e;
     const char* name = "x";
-    std::string err;
-    if (drain_arrow_error(
-            duckdb_to_arrow_schema(ctx->options, &ctx->return_type, &name, 1, &target), err)) {
-        throw DuckyError("ducky: failed to build the Arrow schema for the UDF return type: " + err);
-    }
+    idx_t name_length = 1;
+    ExporterGuard exporter;
+    e.check(duckdb_v2_arrow_exporter_create(context, &ctx->return_type, &name, &name_length, 1, 0,
+                                            &exporter.exporter, e.out()),
+            failed);
+    ArrowSchema target{};
+    e.check(duckdb_v2_arrow_exporter_get_schema(exporter.exporter, &target, e.out()), failed);
     SchemaRelease guard{&target};
     nb::object schema = pyarrow_api().schema_import((uintptr_t)(&target));
     target.release = nullptr;  // pyarrow took ownership
@@ -478,116 +530,105 @@ void ensure_out_schema(ArrowUDFContext* ctx) {
     ctx->out_type = schema.attr("field")(0).attr("type");
 }
 
-// RAII wrappers for DuckDB heap objects used in the Arrow trampoline.
-struct ChunkGuard {
-    duckdb_data_chunk chunk = nullptr;
-    ~ChunkGuard() {
-        if (chunk) duckdb_destroy_data_chunk(&chunk);
-    }
-};
-void arrow_udf_trampoline(duckdb_function_info info, duckdb_data_chunk input,
-                          duckdb_vector output) {
-    auto* ctx = (ArrowUDFContext*)duckdb_scalar_function_get_extra_info(info);
+void arrow_udf_trampoline(duckdb_v2_scalar_function_exec_info_handle info,
+                          duckdb_v2_context_handle context, duckdb_v2_error_info_handle* err) {
     nb::gil_scoped_acquire gil;
-    idx_t n_cols = duckdb_data_chunk_get_column_count(input);
+    report_udf_error(err, "ducky UDF error: ", [&] {
+        V2Error e;
+        void* user_data = nullptr;
+        e.check(duckdb_v2_scalar_function_exec_get_user_data(info, &user_data, e.out()));
+        auto* ctx = (ArrowUDFContext*)user_data;
+        void* init_data = nullptr;
+        e.check(duckdb_v2_scalar_function_exec_get_init_data(info, &init_data, e.out()));
+        auto* local = (ArrowUDFLocal*)init_data;
+        idx_t n = 0;
+        e.check(duckdb_v2_scalar_function_exec_get_row_count(info, &n, e.out()));
+        idx_t n_cols = ctx->param_types.size();
 
-    guard(
-        [&] {
-            ArrowPair in;
-            std::string err;
-            if (drain_arrow_error(
-                    duckdb_to_arrow_schema(ctx->options, ctx->param_types.data(),
-                                           ctx->param_name_ptrs.data(), n_cols, &in.schema),
-                    err)) {
-                throw DuckyError("ducky: failed to build Arrow schema for UDF input: " + err);
+        // The arguments as a chunk of their own, sharing their buffers.
+        duckdb_v2_factory_handle factory = nullptr;
+        e.check(duckdb_v2_context_get_factory(context, &factory, e.out()));
+        ChunkGuard input;
+        e.check(duckdb_v2_data_chunk_create(factory, ctx->param_types.data(), n_cols, &input.chunk,
+                                            e.out()));
+        for (idx_t i = 0; i < n_cols; ++i) {
+            duckdb_v2_vector_handle arg = nullptr, column = nullptr;
+            e.check(duckdb_v2_scalar_function_exec_get_arg(info, i, &arg, e.out()));
+            e.check(duckdb_v2_data_chunk_get_vector(input.chunk, i, &column, e.out()));
+            e.check(duckdb_v2_vector_reference(column, arg, e.out()));
+        }
+
+        const std::string failed_in = "ducky: failed to convert chunk to Arrow array: ";
+        duckdb_v2_arrow_exporter_handle exporter = local->in.exporter;
+        e.check(duckdb_v2_arrow_exporter_append(exporter, &input.chunk,
+                                                /*consume=*/false, /*flush=*/true, e.out()),
+                failed_in);
+        ArrowPair in;
+        e.check(duckdb_v2_arrow_exporter_get_schema(exporter, &in.schema, e.out()), failed_in);
+        e.check(duckdb_v2_arrow_exporter_next_array(exporter, &in.array, e.out()), failed_in);
+        if (!in.array.release) throw DuckyError(failed_in + "no array");
+
+        // Hand the (array, schema) pair off to pyarrow via _import_from_c.
+        // pyarrow takes ownership and clears the release callbacks on success.
+        const PyArrowAPI& pa = pyarrow_api();
+        nb::object rb = pa.import_from_c((uintptr_t)(&in.array), (uintptr_t)(&in.schema));
+
+        // Dispatch to the user's callable according to the registered convention.
+        nb::object result;
+        if (ctx->record_batch) {
+            result = ctx->callable(rb);
+        } else if (ctx->dict_style) {
+            nb::dict col_dict;
+            for (idx_t i = 0; i < n_cols; ++i) {
+                col_dict[ctx->param_names[i].c_str()] = rb.attr("column")(i);
             }
-            if (drain_arrow_error(duckdb_data_chunk_to_arrow(ctx->options, input, &in.array),
-                                  err)) {
-                throw DuckyError("ducky: failed to convert chunk to Arrow array: " + err);
-            }
+            result = ctx->callable(col_dict);
+        } else {
+            nb::list args;
+            for (idx_t i = 0; i < n_cols; ++i) args.append(rb.attr("column")(i));
+            result = ctx->callable(*nb::tuple(args));
+        }
 
-            // Hand the (array, schema) pair off to pyarrow via _import_from_c.
-            // pyarrow takes ownership and clears the release callbacks on success.
-            const PyArrowAPI& pa = pyarrow_api();
-            nb::object rb = pa.import_from_c((uintptr_t)(&in.array), (uintptr_t)(&in.schema));
+        // Wrap the user's pa.Array into a single-field RecordBatch, which
+        // imports as a one-column chunk.
+        //
+        // The batch is pinned to the *declared* return type rather than to
+        // whatever the callable happened to produce: pyarrow's kernels widen
+        // types (pc.multiply on two DECIMAL(5,2) yields DECIMAL(11,4)), and a
+        // widened array would reach duckdb_v2_vector_reference below with a
+        // type the output vector doesn't share, which it rejects. Cast here
+        // and let pyarrow reject a genuinely incompatible return.
+        ensure_out_schema(ctx, context);
+        if (!nb::cast<bool>(result.attr("type").attr("equals")(ctx->out_type))) {
+            result = result.attr("cast")(ctx->out_type);
+        }
+        nb::list out_arrays;
+        out_arrays.append(result);
+        nb::object out_rb = pa.from_arrays(out_arrays, "schema"_a = ctx->out_schema);
 
-            // Dispatch to the user's callable according to the registered convention.
-            nb::object result;
-            if (ctx->record_batch) {
-                result = ctx->callable(rb);
-            } else if (ctx->dict_style) {
-                nb::dict col_dict;
-                for (idx_t i = 0; i < n_cols; ++i) {
-                    col_dict[ctx->param_names[i].c_str()] = rb.attr("column")(i);
-                }
-                result = ctx->callable(col_dict);
-            } else {
-                nb::list args;
-                for (idx_t i = 0; i < n_cols; ++i) args.append(rb.attr("column")(i));
-                result = ctx->callable(*nb::tuple(args));
-            }
+        ArrowPair out;
+        out_rb.attr("_export_to_c")((uintptr_t)(&out.array), (uintptr_t)(&out.schema));
+        idx_t n_rows = (idx_t)out.array.length;
+        if (n_rows != n) {
+            throw DuckyError("ducky: arrow UDF returned " + std::to_string(n_rows) +
+                             " rows; expected " + std::to_string(n));
+        }
 
-            // Wrap the user's pa.Array into a single-field RecordBatch so we can
-            // round-trip back through duckdb_data_chunk_from_arrow (which expects a
-            // struct-shaped ArrowArray representing one chunk).
-            //
-            // The batch is pinned to the *declared* return type rather than to
-            // whatever the callable happened to produce: pyarrow's kernels widen
-            // types (pc.multiply on two DECIMAL(5,2) yields DECIMAL(11,4)), and a
-            // widened array would reach duckdb_vector_reference_vector below with a
-            // physical layout the output vector doesn't share -- DECIMAL(11,4) is
-            // int64-backed, DECIMAL(7,4) int32-backed. That trips an assertion in
-            // debug DuckDB and silently misreads the buffer in release builds, so
-            // cast here and let pyarrow reject a genuinely incompatible return.
-            ensure_out_schema(ctx);
-            if (!nb::cast<bool>(result.attr("type").attr("equals")(ctx->out_type))) {
-                result = result.attr("cast")(ctx->out_type);
-            }
-            nb::list out_arrays;
-            out_arrays.append(result);
-            nb::object out_rb = pa.from_arrays(out_arrays, "schema"_a = ctx->out_schema);
-
-            ArrowPair out;
-            out_rb.attr("_export_to_c")((uintptr_t)(&out.array), (uintptr_t)(&out.schema));
-
-            // Each guard owns its out-param from construction, so a failed
-            // conversion (or the throw below) cleans up via the destructor.
-            ConvertedSchemaRelease converted;
-            if (drain_arrow_error(
-                    duckdb_schema_from_arrow(ctx->con, &out.schema, &converted.schema), err)) {
-                throw DuckyError("ducky: failed to convert UDF output schema: " + err);
-            }
-
-            ChunkGuard out_chunk;
-            if (drain_arrow_error(duckdb_data_chunk_from_arrow(ctx->con, &out.array,
-                                                               converted.schema, &out_chunk.chunk),
-                                  err)) {
-                throw DuckyError("ducky: failed to convert UDF output chunk: " + err);
-            }
-            // duckdb_data_chunk_from_arrow has taken ownership of out.array.
-            out.array.release = nullptr;
-
-            idx_t n_rows = duckdb_data_chunk_get_size(out_chunk.chunk);
-            idx_t expected = duckdb_data_chunk_get_size(input);
-            if (n_rows != expected) {
-                throw DuckyError("ducky: arrow UDF returned " + std::to_string(n_rows) +
-                                 " rows; expected " + std::to_string(expected));
-            }
-            duckdb_vector v = duckdb_data_chunk_get_vector(out_chunk.chunk, 0);
-            duckdb_vector_reference_vector(output, v);
-        },
-        [&](const char* what) { set_udf_error(info, what); });
-}
-
-// Register and destroy `f`. Registration takes the client context lock, which
-// a query running Python callbacks on another thread may hold while it waits
-// for the GIL; a failed registration runs the extra-info destructor, which
-// takes the GIL itself.
-duckdb_state register_scalar(duckdb_connection con, duckdb_scalar_function& f) {
-    release_gil_if_held release;
-    duckdb_state state = duckdb_register_scalar_function(con, f);
-    duckdb_destroy_scalar_function(&f);
-    return state;
+        const std::string failed_out = "ducky: failed to convert UDF output chunk: ";
+        duckdb_v2_arrow_importer_handle importer = local->out.importer;
+        // Consumed: the chunk references the batch's buffers, zero-copy.
+        e.check(duckdb_v2_arrow_importer_append(importer, &out.array, /*consume=*/true,
+                                                /*flush=*/true, e.out()),
+                failed_out);
+        ChunkGuard out_chunk;
+        e.check(duckdb_v2_arrow_importer_next_chunk(importer, &out_chunk.chunk, e.out()),
+                failed_out);
+        if (!out_chunk.chunk) throw DuckyError(failed_out + "no chunk");
+        duckdb_v2_vector_handle output = nullptr, column = nullptr;
+        e.check(duckdb_v2_scalar_function_exec_get_result(info, &output, e.out()));
+        e.check(duckdb_v2_data_chunk_get_vector(out_chunk.chunk, 0, &column, e.out()));
+        e.check(duckdb_v2_vector_reference(output, column, e.out()));
+    });
 }
 
 // Owns a v2 scalar function until it is registered. Errors raise with
@@ -655,50 +696,6 @@ const StructDtypes& struct_dtypes() {
             mk({{"months", "<i4"}, {"days", "<i4"}, {"micros", "<i8"}}),
         };
     });
-}
-
-TypeParser::TypeParser(duckdb_database database, duckdb_connection fallback)
-    : database_(database), fallback_(fallback) {}
-
-TypeParser::~TypeParser() {
-    if (private_) {
-        release_gil_if_held release;
-        duckdb_disconnect(&private_);
-    }
-}
-
-duckdb_logical_type TypeParser::parse(const std::string& type_str) {
-    if (type_str.empty()) {
-        throw DuckyError("ducky: empty type string");
-    }
-    for (char c : type_str) {
-        bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
-                  c == '_' || c == '(' || c == ')' || c == '[' || c == ']' || c == '<' ||
-                  c == '>' || c == ',' || c == ' ';
-        if (!ok) {
-            throw DuckyError("ducky: invalid character in type string '" + type_str + "'");
-        }
-    }
-    std::string q = "SELECT CAST(NULL AS " + type_str + ")";
-    duckdb_result r;
-    duckdb_state state;
-    {
-        // Queries take the client context lock; Python callbacks of a query
-        // running elsewhere may need the GIL meanwhile.
-        release_gil_if_held release;
-        if (!private_ && duckdb_connect(database_, &private_) == DuckDBError) private_ = nullptr;
-        state = private_ ? duckdb_query(private_, q.c_str(), &r) : DuckDBError;
-        if (state == DuckDBError && private_) duckdb_destroy_result(&r);
-        if (state == DuckDBError) state = duckdb_query(fallback_, q.c_str(), &r);
-    }
-    if (state == DuckDBError) {
-        std::string err = duckdb_message(duckdb_result_error(&r));
-        duckdb_destroy_result(&r);
-        throw DuckyError("ducky: invalid DuckDB type '" + type_str + "': " + err);
-    }
-    duckdb_logical_type lt = duckdb_column_logical_type(&r, 0);
-    duckdb_destroy_result(&r);
-    return lt;
 }
 
 const TypeSpec* typespec_for(duckdb_type type) {
@@ -845,58 +842,55 @@ void create_arrow_scalar_function(Connection& con, const std::string& name, nb::
                                   nb::object parameters, const std::string& return_type,
                                   bool record_batch) {
     std::shared_ptr<DuckDBHandle> handle = con.open_handle();
-    duckdb_connection raw = handle->connection;
-    TypeParser types(handle->database, raw);
+    const std::string failed = "ducky: failed to register arrow UDF '" + name + "': ";
+    V2Error err;
+    duckdb_v2_factory_handle types = nullptr;
+    err.check(duckdb_v2_connection_get_factory(handle->connection_v2, &types, err.out()), failed);
     auto ctx = std::make_unique<ArrowUDFContext>();
     ctx->callable = handle->keep(std::move(fn));
-    ctx->con = raw;
     ctx->record_batch = record_batch;
-    duckdb_connection_get_arrow_options(raw, &ctx->options);
-    if (!ctx->options) {
-        throw DuckyError("ducky: failed to fetch Arrow options from connection");
-    }
 
     if (nb::isinstance<nb::dict>(parameters)) {
         ctx->dict_style = true;
         nb::dict d = nb::cast<nb::dict>(parameters);
         for (auto item : d) {
             ctx->param_names.emplace_back(nb::cast<std::string>(item.first));
-            ctx->param_types.push_back(types.parse(nb::cast<std::string>(item.second)));
+            ctx->param_types.push_back(v2_parse_type(types, nb::cast<std::string>(item.second)));
         }
     } else {
         nb::sequence seq = nb::cast<nb::sequence>(parameters);
         idx_t i = 0;
         for (auto item : seq) {
             ctx->param_names.emplace_back("arg" + std::to_string(i++));
-            ctx->param_types.push_back(types.parse(nb::cast<std::string>(item)));
+            ctx->param_types.push_back(v2_parse_type(types, nb::cast<std::string>(item)));
         }
     }
     if (ctx->param_types.empty()) {
         throw DuckyError("ducky: arrow UDF '" + name + "' must declare at least one parameter");
     }
-    ctx->return_type = types.parse(return_type);
+    ctx->return_type = v2_parse_type(types, return_type);
 
-    // Pre-compute stable const char* pointers into param_names for zero-alloc
-    // trampoline calls. param_names is never modified after this point.
-    ctx->param_name_ptrs.reserve(ctx->param_names.size());
-    for (const std::string& n : ctx->param_names) ctx->param_name_ptrs.push_back(n.c_str());
-
-    duckdb_scalar_function f = duckdb_create_scalar_function();
-    duckdb_scalar_function_set_name(f, name.c_str());
-    for (duckdb_logical_type t : ctx->param_types) {
-        duckdb_scalar_function_add_parameter(f, t);
+    // Pre-compute stable pointers into param_names for zero-alloc trampoline
+    // calls. param_names is never modified after this point.
+    for (const std::string& n : ctx->param_names) {
+        ctx->param_name_ptrs.push_back(n.data());
+        ctx->param_name_lengths.push_back(n.size());
     }
-    duckdb_scalar_function_set_return_type(f, ctx->return_type);
-    duckdb_scalar_function_set_function(f, &arrow_udf_trampoline);
-    // Ownership of ctx passes to the function object here; see
-    // create_scalar_function.
-    duckdb_scalar_function_set_extra_info(f, ctx.get(), &gil_delete<ArrowUDFContext>);
-    // NOLINTNEXTLINE(bugprone-unused-return-value)
-    (void)ctx.release();
 
-    duckdb_state state = register_scalar(raw, f);
-    if (state == DuckDBError) {
-        throw DuckyError("ducky: failed to register arrow UDF '" + name +
-                         "' (name in use, or invalid types?)");
+    auto check = [&](DUCKDB_V2_ERROR code) { err.check(code, failed); };
+    ScalarFunctionHandle f(types, failed);
+    check(duckdb_v2_scalar_function_set_name(f.get(), name.data(), name.size(), err.out()));
+    duckdb_v2_function_signature_handle sig = nullptr;
+    check(duckdb_v2_scalar_function_get_signature(f.get(), &sig, err.out()));
+    for (size_t i = 0; i < ctx->param_types.size(); ++i) {
+        const std::string& param = ctx->param_names[i];
+        check(duckdb_v2_function_signature_add_parameter(
+            sig, param.data(), param.size(), ctx->param_types[i], nullptr,
+            DUCKDB_V2_FUNCTION_PARAMETER_KIND_POSITIONAL_ONLY, err.out()));
     }
+    check(duckdb_v2_function_signature_set_return_type(sig, ctx->return_type, err.out()));
+    check(duckdb_v2_scalar_function_set_init_callback(f.get(), &arrow_udf_init, err.out()));
+    check(duckdb_v2_scalar_function_set_exec_callback(f.get(), &arrow_udf_trampoline, err.out()));
+    f.set_user_data(std::move(ctx));
+    f.register_on(handle->connection_v2);
 }

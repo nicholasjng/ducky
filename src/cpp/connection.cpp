@@ -850,7 +850,6 @@ Connection::Connection(const std::string& database, nb::object config) {
               failed);
     err.check(duckdb_v2_connection_create(handle->instance, &handle->connection_v2, err.out()),
               "ducky: failed to connect to '" + database + "': ");
-    err.check(duckdb_v2_instance_open_v1(handle->instance, &handle->database, err.out()), failed);
     handle->connection = duckdb_v2_connection_get_v1(handle->connection_v2);
     handle_ = std::move(handle);
     profile_sink_ = nb::none();
