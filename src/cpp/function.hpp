@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "duckdb.h"
+#include "v2.hpp"
 
 namespace nb = nanobind;
 
@@ -17,6 +18,7 @@ class Connection;
 struct TypeSpec {
     const char* name;
     duckdb_type type;
+    DUCKDB_V2_LOGICAL_TYPE_ID v2_type;
     size_t size;
     nb::dlpack::dtype (*dtype)();
 };
