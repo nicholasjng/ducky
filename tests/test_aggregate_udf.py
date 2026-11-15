@@ -163,3 +163,38 @@ def test_integer_return_type(con):
     con.create_aggregate_function("int_sum", IntSum, parameters=["BIGINT"], return_type="BIGINT")
     result: int = con.sql("SELECT int_sum(i) FROM (VALUES (1), (2), (3)) t(i)").fetchitem()
     assert result == 6
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "SELECT counted(i) FROM range(100000) t(i)",
+        "SELECT i % 1000, counted(i) FROM range(200000) t(i) GROUP BY 1",
+        "SELECT counted(DISTINCT i % 7) FROM range(10000) t(i)",
+        "SELECT counted(i) OVER (ORDER BY i ROWS 3 PRECEDING) FROM range(5000) t(i)",
+        "SELECT counted(i) FROM range(10) t(i) WHERE false",
+    ],
+)
+def test_aggregate_states_are_released(con, query):
+    live = []
+
+    class Counted:
+        def __init__(self):
+            live.append(None)
+            self.total = 0
+
+        def __del__(self):
+            live.pop()
+
+        def update(self, x):
+            self.total += int(x.sum())
+
+        def combine(self, other):
+            self.total += other.total
+
+        def finalize(self):
+            return self.total
+
+    con.create_aggregate_function("counted", Counted, ["BIGINT"], "BIGINT")
+    con.sql(query).fetchall()
+    assert live == []
