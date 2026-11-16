@@ -443,25 +443,24 @@ size_t fast_arrow_width(duckdb_type t) {
 // Arrow stream state for a Result. Callbacks may run on any thread, with or
 // without the GIL; they only touch the Result through its cursor lock.
 struct ArrowStreamState {
-    nb::object owner;                     // keeps the Result (and its duckdb_result) alive
-    Result* result;                       // borrowed from owner
-    duckdb_arrow_options options;         // owned by the stream, destroyed on release
-    bool fast;                            // all columns eligible -> one hand-built batch
-    bool done;                            // fast path emits exactly one combined batch
-    duckdb_data_chunk scratch = nullptr;  // reused across get_next calls
-    std::vector<size_t> widths;           // per-column element width (fast path only)
+    nb::object owner;              // keeps the Result alive
+    Result* result;                // borrowed from owner
+    duckdb_arrow_options options;  // owned by the stream, destroyed on release
+    bool fast;                     // all columns eligible -> one hand-built batch
+    bool done;                     // fast path emits exactly one combined batch
+    std::vector<size_t> widths;    // per-column element width (fast path only)
     std::string last_error;
 };
 
-// Scope owner for a result-shaped chunk.
-struct ScratchChunk {
+// Scope owner for a chunk taken from a result.
+struct OwnedChunk {
     duckdb_data_chunk chunk;
-    explicit ScratchChunk(duckdb_result* result) : chunk(make_result_chunk(result)) {}
-    ~ScratchChunk() {
+    explicit OwnedChunk(duckdb_data_chunk chunk) : chunk(chunk) {}
+    ~OwnedChunk() {
         if (chunk) duckdb_destroy_data_chunk(&chunk);
     }
-    ScratchChunk(const ScratchChunk&) = delete;
-    ScratchChunk& operator=(const ScratchChunk&) = delete;
+    OwnedChunk(const OwnedChunk&) = delete;
+    OwnedChunk& operator=(const OwnedChunk&) = delete;
 };
 
 // The unconsumed chunks of a result, retained when the row count is unknown.
@@ -472,20 +471,7 @@ struct ChunkList {
 
     // Requires `result`'s cursor lock.
     explicit ChunkList(Result& result) {
-        for (;;) {
-            duckdb_data_chunk ch = make_result_chunk(result.raw_result());
-            if (!ch) return;
-            bool fetched;
-            try {
-                fetched = result.next_chunk_locked(ch);
-            } catch (...) {
-                duckdb_destroy_data_chunk(&ch);
-                throw;
-            }
-            if (!fetched) {
-                duckdb_destroy_data_chunk(&ch);
-                return;
-            }
+        while (duckdb_data_chunk ch = result.take_chunk_locked()) {
             idx_t sz = duckdb_data_chunk_get_size(ch);
             chunks.push_back(ch);
             sizes.push_back(sz);
@@ -597,24 +583,19 @@ void finish_fast_batch(std::unique_ptr<FastBatch> b, ArrowArray* out, idx_t tota
 
 int stream_get_schema(ArrowArrayStream* stream, ArrowSchema* out) {
     auto* state = (ArrowStreamState*)stream->private_data;
-    duckdb_result* result = state->result->raw_result();
-    idx_t n = duckdb_column_count(result);
-    std::vector<duckdb_logical_type> types(n);
-    std::vector<const char*> names(n);
-    for (idx_t i = 0; i < n; ++i) {
-        types[i] = duckdb_column_logical_type(result, i);
-        names[i] = duckdb_column_name(result, i);
-    }
+    const Result& result = *state->result;
+    std::vector<duckdb_logical_type> types = result.column_logical_types();
+    std::vector<const char*> names;
+    for (const std::string& name : result.column_names()) names.push_back(name.c_str());
     duckdb_error_data error =
-        duckdb_to_arrow_schema(state->options, types.data(), names.data(), n, out);
-    for (idx_t i = 0; i < n; ++i) duckdb_destroy_logical_type(&types[i]);
+        duckdb_to_arrow_schema(state->options, types.data(), names.data(), names.size(), out);
     return consume_error(state, error) ? EIO : 0;
 }
 
 // Build one combined batch from exactly `total` remaining rows.
 void build_fast_batch_known_total(ArrowStreamState* state, ArrowArray* out, idx_t total) {
     Result& result = *state->result;
-    idx_t ncols = duckdb_column_count(result.raw_result());
+    idx_t ncols = result.column_names().size();
     size_t valid_bytes = (total + 7) / 8;
 
     auto b = std::make_unique<FastBatch>(ncols);
@@ -623,10 +604,9 @@ void build_fast_batch_known_total(ArrowStreamState* state, ArrowArray* out, idx_
         b->child_bufs[c] = {nullptr, b->alloc(total * state->widths[c])};
     }
 
-    ScratchChunk scratch(result.raw_result());
-    if (!scratch.chunk) throw std::bad_alloc();
     size_t row_off = 0;
-    while (result.next_chunk_locked(scratch.chunk)) {
+    while (duckdb_data_chunk taken = result.take_chunk_locked()) {
+        OwnedChunk scratch(taken);
         idx_t sz = duckdb_data_chunk_get_size(scratch.chunk);
         if (row_off + sz > total) {
             throw DuckyError("ducky: result produced more rows than expected");
@@ -658,7 +638,7 @@ void build_fast_batch(ArrowStreamState* state, ArrowArray* out) {
         build_fast_batch_known_total(state, out, *remaining);
         return;
     }
-    idx_t ncols = duckdb_column_count(state->result->raw_result());
+    idx_t ncols = state->result->column_names().size();
 
     ChunkList pulled(*state->result);
     if (pulled.total == 0) return;
@@ -702,13 +682,10 @@ int stream_get_next(ArrowArrayStream* stream, ArrowArray* out) {
             build_fast_batch(state, out);
             return 0;
         }
-        // Convert one reusable DuckDB chunk into Arrow-owned buffers.
-        if (!state->scratch) {
-            state->scratch = make_result_chunk(state->result->raw_result());
-            if (!state->scratch) return 0;
-        }
-        if (!state->result->next_chunk_locked(state->scratch)) return 0;  // exhausted
-        duckdb_error_data error = duckdb_data_chunk_to_arrow(state->options, state->scratch, out);
+        // Convert one DuckDB chunk into Arrow-owned buffers.
+        OwnedChunk chunk(state->result->take_chunk_locked());
+        if (!chunk.chunk) return 0;  // exhausted
+        duckdb_error_data error = duckdb_data_chunk_to_arrow(state->options, chunk.chunk, out);
         return consume_error(state, error) ? EIO : 0;
     } catch (const std::exception& e) {
         if (out->release) out->release(out);
@@ -726,7 +703,6 @@ void stream_release(ArrowArrayStream* stream) {
     auto* state = (ArrowStreamState*)stream->private_data;
     if (state) {
         if (state->options) duckdb_destroy_arrow_options(&state->options);
-        if (state->scratch) duckdb_destroy_data_chunk(&state->scratch);
         nb::gil_scoped_acquire gil;  // drop the owner reference under the GIL
         delete state;
     }
@@ -804,22 +780,63 @@ CellDecoder::CellDecoder(duckdb_logical_type logical) : type(duckdb_get_type_id(
     }
 }
 
-duckdb_data_chunk make_result_chunk(duckdb_result* result) {
-    idx_t n = duckdb_column_count(result);
-    if (n == 0) return nullptr;
-    std::vector<duckdb_logical_type> types(n);
-    for (idx_t i = 0; i < n; ++i) types[i] = duckdb_column_logical_type(result, i);
-    duckdb_data_chunk chunk = duckdb_create_data_chunk(types.data(), n);
-    for (idx_t i = 0; i < n; ++i) duckdb_destroy_logical_type(&types[i]);
-    return chunk;
+void destroy_v2_result(duckdb_v2_result_handle& result) {
+    if (!result) return;
+    release_gil_if_held release;
+    duckdb_v2_result_destroy(&result);
+}
+
+Execution::Execution(duckdb_v2_result_handle result, bool streaming) : result_(result) {
+    // A statement without rows runs to its end anyway, and its count and
+    // schema need it; so does one that expands into several, whose result
+    // type is not known yet.
+    DUCKDB_V2_RESULT_TYPE type;
+    settled_ = streaming &&
+               duckdb_v2_result_get_result_type(result, &type, nullptr) == DUCKDB_V2_ERROR_NONE &&
+               type == DUCKDB_V2_RESULT_TYPE_QUERY_RESULT;
+    // Its workers then run without waiting for each chunk to be taken. Were
+    // it to fail, the result would stream, which reads the same rows.
+    if (!streaming) duckdb_v2_result_retain(result, nullptr);
+}
+
+Execution::~Execution() {
+    for (duckdb_data_chunk& chunk : chunks_) duckdb_destroy_data_chunk(&chunk);
+    destroy_v2_result(result_);
+}
+
+bool Execution::run(std::chrono::steady_clock::time_point deadline) {
+    V2Error err;
+    while (!settled_) {
+        duckdb_v2_data_chunk_handle chunk = nullptr;
+        DUCKDB_V2_RESULT_STEP_STATUS status;
+        err.check(duckdb_v2_result_step(result_, &chunk, &status, err.out()));
+        switch (status) {
+            case DUCKDB_V2_RESULT_STEP_STATUS_CHUNK:
+                chunks_.push_back(duckdb_v2_data_chunk_get_v1(chunk));
+                break;
+            case DUCKDB_V2_RESULT_STEP_STATUS_FINISHED:
+                settled_ = finished_ = true;
+                break;
+            case DUCKDB_V2_RESULT_STEP_STATUS_CANCELLED:
+                throw DuckyError(kInterrupted);
+            default:  // WAITING
+                if (std::chrono::steady_clock::now() >= deadline) return false;
+                // Bounded, and woken when a task completes.
+                duckdb_v2_result_wait(result_, nullptr);
+                continue;
+        }
+        if (std::chrono::steady_clock::now() >= deadline) break;
+    }
+    return settled_;
 }
 
 nb::object Result::arrow_c_stream(nb::object self, bool allow_fast) {
     if (!handle_ || !handle_->connection) {
         throw DuckyError("ducky: Arrow export is unavailable; the connection is closed");
     }
-    // Stream-owned conversion options derived from the result.
-    duckdb_arrow_options options = duckdb_result_get_arrow_options(&result_);
+    // Stream-owned conversion options: the connection's Arrow settings.
+    duckdb_arrow_options options = nullptr;
+    duckdb_connection_get_arrow_options(handle_->connection, &options);
 
     // Combine only bit-compatible layouts when permitted.
     std::vector<size_t> widths(column_count_);
@@ -856,38 +873,72 @@ nb::object Result::arrow_c_stream(nb::object self, bool allow_fast) {
     return nb::steal(capsule);
 }
 
-Result::Result(duckdb_result result, std::shared_ptr<DuckDBHandle> handle)
-    : result_(result), handle_(std::move(handle)) {
+Result::Result(Execution& execution, std::shared_ptr<DuckDBHandle> handle)
+    : handle_(std::move(handle)) {
     // PyDateTimeAPI is static per-TU; prime ours so the *_to_py helpers can
     // use PyDate_FromDate / PyTime_FromTime / etc. unconditionally.
     if (!PyDateTimeAPI) PyDateTime_IMPORT;
-    column_count_ = duckdb_column_count(&result_);
-    streaming_ = duckdb_result_is_streaming(result_);
+    duckdb_v2_result_handle result = execution.result_;
+
+    // A settled result knows its schema, even one that expanded into several
+    // statements.
+    V2Error err;
+    duckdb_v2_schema_handle schema_handle = nullptr;
+    err.check(duckdb_v2_result_get_schema(result, &schema_handle, err.out()));
+    DUCKDB_V2_RESULT_TYPE result_type = DUCKDB_V2_RESULT_TYPE_QUERY_RESULT;
+    DUCKDB_V2_ERROR code = duckdb_v2_result_get_result_type(result, &result_type, err.out());
+    if (code == DUCKDB_V2_ERROR_NONE)
+        code = duckdb_v2_schema_get_count(schema_handle, &column_count_, err.out());
     auto schema = std::make_shared<ChunkSchema>();
     schema->names.reserve(column_count_);
     schema->name_to_idx.reserve(column_count_);
     types_.reserve(column_count_);
     column_types_.reserve(column_count_);
-    for (idx_t i = 0; i < column_count_; ++i) {
-        schema->names.emplace_back(duckdb_column_name(&result_, i));
+    for (idx_t i = 0; i < column_count_ && code == DUCKDB_V2_ERROR_NONE; ++i) {
+        const char* name = nullptr;
+        idx_t length = 0;
+        duckdb_v2_logical_type_handle type = nullptr;
+        code = duckdb_v2_schema_get_field(schema_handle, i, &name, &length, &type, err.out());
+        if (code != DUCKDB_V2_ERROR_NONE) break;
+        schema->names.emplace_back(name, length);
         schema->name_to_idx.emplace(schema->names.back(), i);
-        duckdb_logical_type logical = duckdb_column_logical_type(&result_, i);
+        duckdb_logical_type logical = duckdb_v2_logical_type_to_v1(type);
         column_types_.push_back(logical);
         types_.push_back(duckdb_get_type_id(logical));
     }
+    duckdb_v2_schema_destroy(&schema_handle);
+    if (code != DUCKDB_V2_ERROR_NONE) {
+        for (duckdb_logical_type& logical : column_types_) duckdb_destroy_logical_type(&logical);
+        err.check(code);
+    }
     schema_ = std::move(schema);
+
+    // Take the chunks; a running streaming query stays with the Result.
+    buffered_ = std::move(execution.chunks_);
+    execution.chunks_.clear();
+    for (duckdb_data_chunk chunk : buffered_) buffered_rows_ += duckdb_data_chunk_get_size(chunk);
+    if (execution.finished_) {
+        destroy_v2_result(execution.result_);
+    } else {
+        stream_ = execution.result_;
+        execution.result_ = nullptr;
+    }
+
+    // The count is the first row of the single BIGINT column.
+    if (result_type == DUCKDB_V2_RESULT_TYPE_CHANGED_ROWS && !buffered_.empty() &&
+        duckdb_data_chunk_get_size(buffered_.front()) > 0) {
+        duckdb_vector count = duckdb_data_chunk_get_vector(buffered_.front(), 0);
+        rows_changed_ = ((int64_t*)duckdb_vector_get_data(count))[0];
+    }
 }
 
 Result::~Result() {
     release_chunk();
+    for (duckdb_data_chunk& chunk : buffered_) duckdb_destroy_data_chunk(&chunk);
     for (duckdb_logical_type& logical : column_types_) {
         if (logical) duckdb_destroy_logical_type(&logical);
     }
-    // Destroying an unfinished streaming result cleans up its query under the
-    // client context lock, which a query running Python callbacks on another
-    // thread may hold while it waits for the GIL.
-    release_gil_if_held release;
-    duckdb_destroy_result(&result_);
+    destroy_v2_result(stream_);
 }
 
 void Result::release_chunk() {
@@ -901,57 +952,80 @@ void Result::release_chunk() {
 
 std::unique_lock<std::mutex> Result::lock_cursor() { return lock_releasing_gil(mu_); }
 
-bool Result::fetch_into_locked(duckdb_data_chunk dst) {
-    // The end is sticky: fetching past it would fail on a closed stream.
-    if (exhausted_) return false;
-    bool fetched;
-    {
-        // A fetch can drive query execution (streaming results); DuckDB workers
-        // running Python UDFs or Arrow scans need the GIL meanwhile.
-        release_gil_if_held release;
-        fetched = duckdb_fetch_chunk_into(result_, dst);
-    }
-    if (fetched) return true;
-    // A false return is either the end of the result or a failure that DuckDB
-    // records on the result (execution errors, interrupts).
-    if (const char* error = duckdb_result_error(&result_)) throw DuckyError(error);
-    exhausted_ = true;
-    return false;
+void Result::end_stream(std::string error) {
+    error_ = std::move(error);
+    destroy_v2_result(stream_);
 }
 
-bool Result::next_chunk_locked(duckdb_data_chunk dst) {
-    if (chunk_ && cursor_ < chunk_size_) {
-        // Hand out the rows the row cursor buffered but has not returned yet.
-        idx_t count = chunk_size_ - cursor_;
-        duckdb_data_chunk_reset(dst);
-        duckdb_selection_vector sel = duckdb_create_selection_vector(chunk_size_);
-        sel_t* index = duckdb_selection_vector_get_data_ptr(sel);
-        for (idx_t i = 0; i < chunk_size_; ++i) index[i] = (sel_t)i;
-        for (idx_t c = 0; c < column_count_; ++c) {
-            duckdb_vector_copy_sel(duckdb_data_chunk_get_vector(chunk_, c),
-                                   duckdb_data_chunk_get_vector(dst, c), sel, chunk_size_, cursor_,
-                                   0);
+duckdb_data_chunk Result::next_query_chunk_locked() {
+    while (!buffered_.empty()) {
+        duckdb_data_chunk chunk = buffered_.front();
+        buffered_.pop_front();
+        idx_t size = duckdb_data_chunk_get_size(chunk);
+        buffered_rows_ -= size;
+        if (size > 0) return chunk;
+        duckdb_destroy_data_chunk(&chunk);
+    }
+    // The error is sticky; the end too, since a finished stream is gone.
+    if (!error_.empty()) throw DuckyError(error_);
+    while (stream_) {
+        duckdb_v2_data_chunk_handle chunk = nullptr;
+        V2Error err;
+        DUCKDB_V2_ERROR code;
+        {
+            // A fetch drives the query's execution; DuckDB workers running
+            // Python UDFs or Arrow scans need the GIL meanwhile.
+            release_gil_if_held release;
+            code = duckdb_v2_result_fetch_chunk(stream_, &chunk, err.out());
         }
-        duckdb_destroy_selection_vector(sel);
-        duckdb_data_chunk_set_size(dst, count);
+        if (code != DUCKDB_V2_ERROR_NONE) {
+            end_stream(code == DUCKDB_V2_ERROR_RUNTIME_INTERRUPT ? kInterrupted : err.text());
+            throw DuckyError(error_);
+        }
+        if (!chunk) {
+            end_stream();
+            break;
+        }
+        duckdb_data_chunk out = duckdb_v2_data_chunk_get_v1(chunk);
+        if (duckdb_data_chunk_get_size(out) > 0) return out;
+        duckdb_destroy_data_chunk(&out);
+    }
+    return nullptr;
+}
+
+duckdb_data_chunk Result::take_chunk_locked() {
+    if (chunk_ && cursor_ < chunk_size_) {
+        duckdb_data_chunk out;
+        if (cursor_ == 0) {
+            // Nothing of it was returned: hand the chunk over.
+            out = chunk_;
+            chunk_ = nullptr;
+        } else {
+            // Copy out the rows the row cursor buffered but has not returned.
+            idx_t count = chunk_size_ - cursor_;
+            out = duckdb_create_data_chunk(column_types_.data(), column_count_);
+            duckdb_selection_vector sel = duckdb_create_selection_vector(chunk_size_);
+            sel_t* index = duckdb_selection_vector_get_data_ptr(sel);
+            for (idx_t i = 0; i < chunk_size_; ++i) index[i] = (sel_t)i;
+            for (idx_t c = 0; c < column_count_; ++c) {
+                duckdb_vector_copy_sel(duckdb_data_chunk_get_vector(chunk_, c),
+                                       duckdb_data_chunk_get_vector(out, c), sel, chunk_size_,
+                                       cursor_, 0);
+            }
+            duckdb_destroy_selection_vector(sel);
+            duckdb_data_chunk_set_size(out, count);
+        }
         release_chunk();
-        rows_returned_ += count;
-        return true;
+        return out;
     }
     release_chunk();
-    for (;;) {
-        if (!fetch_into_locked(dst)) return false;
-        idx_t size = duckdb_data_chunk_get_size(dst);
-        if (size == 0) continue;
-        rows_returned_ += size;
-        return true;
-    }
+    return next_query_chunk_locked();
 }
 
-std::optional<idx_t> Result::remaining_rows_locked() {
-    if (streaming_) return std::nullopt;
-    idx_t total = duckdb_row_count(&result_);
-    return total > rows_returned_ ? total - rows_returned_ : 0;
+std::optional<idx_t> Result::remaining_rows_locked() const {
+    // A failed query's rows are unknown; fetching raises its error.
+    if (stream_ || !error_.empty()) return std::nullopt;
+    return buffered_rows_ + (chunk_ ? chunk_size_ - cursor_ : 0);
 }
 
 std::vector<std::string> Result::column_types() const {
@@ -974,26 +1048,15 @@ nb::object Result::description() const {
 
 // Requires the cursor lock.
 bool Result::ensure_row() {
-    while (!chunk_ || cursor_ >= chunk_size_) {
-        // Refill the cursor's scratch chunk in place.
-        if (!chunk_) {
-            chunk_ = make_result_chunk(&result_);
-            if (!chunk_) return false;  // zero-column result
-        }
-        if (!fetch_into_locked(chunk_)) {
-            release_chunk();
-            return false;  // no more chunks
-        }
-        idx_t size = duckdb_data_chunk_get_size(chunk_);
-        if (size == 0) continue;
-        chunk_size_ = size;
-        cursor_ = 0;
-        cursors_.resize(column_count_);
-        for (idx_t i = 0; i < column_count_; ++i) {
-            // Re-resolved per refill: a validity mask can materialize lazily.
-            duckdb_vector v = duckdb_data_chunk_get_vector(chunk_, i);
-            cursors_[i] = ColumnCursor{v, duckdb_vector_get_data(v), duckdb_vector_get_validity(v)};
-        }
+    if (chunk_ && cursor_ < chunk_size_) return true;
+    release_chunk();
+    chunk_ = next_query_chunk_locked();
+    if (!chunk_) return false;
+    chunk_size_ = duckdb_data_chunk_get_size(chunk_);
+    cursors_.resize(column_count_);
+    for (idx_t i = 0; i < column_count_; ++i) {
+        duckdb_vector v = duckdb_data_chunk_get_vector(chunk_, i);
+        cursors_[i] = ColumnCursor{v, duckdb_vector_get_data(v), duckdb_vector_get_validity(v)};
     }
     return true;
 }
@@ -1009,7 +1072,6 @@ void Result::ensure_decoders() {
 nb::object Result::build_row() {
     ensure_decoders();
     idx_t row = cursor_++;
-    rows_returned_++;
     // Own the partial tuple across conversion errors.
     nb::object tuple = steal_checked(PyTuple_New((Py_ssize_t)column_count_));
     for (idx_t c = 0; c < column_count_; ++c) {
@@ -1070,7 +1132,6 @@ nb::object Result::fetchitem() {
     // survives the chunk release that the follow-up ensure_row() may trigger.
     ensure_decoders();
     idx_t row = cursor_++;
-    rows_returned_++;
     const ColumnCursor& cur = cursors_[0];
     nb::object value = convert_cell(decoders_[0], cur.vector, cur.data, cur.validity, row);
     if (ensure_row()) {
@@ -1079,36 +1140,12 @@ nb::object Result::fetchitem() {
     return value;
 }
 
-int64_t Result::rows_changed() {
-    // Streaming results can't report the count without materializing.
-    if (streaming_) return 0;
-    return (int64_t)duckdb_rows_changed(&result_);
-}
-
-duckdb_data_chunk Result::fetch_raw_chunk_locked() {
-    duckdb_data_chunk chunk = chunk_pool_->take();
-    if (!chunk) chunk = make_result_chunk(&result_);
-    if (!chunk) return nullptr;  // zero-column result
-    bool fetched;
-    try {
-        fetched = next_chunk_locked(chunk);
-    } catch (...) {
-        duckdb_destroy_data_chunk(&chunk);
-        throw;
-    }
-    if (!fetched) {
-        duckdb_destroy_data_chunk(&chunk);
-        return nullptr;
-    }
-    return chunk;
-}
-
 nb::object Result::fetch_chunk() {
     auto lock = lock_cursor();
-    duckdb_data_chunk chunk = fetch_raw_chunk_locked();
+    duckdb_data_chunk chunk = take_chunk_locked();
     if (!chunk) return nb::none();
     // The Python wrapper owns the allocated Chunk.
-    return nb::cast(new Chunk(chunk, schema_, handle_, chunk_pool_), nb::rv_policy::take_ownership);
+    return nb::cast(new Chunk(chunk, schema_, handle_), nb::rv_policy::take_ownership);
 }
 
 namespace {
@@ -1264,12 +1301,12 @@ nb::object Result::fetch_numpy_chunk(bool fill_nulls) {
     duckdb_data_chunk chunk;
     {
         auto lock = lock_cursor();
-        chunk = fetch_raw_chunk_locked();
+        chunk = take_chunk_locked();
     }
     if (!chunk) return nb::none();
     // Column views keep their owning Chunk alive.
     nb::object chunk_obj =
-        nb::cast(new Chunk(chunk, schema_, handle_, chunk_pool_), nb::rv_policy::take_ownership);
+        nb::cast(new Chunk(chunk, schema_, handle_), nb::rv_policy::take_ownership);
     Chunk& c = nb::cast<Chunk&>(chunk_obj);
     nb::dict out;
     const std::vector<std::string>& names = schema_->names;
@@ -1323,10 +1360,9 @@ nb::object Result::to_numpy(nb::object columns) {
         }
 
         if (total > 0 && column_count_ > 0) {
-            ScratchChunk scratch(&result_);
-            if (!scratch.chunk) throw std::bad_alloc();
             idx_t offset = 0;
-            while (next_chunk_locked(scratch.chunk)) {
+            while (duckdb_data_chunk taken = take_chunk_locked()) {
+                OwnedChunk scratch(taken);
                 idx_t sz = duckdb_data_chunk_get_size(scratch.chunk);
                 if (offset + sz > total) {
                     throw DuckyError("ducky: to_numpy: result produced more rows than expected");

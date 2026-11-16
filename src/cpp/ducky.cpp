@@ -351,12 +351,11 @@ NB_MODULE(_core, m) {
                     "BaseException | None, traceback: types.TracebackType | None) -> None"),
             nb::lock_self());
 
-    nb::enum_<duckdb_pending_state>(m, "PendingState",
-                                    "State of an async query's executor after a tick.")
-        .value("READY", DUCKDB_PENDING_RESULT_READY, "The result is ready to materialize.")
-        .value("NOT_READY", DUCKDB_PENDING_RESULT_NOT_READY, "More tasks remain; tick again.")
-        .value("ERROR", DUCKDB_PENDING_ERROR, "Execution failed; see ``.error()``.")
-        .value("NO_TASKS", DUCKDB_PENDING_NO_TASKS_AVAILABLE,
+    nb::enum_<PendingState>(m, "PendingState", "State of an async query's executor after a tick.")
+        .value("READY", PendingState::READY, "The result is ready to materialize.")
+        .value("NOT_READY", PendingState::NOT_READY, "More work remains; tick again.")
+        .value("ERROR", PendingState::ERROR, "Execution failed; see ``.error()``.")
+        .value("NO_TASKS", PendingState::NO_TASKS,
                "Workers own the outstanding tasks; yield, then tick again.");
 
     nb::class_<PendingResult>(m, "PendingResult", "Steppable in-flight query handle.")

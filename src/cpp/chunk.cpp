@@ -54,11 +54,8 @@ bool Chunk::dense(idx_t i, void*& data, nb::dlpack::dtype& dtype, std::vector<si
 }
 
 Chunk::Chunk(duckdb_data_chunk chunk, std::shared_ptr<const ChunkSchema> schema,
-             std::shared_ptr<DuckDBHandle> handle, std::weak_ptr<ChunkPool> pool)
-    : chunk_(chunk),
-      schema_(std::move(schema)),
-      handle_(std::move(handle)),
-      pool_(std::move(pool)) {
+             std::shared_ptr<DuckDBHandle> handle)
+    : chunk_(chunk), schema_(std::move(schema)), handle_(std::move(handle)) {
     size_ = duckdb_data_chunk_get_size(chunk_);
 }
 
@@ -66,12 +63,7 @@ Chunk::~Chunk() {
     for (duckdb_logical_type& logical : types_) {
         if (logical) duckdb_destroy_logical_type(&logical);
     }
-    if (chunk_) {
-        auto pool = pool_.lock();
-        if (!pool || !pool->try_return(chunk_)) {
-            duckdb_destroy_data_chunk(&chunk_);
-        }
-    }
+    if (chunk_) duckdb_destroy_data_chunk(&chunk_);
 }
 
 duckdb_logical_type Chunk::logical_type(idx_t i) {

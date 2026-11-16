@@ -3,7 +3,9 @@
 #include <nanobind/nanobind.h>
 #include <tsl/robin_map.h>
 
+#include <chrono>
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -13,6 +15,7 @@
 #include "chunk.hpp"
 #include "database.hpp"
 #include "duckdb.h"
+#include "v2.hpp"
 
 namespace nb = nanobind;
 
@@ -35,11 +38,50 @@ struct CellDecoder {
     explicit CellDecoder(duckdb_logical_type logical);
 };
 
-// A lazily decoded duckdb_result.
+// Runs a C API v2 result to its end on the calling thread, unless it streams
+// rows: those run as they are fetched, so they settle at once. Owns the result
+// until a Result takes it, and the chunks stepped so far.
+class Execution {
+   public:
+    // Takes `result`.
+    Execution(duckdb_v2_result_handle result, bool streaming);
+    ~Execution();
+
+    Execution(const Execution&) = delete;
+    Execution& operator=(const Execution&) = delete;
+
+    // Steps until settled() or until `deadline` passes, waiting with the
+    // result while workers own the remaining tasks; one step at the least.
+    // Returns settled(). Call without the GIL. Raises DuckyError when the query
+    // fails or is interrupted.
+    bool run(std::chrono::steady_clock::time_point deadline);
+    // Whether the result can be handed to a Result.
+    bool settled() const { return settled_; }
+
+   private:
+    friend class Result;
+
+    duckdb_v2_result_handle result_;
+    bool settled_;
+    bool finished_ = false;
+    // v1 views of the v2 chunks; see duckdb_v2_data_chunk_get_v1.
+    std::deque<duckdb_data_chunk> chunks_;
+};
+
+// The message of a query that connection_interrupt cancelled.
+inline constexpr const char* kInterrupted = "ducky: query interrupted";
+
+// Destroys a v2 result. Ending an unfinished query cleans it up under the
+// client context lock, which a query running Python callbacks on another
+// thread may hold while it waits for the GIL.
+void destroy_v2_result(duckdb_v2_result_handle& result);
+
+// A lazily decoded query result.
 class Result {
    public:
-    // `handle` keeps the database alive.
-    Result(duckdb_result result, std::shared_ptr<DuckDBHandle> handle);
+    // Takes the settled `execution`'s result and chunks. `handle` keeps the
+    // database alive.
+    Result(Execution& execution, std::shared_ptr<DuckDBHandle> handle);
     ~Result();
 
     Result(const Result&) = delete;
@@ -47,6 +89,8 @@ class Result {
 
     const std::vector<std::string>& column_names() const { return schema_->names; }
     std::vector<std::string> column_types() const;
+    // Owned by the Result.
+    const std::vector<duckdb_logical_type>& column_logical_types() const { return column_types_; }
     // PEP 249 Cursor.description: one 7-tuple per column, or None when the
     // statement produced no result set.
     nb::object description() const;
@@ -59,10 +103,9 @@ class Result {
     // does not have exactly one column or does not yield exactly one row.
     nb::object fetchitem();
 
-    // Rows affected by an INSERT / UPDATE / DELETE, per duckdb_rows_changed.
-    // 0 for statements that don't report changed rows (SELECT, DDL) and for
-    // streaming results (the C API can't read the count without materializing).
-    int64_t rows_changed();
+    // Rows affected by an INSERT / UPDATE / DELETE: its count, read when the
+    // query ran. 0 for statements that don't report changed rows (SELECT, DDL).
+    int64_t rows_changed() const { return rows_changed_; }
 
     // Pull the next chunk. Shares the cursor with other consumers.
     nb::object fetch_chunk();
@@ -88,16 +131,14 @@ class Result {
     // waiting for the GIL (or for DuckDB workers that need it) cannot deadlock
     // with the waiter.
     std::unique_lock<std::mutex> lock_cursor();
-    // Fills `dst` (a chunk of the result's column types, see
-    // make_result_chunk) with the next unconsumed rows: first the rows the row
-    // cursor buffered but has not returned, then a fresh fetch. Counts them as
-    // returned. Returns false at the end; raises DuckyError when the query
-    // failed or the result was invalidated. Requires the cursor lock.
-    bool next_chunk_locked(duckdb_data_chunk dst);
-    // Exact number of unconsumed rows, or nullopt when unknown (streaming).
-    // Requires the cursor lock.
-    std::optional<idx_t> remaining_rows_locked();
-    duckdb_result* raw_result() { return &result_; }
+    // Returns a chunk of the next unconsumed rows, which the caller owns: first
+    // the rows the row cursor buffered but has not returned, then the next
+    // chunk. Returns nullptr at the end; raises DuckyError when the query
+    // failed. Requires the cursor lock.
+    duckdb_data_chunk take_chunk_locked();
+    // Exact number of unconsumed rows, or nullopt while a streaming query still
+    // runs or after it failed. Requires the cursor lock.
+    std::optional<idx_t> remaining_rows_locked() const;
 
    private:
     // Ensures a row is available at the cursor, advancing to the next chunk as
@@ -106,17 +147,23 @@ class Result {
     // Builds the tuple at the cursor and advances the cursor by one row.
     nb::object build_row();
     void release_chunk();
-    // Backs fetch_chunk()/fetch_numpy_chunk(): returns the next data chunk
-    // (reusing a buffer from chunk_pool_ when one is free), or nullptr when
-    // exhausted. Requires the cursor lock.
-    duckdb_data_chunk fetch_raw_chunk_locked();
-    // Fetches the next chunk from DuckDB into `dst` with the GIL released.
-    // Returns false at the end; raises when the result reports an error.
-    bool fetch_into_locked(duckdb_data_chunk dst);
+    // The next chunk of the query, skipping empty ones, or nullptr at its end.
+    // Fetches with the GIL released. Requires the cursor lock.
+    duckdb_data_chunk next_query_chunk_locked();
+    // Ends the query, keeping `error` to raise from every later fetch.
+    void end_stream(std::string error = "");
 
-    duckdb_result result_;
+    // The streaming query's result while it runs; nullptr once every chunk is
+    // buffered or consumed.
+    duckdb_v2_result_handle stream_ = nullptr;
+    // Chunks stepped but not yet consumed, as v1 views, and their rows.
+    std::deque<duckdb_data_chunk> buffered_;
+    idx_t buffered_rows_ = 0;
+    // Set when the stream failed; raised by every later fetch.
+    std::string error_;
     std::shared_ptr<DuckDBHandle> handle_;
-    idx_t column_count_;
+    idx_t column_count_ = 0;
+    int64_t rows_changed_ = 0;
     // Shared with every Chunk this Result spawns; never mutated after the
     // Result constructor finishes.
     std::shared_ptr<const ChunkSchema> schema_;
@@ -135,24 +182,12 @@ class Result {
     duckdb_data_chunk chunk_ = nullptr;
     idx_t chunk_size_ = 0;
     idx_t cursor_ = 0;
-    // Buffer pool for chunk-returning APIs.
-    std::shared_ptr<ChunkPool> chunk_pool_ = std::make_shared<ChunkPool>();
-    // Rows handed out through any consumer (rows, chunks, arrays, Arrow).
-    idx_t rows_returned_ = 0;
-    // Set once DuckDB reported the end of the result.
-    bool exhausted_ = false;
-    // Whether the result streams. Captured at construction: DuckDB reports a
-    // failed streaming result as non-streaming.
-    bool streaming_ = false;
     std::vector<ColumnCursor> cursors_;
     // Built on the first row decoded. Requires the cursor lock.
     std::vector<CellDecoder> decoders_;
     void ensure_decoders();
-    // Guards the cursor state above and all fetches from result_. Blocking
+    // Guards the cursor state above and all fetches from stream_. Blocking
     // fetches run with the GIL released, so binding-level locks (nb::lock_self)
     // alone don't serialize consumers.
     std::mutex mu_;
 };
-
-// A chunk with `result`'s column types, or nullptr for a zero-column result.
-duckdb_data_chunk make_result_chunk(duckdb_result* result);

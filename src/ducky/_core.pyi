@@ -289,7 +289,7 @@ class PendingState(enum.Enum):
     """The result is ready to materialize."""
 
     NOT_READY = 1
-    """More tasks remain; tick again."""
+    """More work remains; tick again."""
 
     ERROR = 2
     """Execution failed; see ``.error()``."""

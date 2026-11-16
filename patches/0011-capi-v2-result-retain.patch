@@ -1,0 +1,155 @@
+Add duckdb_v2_result_retain: run a result to its end without a consumer
+
+A C API v2 result of a SELECT always streams: its query holds at most
+max_streaming_buffer_size of rows the consumer has not taken, and parks its
+workers until the consumer steps. A statement that keeps the source order of its
+rows then runs mostly on the consumer's thread. The engine also retains results
+(QueryResult::Materialize), which v1's materialized path uses: the query runs to
+its end in parallel without waiting on the consumer. A client that reads a
+result to its end anyway has no way to ask v2 for that. Born from a heavy
+projection over a table, read in full through v2: 645 ms streamed, 110 ms with
+the cap lifted, on 8 threads.
+
+  - ResultWrapperV2::Retain(): before the result starts streaming, materializes
+    its handle and keeps it retained. A no-op for a result that is retained
+    already or has ended; an error once it streams.
+  - duckdb_v2_result_retain(result) and duckdb_v2_arrow_result_retain(result),
+    in duckdb_v2_result_retain.h.
+
+Note for upstreaming: duckdb_v2.h is generated; an upstream PR would add these
+to its generator's definitions, or a retain flag to the execute functions.
+diff --git a/src/include/duckdb/main/capi_v2/capi_v2_result_internal.hpp b/src/include/duckdb/main/capi_v2/capi_v2_result_internal.hpp
+index ccf74b91..8a1b1e7e 100644
+--- a/src/include/duckdb/main/capi_v2/capi_v2_result_internal.hpp
++++ b/src/include/duckdb/main/capi_v2/capi_v2_result_internal.hpp
+@@ -91,6 +91,9 @@ struct ResultWrapperV2 {
+ 	DUCKDB_V2_RESULT_STEP_STATUS Step(unique_ptr<typename FORMAT::T> &out_unit);
+ 	//! Blocks until Step can make progress. No-op on terminal states.
+ 	void Wait();
++	//! Retains a result that would stream, so its query runs to the end without waiting on the consumer. A no-op
++	//! for a result that is retained already or has ended. Throws once the result has started streaming.
++	void Retain();
+ 	//! Blocking convenience: steps/waits until a unit is produced (returned)
+ 	//! or the stream ends (nullptr). Cancellation throws InterruptException.
+ 	template <class FORMAT>
+diff --git a/src/include/duckdb_v2_result_retain.h b/src/include/duckdb_v2_result_retain.h
+new file mode 100644
+index 00000000..294d845d
+--- /dev/null
++++ b/src/include/duckdb_v2_result_retain.h
+@@ -0,0 +1,52 @@
++//===----------------------------------------------------------------------===//
++//
++//                         DuckDB
++//
++// duckdb_v2_result_retain.h
++//
++//
++//===----------------------------------------------------------------------===//
++
++#pragma once
++
++#include "duckdb_v2.h"
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#if DUCKDB_V2_API_ALLOW_UNSTABLE
++/*!
++ * Retains a result instead of streaming it.
++ *
++ * A result that streams holds at most `max_streaming_buffer_size` of rows that the consumer has not taken, and parks
++ * the query's workers until the consumer steps; a statement that keeps the source order of its rows then runs mostly
++ * on the consumer's thread. A retained result runs to its end without waiting on the consumer, in parallel, keeping
++ * every row; stepping it yields the same chunks. Retain a result that will be read to its end anyway.
++ *
++ * Call it before the first step. A no-op for a result that is retained already, such as one of a statement that does
++ * not return rows, and for a result that has ended. Fails with `ERROR_INPUT_INVALID` once the result has started
++ * streaming.
++ *
++ * history:
++ * - unstable: v2.0.0
++ *
++ * @param result The result.
++ */
++DUCKDB_C_API DUCKDB_V2_ERROR duckdb_v2_result_retain(duckdb_v2_result_handle result, duckdb_v2_error_info_handle *err);
++
++/*!
++ * Retains an Arrow result instead of streaming it; see `duckdb_v2_result_retain()`.
++ *
++ * history:
++ * - unstable: v2.0.0
++ *
++ * @param result The Arrow result.
++ */
++DUCKDB_C_API DUCKDB_V2_ERROR duckdb_v2_arrow_result_retain(duckdb_v2_arrow_result_handle result,
++                                                         duckdb_v2_error_info_handle *err);
++#endif
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/src/main/capi/v2/capi_v2_arrow.cpp b/src/main/capi/v2/capi_v2_arrow.cpp
+index e8f64b6c..f305b7b1 100644
+--- a/src/main/capi/v2/capi_v2_arrow.cpp
++++ b/src/main/capi/v2/capi_v2_arrow.cpp
+@@ -1,4 +1,5 @@
+ #include "duckdb/main/capi_v2/capi_v2_result_internal.hpp"
++#include "duckdb_v2_result_retain.h"
+ 
+ #include "duckdb/common/arrow/arrow_appender.hpp"
+ #include "duckdb/common/arrow/arrow_converter.hpp"
+@@ -675,6 +676,12 @@ DUCKDB_V2_ERROR duckdb_v2_arrow_result_wait(duckdb_v2_arrow_result_handle result
+ 	return duckdb_v2_result_wait(AsResult(result), err);
+ }
+ 
++DUCKDB_V2_ERROR duckdb_v2_arrow_result_retain(duckdb_v2_arrow_result_handle result,
++                                              duckdb_v2_error_info_handle *err) {
++	DUCKDB_CHECK_ARG(result);
++	return duckdb_v2_result_retain(AsResult(result), err);
++}
++
+ DUCKDB_V2_ERROR duckdb_v2_arrow_result_drain(duckdb_v2_arrow_result_handle result, idx_t *out_rows_changed,
+                                              duckdb_v2_error_info_handle *err) {
+ 	DUCKDB_CHECK_ARG(result);
+diff --git a/src/main/capi/v2/capi_v2_result.cpp b/src/main/capi/v2/capi_v2_result.cpp
+index ab9a7256..3de754c7 100644
+--- a/src/main/capi/v2/capi_v2_result.cpp
++++ b/src/main/capi/v2/capi_v2_result.cpp
+@@ -1,4 +1,5 @@
+ #include "duckdb/main/capi_v2/capi_v2_result_internal.hpp"
++#include "duckdb_v2_result_retain.h"
+ 
+ #include "duckdb/common/arrow/arrow_format.hpp"
+ #include "duckdb/common/arrow/nanoarrow/nanoarrow.hpp"
+@@ -296,6 +297,17 @@ void ResultWrapperV2::Wait() {
+ 	}
+ }
+ 
++void ResultWrapperV2::Retain() {
++	if (state == State::STREAMING && stream) {
++		throw InvalidInputException("the result is already streaming; retain it before stepping it");
++	}
++	if (state != State::PENDING || !stream_when_ready) {
++		return;
++	}
++	handle->Materialize();
++	stream_when_ready = false;
++}
++
+ template <class FORMAT>
+ unique_ptr<typename FORMAT::T> ResultWrapperV2::FetchBlocking() {
+ 	while (true) {
+@@ -574,6 +586,11 @@ DUCKDB_V2_ERROR duckdb_v2_result_wait(duckdb_v2_result_handle result, duckdb_v2_
+ 	return WithErrorHandler(err, [&]() { Convert(result)->Wait(); });
+ }
+ 
++DUCKDB_V2_ERROR duckdb_v2_result_retain(duckdb_v2_result_handle result, duckdb_v2_error_info_handle *err) {
++	DUCKDB_CHECK_ARG(result);
++	return WithErrorHandler(err, [&]() { Convert(result)->Retain(); });
++}
++
+ // ---------------------------------------------------------------------------
+ // Metadata
+ // ---------------------------------------------------------------------------

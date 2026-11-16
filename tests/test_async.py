@@ -31,6 +31,15 @@ async def test_asql_streaming_spans_chunks(con):
     assert chunks > 1, "expected the streaming result to span multiple chunks"
 
 
+async def test_asql_streaming_raises_runtime_errors_when_fetched(con):
+    res = await con.asql(
+        "SELECT CASE WHEN i < 300000 THEN i ELSE error('boom') END AS x FROM range(500000) t(i)",
+        streaming=True,
+    )
+    with pytest.raises(ducky.Error, match="boom"):
+        res.fetchall()
+
+
 async def test_aexecute_error_propagates(con):
     with pytest.raises(ducky.Error, match="no_such_table"):
         await con.aexecute("SELECT * FROM no_such_table")

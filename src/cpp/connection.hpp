@@ -12,61 +12,48 @@
 
 #include "database.hpp"
 #include "duckdb.h"
+#include "prepared.hpp"
 #include "result.hpp"
 
 namespace nb = nanobind;
 
-class PreparedStatement;
 struct ArrowRegistry;
 
+// The state of an async query after a tick. The values are C API v1's pending
+// states, which ducky._aio was written against.
+enum class PendingState : int { READY = 0, NOT_READY = 1, ERROR = 2, NO_TASKS = 3 };
+
 // Steppable pending result used by ducky._aio.
-// Runs a pending query's tasks on the calling thread. While DuckDB's workers
-// finish the last tasks of a pipeline there is nothing to execute here: yield,
-// then sleep briefly. Short sleeps keep the wake-up latency well below a
-// typical query's runtime.
-class TaskPacer {
-   public:
-    // Runs tasks until the result is ready, execution fails, or `deadline`
-    // passes, and returns the last state. Call without the GIL.
-    duckdb_pending_state run(duckdb_pending_result pending,
-                             std::chrono::steady_clock::time_point deadline);
-
-   private:
-    int no_tasks_streak_ = 0;
-    std::chrono::microseconds backoff_{0};
-};
-
 class PendingResult {
    public:
-    // Takes `pending`, and `stmt` when `owns_stmt`.
-    PendingResult(duckdb_pending_result pending, duckdb_prepared_statement stmt, bool owns_stmt,
-                  duckdb_connection con, std::shared_ptr<DuckDBHandle> handle);
+    PendingResult(std::unique_ptr<Execution> execution, std::shared_ptr<DuckDBHandle> handle);
     ~PendingResult();
 
     PendingResult(const PendingResult&) = delete;
     PendingResult& operator=(const PendingResult&) = delete;
 
-    // Advance the executor by one task. Releases the GIL.
-    duckdb_pending_state execute_task();
-    // Runs tasks for up to `budget` seconds (GIL released); see TaskPacer.
-    duckdb_pending_state execute_tasks(double budget);
-    // DuckDB's most recent error message, or "" if the handle is gone.
+    // Runs one step of the query. Releases the GIL.
+    PendingState execute_task();
+    // Runs the query for up to `budget` seconds (GIL released), waiting while
+    // DuckDB's workers own the remaining tasks.
+    PendingState execute_tasks(double budget);
+    // The message of the error execution failed with, or "".
     std::string error();
-    // Materialize the finished result; call once execute_task reports READY.
-    // Raises DuckyError on execution failure.
+    // Returns the result once execute_task reports READY, running the query
+    // to that point first. Raises DuckyError on execution failure.
     std::shared_ptr<Result> materialize();
-    // Cancellation teardown: interrupt, drain to a terminal state, discard.
+    // Cancellation teardown: interrupt and end the query.
     void drain();
 
    private:
-    void cleanup_locked();
+    // Requires mu_ and no GIL.
+    PendingState run_locked(std::chrono::steady_clock::time_point deadline);
+    // Interrupts and ends the query. Requires mu_ and no GIL.
+    void cancel_locked();
 
     std::mutex mu_;
-    TaskPacer pacer_;
-    duckdb_pending_result pending_ = nullptr;
-    duckdb_prepared_statement stmt_ = nullptr;
-    bool owns_stmt_ = false;
-    duckdb_connection con_ = nullptr;
+    std::unique_ptr<Execution> execution_;
+    std::string error_;
     std::shared_ptr<DuckDBHandle> handle_;
 };
 
@@ -94,8 +81,7 @@ class Connection {
     nb::object arrow_collected_stream(const std::string& query, nb::object parameters,
                                       uint64_t rows_per_batch);
 
-    // Prepare + bind without driving the executor — substrate for ducky._aio.
-    // The returned handle owns a throwaway prepared statement.
+    // Start the query without driving it — substrate for ducky._aio.
     PendingResult* make_pending(const std::string& query, nb::object parameters, bool streaming);
 
     // Compile a reusable prepared statement.
@@ -147,47 +133,44 @@ class Connection {
     void gc_clear();
 
    private:
-    duckdb_result run(const std::string& query, nb::object parameters, bool streaming);
+    // Runs `query` to a settled result.
+    std::shared_ptr<Result> run(const std::string& query, nb::object parameters, bool streaming);
 
     // Prepared-statement LRU keyed by exact query text.
     struct CachedStatement {
         std::string query;
-        duckdb_prepared_statement stmt;
+        std::unique_ptr<V2Prepared> stmt;
     };
     // Returns the cached statement for `query` (removing it from the cache),
     // or nullptr on a miss.
-    duckdb_prepared_statement statement_cache_checkout(const std::string& query);
+    std::unique_ptr<V2Prepared> statement_cache_checkout(const std::string& query);
     // Returns a statement to the cache as most-recently-used, evicting the
     // least-recently-used entry past capacity.
-    void statement_cache_checkin(const std::string& query, duckdb_prepared_statement stmt);
+    void statement_cache_checkin(const std::string& query, std::unique_ptr<V2Prepared> stmt);
     // Destroys every cached statement. Must run before the connection closes.
     void statement_cache_clear();
     // Post-run disposal of a checked-out statement: flushes plans its execution
     // invalidated, then caches or destroys it.
-    void statement_cache_retire(const std::string& query, duckdb_prepared_statement stmt);
+    void statement_cache_retire(const std::string& query, std::unique_ptr<V2Prepared> stmt);
 
     // One execution's checked-out or freshly prepared statement.
     class StatementLease {
        public:
-        // Check out an unbound cached statement or prepare one on `connection`.
-        StatementLease(Connection& con, duckdb_connection connection, const std::string& query);
-        ~StatementLease();
+        // Check out a cached statement or prepare one on `connection`.
+        StatementLease(Connection& con, duckdb_v2_connection_handle connection,
+                       const std::string& query);
 
-        StatementLease(const StatementLease&) = delete;
-        StatementLease& operator=(const StatementLease&) = delete;
-
-        duckdb_prepared_statement get() const { return stmt_; }
+        const V2Prepared& get() const { return *stmt_; }
         // Hands the statement back to the cache per statement_cache_retire. Call
-        // only after the execution succeeded.
+        // only after the execution succeeded; a statement whose execution threw
+        // is destroyed instead.
         void retire();
 
        private:
         Connection& con_;
         const std::string& query_;
-        duckdb_prepared_statement stmt_ = nullptr;
+        std::unique_ptr<V2Prepared> stmt_;
     };
-    // Make a result sharing the database handle.
-    std::shared_ptr<Result> make_result(duckdb_result result);
     // Fire the sink for sampled materialized queries.
     void maybe_emit_profile(duckdb_connection connection, const std::string& query);
 

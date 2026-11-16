@@ -5,6 +5,7 @@
 #include <utility>
 
 #include "duckdb_v2_bridge.h"
+#include "duckdb_v2_result_retain.h"
 #include "ducky.hpp"
 
 // The process's C API v2 environment. Never destroyed: an instance can outlive

@@ -23,41 +23,12 @@ struct ChunkSchema {
     idx_t resolve(nb::object key) const;
 };
 
-// Reusable data-chunk buffers for one result.
-struct ChunkPool {
-    nb::ft_mutex mu_;
-    std::vector<duckdb_data_chunk> free_;
-    static constexpr size_t kCapacity = 1;
-
-    ~ChunkPool() {
-        for (duckdb_data_chunk c : free_) duckdb_destroy_data_chunk(&c);
-    }
-
-    // Takes ownership of `chunk` if there's room; returns false (caller keeps
-    // ownership) if the pool is full.
-    bool try_return(duckdb_data_chunk chunk) {
-        nb::ft_lock_guard lock(mu_);
-        if (free_.size() >= kCapacity) return false;
-        free_.push_back(chunk);
-        return true;
-    }
-
-    // Returns a previously-freed buffer, or nullptr if none is available.
-    duckdb_data_chunk take() {
-        nb::ft_lock_guard lock(mu_);
-        if (free_.empty()) return nullptr;
-        duckdb_data_chunk c = free_.back();
-        free_.pop_back();
-        return c;
-    }
-};
-
 // A data chunk exposing flat columns as zero-copy arrays.
 class Chunk {
    public:
-    // Return the buffer to `pool` on destruction when possible.
+    // Takes `chunk`.
     Chunk(duckdb_data_chunk chunk, std::shared_ptr<const ChunkSchema> schema,
-          std::shared_ptr<DuckDBHandle> handle, std::weak_ptr<ChunkPool> pool = {});
+          std::shared_ptr<DuckDBHandle> handle);
     ~Chunk();
 
     Chunk(const Chunk&) = delete;
@@ -118,6 +89,5 @@ class Chunk {
     std::vector<duckdb_type> type_ids_;
     std::vector<std::unique_ptr<uint8_t[]>> unpacked_validity_;
     std::shared_ptr<DuckDBHandle> handle_;
-    std::weak_ptr<ChunkPool> pool_;
     idx_t size_;
 };

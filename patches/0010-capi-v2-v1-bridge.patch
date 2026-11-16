@@ -1,22 +1,27 @@
-Bridge C API v2 connections to C API v1 handles
+Bridge C API v2 handles to C API v1 handles
 
 C API v2 has no appender, and v1 and v2 handles do not convert into each other,
-so a client that moves its connections to v2 loses the v1 functions v2 has no
-counterpart for. Both wrap the same engine object: a v2 connection is a
-Connection, which is what a v1 connection handle points to. Add, in
-duckdb_v2_bridge.h, duckdb_v2_connection_get_v1(conn): the borrowed v1 handle
-of a v2 connection, valid until the v2 connection is destroyed. A query run
-through the v1 handle does not count as the v2 connection's running statement.
+so a client that moves to v2 loses the v1 functions v2 has no counterpart for.
+Several handles wrap the same engine object in both APIs. Add, in
+duckdb_v2_bridge.h:
+
+  - duckdb_v2_connection_get_v1(conn): the borrowed v1 handle of a v2
+    connection, valid until the v2 connection is destroyed. A query run through
+    the v1 handle does not count as the v2 connection's running statement.
+  - duckdb_v2_data_chunk_get_v1(chunk): the v1 handle of a v2 data chunk. Both
+    are the DataChunk, so the chunk is destroyed once, through either API.
+  - duckdb_v2_logical_type_to_v1(type): a v1 copy of a v2 logical type, whose
+    handles do not share a representation.
 
 Note for upstreaming: duckdb_v2.h is generated; an upstream PR would add these
 to its generator's definitions, or keep them in a hand-written header like this
 one.
 diff --git a/src/include/duckdb_v2_bridge.h b/src/include/duckdb_v2_bridge.h
 new file mode 100644
-index 00000000..43490e6a
+index 00000000..92e2dfdc
 --- /dev/null
 +++ b/src/include/duckdb_v2_bridge.h
-@@ -0,0 +1,39 @@
+@@ -0,0 +1,63 @@
 +//===----------------------------------------------------------------------===//
 +//
 +//                         DuckDB
@@ -51,13 +56,37 @@ index 00000000..43490e6a
 + * @return The v1 connection handle, or NULL when `conn` is NULL.
 + */
 +DUCKDB_C_API duckdb_connection duckdb_v2_connection_get_v1(duckdb_v2_connection_handle conn);
++
++/*!
++ * Returns the C API v1 handle of a v2 data chunk, for reading it with v1 vector functions.
++ *
++ * Both handles are the same chunk: destroying it through either API destroys it for both, so destroy it once.
++ *
++ * history:
++ * - unstable: v2.0.0
++ *
++ * @param chunk The v2 data chunk.
++ * @return The v1 data chunk handle, or NULL when `chunk` is NULL.
++ */
++DUCKDB_C_API duckdb_data_chunk duckdb_v2_data_chunk_get_v1(duckdb_v2_data_chunk_handle chunk);
++
++/*!
++ * Copies a v2 logical type into a C API v1 logical type.
++ *
++ * history:
++ * - unstable: v2.0.0
++ *
++ * @param type The v2 logical type, which stays owned by the caller.
++ * @return The v1 logical type, to be destroyed with `duckdb_destroy_logical_type()`, or NULL when `type` is NULL.
++ */
++DUCKDB_C_API duckdb_logical_type duckdb_v2_logical_type_to_v1(duckdb_v2_logical_type_handle type);
 +#endif
 +
 +#ifdef __cplusplus
 +}
 +#endif
 diff --git a/src/main/capi/v2/capi_v2_connection.cpp b/src/main/capi/v2/capi_v2_connection.cpp
-index 2d88d63c..d735a385 100644
+index 2d88d63c..301870cb 100644
 --- a/src/main/capi/v2/capi_v2_connection.cpp
 +++ b/src/main/capi/v2/capi_v2_connection.cpp
 @@ -1,4 +1,5 @@
@@ -66,7 +95,7 @@ index 2d88d63c..d735a385 100644
  
  using namespace duckdb::capiv2;
  
-@@ -26,6 +27,12 @@ DUCKDB_V2_ERROR duckdb_v2_connection_destroy(duckdb_v2_connection_handle *conn)
+@@ -26,6 +27,25 @@ DUCKDB_V2_ERROR duckdb_v2_connection_destroy(duckdb_v2_connection_handle *conn)
  	});
  }
  
@@ -74,6 +103,19 @@ index 2d88d63c..d735a385 100644
 +	// A v1 connection handle is the Connection itself
 +	duckdb::Connection *connection = conn ? Convert(conn) : nullptr;
 +	return reinterpret_cast<duckdb_connection>(connection);
++}
++
++duckdb_data_chunk duckdb_v2_data_chunk_get_v1(duckdb_v2_data_chunk_handle chunk) {
++	// Both handles are the DataChunk itself
++	return reinterpret_cast<duckdb_data_chunk>(chunk ? Convert(chunk) : nullptr);
++}
++
++duckdb_logical_type duckdb_v2_logical_type_to_v1(duckdb_v2_logical_type_handle type) {
++	if (!type) {
++		return nullptr;
++	}
++	auto ref = Convert(type);
++	return reinterpret_cast<duckdb_logical_type>(new duckdb::LogicalType(*ref));
 +}
 +
  // ---------------------------------------------------------------------------
