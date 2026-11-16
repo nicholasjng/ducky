@@ -55,7 +55,8 @@ query's workers until the consumer steps; a statement that keeps the source
 order of its rows then runs mostly on the consumer's thread. Statements without
 rows are retained: they run to their end without a consumer. v2 has no call to
 retain a SELECT's result, which reading it to its end in parallel needs;
-`patches/0011-capi-v2-result-retain.patch` adds `result_retain`.
+`patches/0011-capi-v2-result-retain.patch` adds `result_retain`. See
+[What ducky needs from v2](#what-ducky-needs-from-v2).
 
 Actual concurrency still requires separate connections, created by the shared
 `Database` and pool proposed in [capi-gaps.md](capi-gaps.md).
@@ -94,32 +95,58 @@ Actual concurrency still requires separate connections, created by the shared
   `patches/0004-capi-column-is-generated.patch`), multi-file reader functions,
   and filesystem path helpers such as glob.
 
-## Gaps
+## What ducky needs from v2
 
-- V2 has no appender. `statement_add_collection` with `INSERT ... SELECT`
-  covers bulk columnar inserts, but not row-at-a-time appends or `DEFAULT`
-  handling.
-- `result_fetch_chunk` and `result_step` return a new chunk per call; nothing
-  fetches into a reused chunk, as a v1 patch ducky carried did. Allocating the
-  chunks costs a retained 10M-row result of two columns about 15% when read
-  chunk by chunk.
-- A SELECT's result cannot be retained; see
-  [Query and result ownership](#query-and-result-ownership).
-- Converting a chunk to Arrow needs a callback's context, so outside a callback
-  only the result's own Arrow format converts.
-- `connection_get_query_metrics` keeps only numeric metrics, under other names
-  (`query.total_time`, `operator.timing`) and in a tree without v1's summary
-  nodes: an operator's own name, its `extra_info` (filters, estimated
-  cardinality) and the query's SQL are gone. `ducky.profile`, the profile sink
-  and `format_profiling_info` hand v1's tree to users, so profiling stays on
-  v1.
-- Vectors have no offset-and-count reference; zero-copy windows of a chunk need
-  the Arrow importer or a patch.
-- Registering a Python-backed filesystem still needs a C++ adapter.
-- V1 and v2 handles do not convert into each other through the API.
-  `patches/0010-capi-v2-v1-bridge.patch` gets the v1 handles of a v2
-  connection and chunk, and a v1 copy of a v2 type, so v1 functions keep
-  working on a database that v2 owns.
+Ordered by what each would gain ducky. Each names the workaround ducky uses
+until then.
+
+1. **An appender.** Row-at-a-time appends with `DEFAULT` handling, and appending
+   chunks or Arrow arrays to a table. `statement_add_collection` with
+   `INSERT ... SELECT` covers bulk columnar inserts only. The appender is
+   ducky's last user of the v1 connection, and the reason the bridge
+   (`patches/0010-capi-v2-v1-bridge.patch`) exists at all.
+2. **Retaining a result.** A SELECT's result always streams: it holds at most
+   `max_streaming_buffer_size` of rows the consumer has not taken and parks the
+   workers until the consumer steps, so an order-preserving query runs mostly
+   on the consumer's thread. A heavy projection over a table, read in full,
+   takes 645 ms streamed and 173 ms retained on 8 threads.
+   `patches/0011-capi-v2-result-retain.patch` adds `result_retain`; a flag on
+   the execute functions would do as well.
+3. **Arrow conversion outside callbacks.** An Arrow exporter needs a callback's
+   context, so a chunk result cannot be converted to Arrow with v2:
+   `Result.arrow()` converts through v1 with the connection's Arrow options, on
+   the bridged chunk and types. An exporter created from a connection would
+   retire that, and with the appender, the bridge.
+4. **Profiling metrics with their text.** `connection_get_query_metrics` keeps
+   only numeric metrics. Against v1's profiling info for the same query, it
+   lacks the SQL text, each operator's own name (`SEQ_SCAN` under a
+   `TABLE_SCAN` node) and its `extra_info`, which carries the table, the pushed
+   filters, projections, aggregates and estimated cardinality: what a profile
+   is read for. Its names differ (`query.total_time`, `operator.timing`) and it
+   has no grouped summary nodes, which a format change in ducky could absorb.
+   String-valued metrics would let ducky move profiling to v2.
+5. **Fetching into a caller-owned chunk.** `result_fetch_chunk` and
+   `result_step` allocate a chunk per call. Reading a retained 10M-row result of
+   two columns chunk by chunk, or into one Arrow batch, takes 15–20% longer than
+   v1 with the fetch-into-chunk patch ducky carried. Chunks handed to Python
+   cannot be reused, so this only pays for conversions that copy each chunk
+   out: NumPy, Arrow, rows.
+6. **A wake-up for asynchronous consumers.** `result_wait` blocks a thread, so
+   an asyncio driver steps on a worker thread and hops back per tick. A callback
+   or file descriptor signalled when a step can make progress would let the
+   event loop step a result without a thread.
+7. **Prepared-statement metadata.** A prepared statement does not report its
+   parameter types or result schema; ducky keeps the parsed statement to bind it
+   again with `statement_bind`, which costs a second bind per prepare.
+8. **Smaller ones.**
+   - A vector reference to an offset and count of another vector, for
+     zero-copy windows of a chunk; ducky windows through the Arrow importer.
+   - Telling a table function's `count(*)` from a scan of its first column;
+     ducky's Arrow scan converts a column it does not read.
+   - Registering a filesystem without a C++ adapter.
+   - `value_get_ubigint` converts a query metric's DOUBLE duration, such as
+     0.0003, to 0 without an error, so a caller that tries the integer getters
+     first reads every timing as 0.
 
 ## Migration cost
 
