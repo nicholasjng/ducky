@@ -724,8 +724,12 @@ void Connection::load_extension(const std::string& name) {
 
 nb::tuple Connection::progress() const {
     std::shared_ptr<DuckDBHandle> handle = open_handle();
-    duckdb_query_progress_type p = duckdb_query_progress(handle->connection);
-    return nb::make_tuple(p.percentage, p.rows_processed, p.total_rows_to_process);
+    double percentage = -1;
+    uint64_t rows_processed = 0, total_rows_to_process = 0;
+    V2Error err;
+    err.check(duckdb_v2_connection_progress_get(handle->connection_v2, &percentage, &rows_processed,
+                                                &total_rows_to_process, err.out()));
+    return nb::make_tuple(percentage, rows_processed, total_rows_to_process);
 }
 
 namespace {
