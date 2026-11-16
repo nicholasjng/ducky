@@ -107,6 +107,12 @@ Actual concurrency still requires separate connections, created by the shared
   [Query and result ownership](#query-and-result-ownership).
 - Converting a chunk to Arrow needs a callback's context, so outside a callback
   only the result's own Arrow format converts.
+- `connection_get_query_metrics` keeps only numeric metrics, under other names
+  (`query.total_time`, `operator.timing`) and in a tree without v1's summary
+  nodes: an operator's own name, its `extra_info` (filters, estimated
+  cardinality) and the query's SQL are gone. `ducky.profile`, the profile sink
+  and `format_profiling_info` hand v1's tree to users, so profiling stays on
+  v1.
 - Vectors have no offset-and-count reference; zero-copy windows of a chunk need
   the Arrow importer or a patch.
 - Registering a Python-backed filesystem still needs a C++ adapter.
@@ -200,10 +206,11 @@ existing conversions through the bridge, and Arrow export converts with v1
 using the connection's Arrow options, since only a callback can create a v2
 exporter.
 
+`Connection.progress()` reads `connection_progress_get`, the same snapshot
+v1's `query_progress` reads.
+
 Next candidates:
 
-- Progress and profiling through `connection_progress_get` and
-  `connection_get_query_metrics`.
 - Reading chunks and types through v2 vector views, which would retire the
   chunk and type bridge.
 
