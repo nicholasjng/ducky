@@ -49,11 +49,16 @@ and `result_fetch_chunk` and `result_drain` are blocking conveniences.
 Cancellation is a status rather than an error. While a result is live, the
 connection rejects another query with `DUCKDB_V2_ERROR_RESOURCE_IN_USE`.
 
-This fits ducky's asynchronous execution better than v1, which ducky drives
-with pending results, `execute_tasks` budgets, and a sleep backoff while workers
-own the remaining tasks. Actual concurrency still requires separate
-connections, created by the shared `Database` and pool proposed in
-[capi-gaps.md](capi-gaps.md).
+A result of a SELECT always streams. A stream holds at most
+`max_streaming_buffer_size` of rows the consumer has not taken and parks the
+query's workers until the consumer steps; a statement that keeps the source
+order of its rows then runs mostly on the consumer's thread. Statements without
+rows are retained: they run to their end without a consumer. v2 has no call to
+retain a SELECT's result, which reading it to its end in parallel needs;
+`patches/0011-capi-v2-result-retain.patch` adds `result_retain`.
+
+Actual concurrency still requires separate connections, created by the shared
+`Database` and pool proposed in [capi-gaps.md](capi-gaps.md).
 
 ## Relevant additions for ducky
 
@@ -95,14 +100,20 @@ connections, created by the shared `Database` and pool proposed in
   covers bulk columnar inserts, but not row-at-a-time appends or `DEFAULT`
   handling.
 - `result_fetch_chunk` and `result_step` return a new chunk per call; nothing
-  fetches into a reused chunk as `patches/0002-capi-fetch-chunk-into.patch`
-  does for v1.
+  fetches into a reused chunk, as a v1 patch ducky carried did. Allocating the
+  chunks costs a retained 10M-row result of two columns about 15% when read
+  chunk by chunk.
+- A SELECT's result cannot be retained; see
+  [Query and result ownership](#query-and-result-ownership).
+- Converting a chunk to Arrow needs a callback's context, so outside a callback
+  only the result's own Arrow format converts.
 - Vectors have no offset-and-count reference; zero-copy windows of a chunk need
   the Arrow importer or a patch.
 - Registering a Python-backed filesystem still needs a C++ adapter.
 - V1 and v2 handles do not convert into each other through the API.
-  `patches/0010-capi-v2-v1-bridge.patch` gets the v1 handle of a v2
-  connection, so v1 functions keep working on a database that v2 owns.
+  `patches/0010-capi-v2-v1-bridge.patch` gets the v1 handles of a v2
+  connection and chunk, and a v1 copy of a v2 type, so v1 functions keep
+  working on a database that v2 owns.
 
 ## Migration cost
 
@@ -127,15 +138,11 @@ hands the v1 handles to everything not yet migrated. Because the environment
 detects file conflicts across instances, opening a file that the process
 already has open now fails; v1 opened a second instance on it.
 
-`Connection.arrow()` runs through `statement_execute_arrow` with parameters
-converted to v2 values, and steps the result to its end with the GIL released.
-Against the retired v1 collector, 10M-row results take about 10% longer. A v2
-result drains rather than retains, so `max_streaming_buffer_size` (10 MiB by
-default) caps its queued arrays and parks workers until the consumer pops one;
-with the cap lifted, v2 matches v1. Lifting the cap for each Arrow query
-through the connection's config would recover this. A trivial query takes about
-64 µs instead of 31 µs because each call parses and plans again; a v2
-prepared-statement cache would recover that.
+`Connection.arrow()` runs through `prepared_statement_execute_arrow` on the
+cached statement of the query, with parameters converted to v2 values, retains
+the result (patch 0011) and steps it to its end with the GIL released. A trivial
+query takes 33 µs, as with v1's collector, and 10M rows of two columns take
+28 ms.
 
 The appender reads its target's columns through `connection_describe_table`,
 which reports generated columns, and the Arrow scan is a v2 table function and
@@ -164,12 +171,40 @@ aggregates. A v2 aggregate's destroy callback is documented to run only on
 states discarded without being finalized, but it is the engine's state
 destructor, as v1's is, so it runs on every state.
 
+Queries run through v2 prepared statements, cached per query text as before;
+`PreparedStatement` holds one too. A cached statement keeps the parameter types
+its plan assumed, read once with `statement_bind`, and executions convert ints
+and floats to them, so a plan is reused instead of bound again: a
+parameterized INSERT takes 76 µs instead of 152. v2 binds each execution's
+values afresh, so nothing carries over between executemany rows.
+
+A materialized result runs to its end with the GIL released, its result
+retained (patch 0011) and stepped into chunks that the `Result` then hands out
+without copying. Retaining matters: a heavy projection over a table read in
+full took 645 ms streamed and takes 173 ms retained, on 8 threads. A streaming
+result runs as it is fetched, so runtime errors surface on fetch, as with v1.
+Async queries step the same way: `execute_tasks` runs steps and waits in
+`result_wait` while workers own the remaining tasks, replacing v1's pending
+results and the sleep backoff. Interrupting is v2's `connection_interrupt`,
+which a result reports as cancelled rather than failed.
+
+Against v1, materialized and streaming reads of 10M rows match or are faster
+(a streaming `to_numpy` takes 30 ms instead of 46), except that reading a
+retained result chunk by chunk or as one Arrow batch takes 15–20% longer: v2
+allocates each chunk, where ducky's v1 patch fetched into a reused one. A
+trivial query takes 34 µs instead of 30; most of a query's time goes to waking
+DuckDB's workers for its few tasks and waiting for them, as v1 also did.
+
+Rows are still read through v1: the result's chunks and types reach the
+existing conversions through the bridge, and Arrow export converts with v1
+using the connection's Arrow options, since only a callback can create a v2
+exporter.
+
 Next candidates:
 
-- `result_step` for the asynchronous driver, replacing pending results, the
-  `execute_tasks` budget, and the sleep backoff.
-- Query execution and results, which would leave the v1 connection to the
-  appender alone.
+- Progress and profiling through `connection_progress_get` and
+  `connection_get_query_metrics`.
+- Reading chunks and types through v2 vector views, which would retire the
+  chunk and type bridge.
 
-Patch 0002 (fetch into a reused chunk) has no v2 replacement. Patch 0008
-changes the engine and applies to both APIs.
+Patch 0008 changes the engine and applies to both APIs.

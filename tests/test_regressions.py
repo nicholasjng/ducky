@@ -418,6 +418,19 @@ def test_open_streaming_result_holds_the_connection(con):
     assert con.sql("SELECT 42").fetchitem() == 42
 
 
+def test_unread_materialized_result_frees_the_connection(con):
+    res = con.sql("SELECT * FROM range(100000)")
+    assert con.execute("SELECT 42").fetchone() == (42,)
+    assert len(res.fetchall()) == 100000
+
+
+def test_streaming_statement_without_rows_runs_to_its_end(con):
+    con.execute("CREATE TABLE t (a INTEGER)")
+    res = con.sql("INSERT INTO t VALUES (1), (2)", streaming=True)
+    assert res.rows_changed == 2
+    assert con.sql("SELECT count(*) FROM t").fetchitem() == 2
+
+
 def test_execute_replaces_open_streaming_result(con):
     con.execute("SELECT * FROM range(100000)", streaming=True)
     assert con.fetchone() == (0,)

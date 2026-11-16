@@ -70,6 +70,15 @@ def test_result_schema_and_statement_type_before_execution(con):
     assert ins.columns == ["Count"]
 
 
+def test_statement_expanding_into_several_has_no_schema_before_execution(con):
+    con.execute("CREATE TABLE t (a INTEGER)")
+    con.execute("INSERT INTO t VALUES (1), (2)")
+    stmt = con.prepare("PIVOT t ON a USING count(*)")
+    assert stmt.statement_type == "MULTI"
+    assert stmt.columns == []
+    assert stmt.execute().fetchall() == [(1, 1)]
+
+
 def test_execute_no_parameters(con):
     stmt = con.prepare("SELECT 42")
     assert stmt.num_parameters == 0

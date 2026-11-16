@@ -105,6 +105,11 @@ def test_bind_named_parameters(con):
     assert got == (7, 12)
 
 
+def test_bind_named_parameters_match_case_insensitively(con):
+    assert con.execute("SELECT $Value + 1", {"value": 41}).fetchitem() == 42
+    assert con.execute("SELECT $value + 1", {"VALUE": 41}).fetchitem() == 42
+
+
 def test_bind_named_unknown_key(con):
     with pytest.raises(ducky.Error, match="unknown named parameter"):
         con.execute("SELECT $a", {"missing": 1})

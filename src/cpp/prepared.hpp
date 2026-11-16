@@ -6,82 +6,132 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "database.hpp"
-#include "duckdb.h"
 #include "result.hpp"
+#include "v2.hpp"
 
 namespace nb = nanobind;
 
-// Human-readable name for a duckdb_statement_type. Mirrors the enum in
-// duckdb.h; unknown values fall back to "UNKNOWN".
-inline const char* duckdb_statement_type_name(duckdb_statement_type type) {
+// Human-readable name for a statement type; unknown values fall back to
+// "UNKNOWN".
+inline const char* statement_type_name(DUCKDB_V2_STATEMENT_TYPE type) {
     switch (type) {
-        case DUCKDB_STATEMENT_TYPE_SELECT:
+        case DUCKDB_V2_STATEMENT_TYPE_SELECT:
             return "SELECT";
-        case DUCKDB_STATEMENT_TYPE_INSERT:
+        case DUCKDB_V2_STATEMENT_TYPE_INSERT:
             return "INSERT";
-        case DUCKDB_STATEMENT_TYPE_UPDATE:
+        case DUCKDB_V2_STATEMENT_TYPE_UPDATE:
             return "UPDATE";
-        case DUCKDB_STATEMENT_TYPE_EXPLAIN:
-            return "EXPLAIN";
-        case DUCKDB_STATEMENT_TYPE_DELETE:
-            return "DELETE";
-        case DUCKDB_STATEMENT_TYPE_PREPARE:
-            return "PREPARE";
-        case DUCKDB_STATEMENT_TYPE_CREATE:
+        case DUCKDB_V2_STATEMENT_TYPE_CREATE:
             return "CREATE";
-        case DUCKDB_STATEMENT_TYPE_EXECUTE:
+        case DUCKDB_V2_STATEMENT_TYPE_DELETE:
+            return "DELETE";
+        case DUCKDB_V2_STATEMENT_TYPE_PREPARE:
+            return "PREPARE";
+        case DUCKDB_V2_STATEMENT_TYPE_EXECUTE:
             return "EXECUTE";
-        case DUCKDB_STATEMENT_TYPE_ALTER:
+        case DUCKDB_V2_STATEMENT_TYPE_ALTER:
             return "ALTER";
-        case DUCKDB_STATEMENT_TYPE_TRANSACTION:
+        case DUCKDB_V2_STATEMENT_TYPE_TRANSACTION:
             return "TRANSACTION";
-        case DUCKDB_STATEMENT_TYPE_COPY:
+        case DUCKDB_V2_STATEMENT_TYPE_COPY:
             return "COPY";
-        case DUCKDB_STATEMENT_TYPE_ANALYZE:
+        case DUCKDB_V2_STATEMENT_TYPE_ANALYZE:
             return "ANALYZE";
-        case DUCKDB_STATEMENT_TYPE_VARIABLE_SET:
+        case DUCKDB_V2_STATEMENT_TYPE_VARIABLE_SET:
             return "VARIABLE_SET";
-        case DUCKDB_STATEMENT_TYPE_CREATE_FUNC:
+        case DUCKDB_V2_STATEMENT_TYPE_CREATE_FUNC:
             return "CREATE_FUNC";
-        case DUCKDB_STATEMENT_TYPE_DROP:
+        case DUCKDB_V2_STATEMENT_TYPE_EXPLAIN:
+            return "EXPLAIN";
+        case DUCKDB_V2_STATEMENT_TYPE_DROP:
             return "DROP";
-        case DUCKDB_STATEMENT_TYPE_EXPORT:
+        case DUCKDB_V2_STATEMENT_TYPE_EXPORT:
             return "EXPORT";
-        case DUCKDB_STATEMENT_TYPE_PRAGMA:
+        case DUCKDB_V2_STATEMENT_TYPE_PRAGMA:
             return "PRAGMA";
-        case DUCKDB_STATEMENT_TYPE_VACUUM:
+        case DUCKDB_V2_STATEMENT_TYPE_VACUUM:
             return "VACUUM";
-        case DUCKDB_STATEMENT_TYPE_CALL:
+        case DUCKDB_V2_STATEMENT_TYPE_CALL:
             return "CALL";
-        case DUCKDB_STATEMENT_TYPE_SET:
+        case DUCKDB_V2_STATEMENT_TYPE_SET:
             return "SET";
-        case DUCKDB_STATEMENT_TYPE_LOAD:
+        case DUCKDB_V2_STATEMENT_TYPE_LOAD:
             return "LOAD";
-        case DUCKDB_STATEMENT_TYPE_RELATION:
+        case DUCKDB_V2_STATEMENT_TYPE_RELATION:
             return "RELATION";
-        case DUCKDB_STATEMENT_TYPE_EXTENSION:
+        case DUCKDB_V2_STATEMENT_TYPE_EXTENSION:
             return "EXTENSION";
-        case DUCKDB_STATEMENT_TYPE_LOGICAL_PLAN:
+        case DUCKDB_V2_STATEMENT_TYPE_LOGICAL_PLAN:
             return "LOGICAL_PLAN";
-        case DUCKDB_STATEMENT_TYPE_ATTACH:
+        case DUCKDB_V2_STATEMENT_TYPE_ATTACH:
             return "ATTACH";
-        case DUCKDB_STATEMENT_TYPE_DETACH:
+        case DUCKDB_V2_STATEMENT_TYPE_DETACH:
             return "DETACH";
-        case DUCKDB_STATEMENT_TYPE_MULTI:
+        case DUCKDB_V2_STATEMENT_TYPE_MULTI:
             return "MULTI";
+        case DUCKDB_V2_STATEMENT_TYPE_COPY_DATABASE:
+            return "COPY_DATABASE";
+        case DUCKDB_V2_STATEMENT_TYPE_UPDATE_EXTENSIONS:
+            return "UPDATE_EXTENSIONS";
+        case DUCKDB_V2_STATEMENT_TYPE_MERGE_INTO:
+            return "MERGE_INTO";
+        case DUCKDB_V2_STATEMENT_TYPE_CONNECT:
+            return "CONNECT";
+        case DUCKDB_V2_STATEMENT_TYPE_DISCONNECT:
+            return "DISCONNECT";
+        case DUCKDB_V2_STATEMENT_TYPE_EXTERNAL_RESOURCE:
+            return "EXTERNAL_RESOURCE";
+        case DUCKDB_V2_STATEMENT_TYPE_PASSTHROUGH:
+            return "PASSTHROUGH";
         default:
             return "UNKNOWN";
     }
 }
 
+// A C API v2 prepared statement of one SQL statement, with the parameter
+// types its plan assumed.
+class V2Prepared {
+   public:
+    // Parses and prepares `query`, which must hold exactly one statement.
+    // Raises DuckyError with DuckDB's message on failure.
+    V2Prepared(duckdb_v2_connection_handle con, const std::string& query);
+    ~V2Prepared();
+
+    V2Prepared(const V2Prepared&) = delete;
+    V2Prepared& operator=(const V2Prepared&) = delete;
+
+    duckdb_v2_prepared_statement_handle get() const { return prepared_; }
+    // The type of the statement as written.
+    DUCKDB_V2_STATEMENT_TYPE type() const { return type_; }
+    // Binding keys in binding order: "1", "2", ... for positional
+    // parameters, the name for named ones.
+    const std::vector<std::string>& parameter_names() const { return parameter_names_; }
+    // The position of parameter `key` in parameter_names(), or -1.
+    int64_t parameter_index(const std::string& key) const;
+    // The type the plan assumed for parameter `key`, or INVALID when it is
+    // unresolved. A value of that type reuses the plan.
+    DUCKDB_V2_LOGICAL_TYPE_ID planned_type(const std::string& key) const;
+    // The statement's result columns as (name, type name) pairs, or none for
+    // a statement that expands into several. Binds without the GIL.
+    std::vector<std::pair<std::string, std::string>> columns(duckdb_v2_connection_handle con) const;
+
+   private:
+    duckdb_v2_sql_statement_handle sql_ = nullptr;
+    duckdb_v2_prepared_statement_handle prepared_ = nullptr;
+    DUCKDB_V2_STATEMENT_TYPE type_ = DUCKDB_V2_STATEMENT_TYPE_INVALID;
+    std::vector<std::string> parameter_names_;
+    std::vector<DUCKDB_V2_LOGICAL_TYPE_ID> parameter_types_;
+};
+
 // A reusable prepared statement sharing its connection handle.
 class PreparedStatement {
    public:
     // `stmt` was prepared from `query` at Arrow registration `arrow_generation`.
-    PreparedStatement(duckdb_prepared_statement stmt, std::shared_ptr<DuckDBHandle> handle,
+    PreparedStatement(std::unique_ptr<V2Prepared> stmt, std::shared_ptr<DuckDBHandle> handle,
                       std::string query, uint64_t arrow_generation);
     ~PreparedStatement();
 
@@ -98,15 +148,15 @@ class PreparedStatement {
     // Number of bind parameters in the statement.
     int64_t num_parameters() const;
     // Name of the parameter at `index` (1-based, matching DuckDB), or None if
-    // the index is out of range or the parameter is positional/unnamed.
+    // the index is out of range. A positional parameter's name is its index.
     nb::object parameter_name(int64_t index) const;
 
-    // Result schema known ahead of execution (empty for non-result statements).
+    // Result schema known ahead of execution (empty for a statement that
+    // expands into several).
     std::vector<std::string> column_names() const;
     std::vector<std::string> column_types() const;
 
-    // The kind of statement (SELECT / INSERT / ...); see
-    // duckdb_statement_type_name.
+    // The kind of statement (SELECT / INSERT / ...); see statement_type_name.
     std::string statement_type() const;
 
     void close();
@@ -118,11 +168,11 @@ class PreparedStatement {
     std::unique_lock<std::mutex> lock_valid() const;
 
     // Replaced when the statement prepares again; still logically const.
-    mutable duckdb_prepared_statement stmt_ = nullptr;
+    mutable std::unique_ptr<V2Prepared> stmt_;
     std::shared_ptr<DuckDBHandle> handle_;
     std::string query_;
     mutable uint64_t arrow_generation_ = 0;
-    // Guards stmt_ and its bindings. Executions run with the GIL released, so
-    // nb::lock_self alone doesn't keep close() or a rebind out of them.
+    // Guards stmt_. Executions run with the GIL released, so nb::lock_self
+    // alone doesn't keep close() or a re-prepare out of them.
     mutable std::mutex mu_;
 };
