@@ -113,10 +113,11 @@ until then.
    `patches/0011-capi-v2-result-retain.patch` adds `result_retain`; a flag on
    the execute functions would do as well.
 3. **Arrow conversion outside callbacks.** An Arrow exporter needs a callback's
-   context, so a chunk result cannot be converted to Arrow with v2:
-   `Result.arrow()` converts through v1 with the connection's Arrow options, on
-   the bridged chunk and types. An exporter created from a connection would
-   retire that, and with the appender, the bridge.
+   context, so a chunk result cannot be converted to Arrow with v2.
+   `patches/0014-capi-v2-connection-arrow-exporter.patch` adds
+   `connection_create_arrow_exporter`, which takes the connection's settings
+   instead; lending out a connection's context would do as well, if the
+   functions taking a context entered a transaction of their own.
 4. **Profiling metrics with their text.** `connection_get_query_metrics` keeps
    only numeric metrics. Against v1's profiling info for the same query, it
    lacks the SQL text, each operator's own name (`SEQ_SCAN` under a
@@ -232,9 +233,10 @@ trivial query takes 34 µs instead of 30; most of a query's time goes to waking
 DuckDB's workers for its few tasks and waiting for them, as v1 also did.
 
 Rows are still read through v1: the result's chunks and types reach the
-existing conversions through the bridge, and Arrow export converts with v1
-using the connection's Arrow options, since only a callback can create a v2
-exporter.
+existing conversions through the bridge. Arrow export converts the chunks with
+an exporter created from the connection (patch 0014), which pins the
+connection's Arrow settings when the stream is created; it matches v1's speed
+and `Connection.arrow()`'s output.
 
 `Connection.progress()` reads `connection_progress_get`, the same snapshot
 v1's `query_progress` reads.

@@ -90,7 +90,6 @@ class Result {
     const std::vector<std::string>& column_names() const { return schema_->names; }
     std::vector<std::string> column_types() const;
     // Owned by the Result.
-    const std::vector<duckdb_logical_type>& column_logical_types() const { return column_types_; }
     // PEP 249 Cursor.description: one 7-tuple per column, or None when the
     // statement produced no result set.
     nb::object description() const;
@@ -171,6 +170,8 @@ class Result {
     // Per-column logical types, owned for the Result's lifetime so the row
     // decoder doesn't allocate one per cell (a column's type is constant).
     std::vector<duckdb_logical_type> column_types_;
+    // The result's v2 schema, which Arrow export creates its exporter from.
+    duckdb_v2_schema_handle schema_v2_ = nullptr;
 
     // Per-column state for the current chunk.
     struct ColumnCursor {

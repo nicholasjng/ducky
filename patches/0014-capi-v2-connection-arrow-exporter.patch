@@ -1,0 +1,187 @@
+Add duckdb_v2_connection_create_arrow_exporter: export Arrow outside callbacks
+
+A C API v2 Arrow exporter is created from a context, which v2 hands out only
+inside callbacks. A client holding a result's chunks has no v2 way to convert
+them to Arrow with its connection's settings, and falls back to v1's
+duckdb_connection_get_arrow_options and duckdb_data_chunk_to_arrow. An exporter
+reads only the client and database config, the Arrow settings and the
+registered Arrow extension types, so nothing ties it to a callback.
+
+  - duckdb_v2_connection_create_arrow_exporter(conn, ...): the same exporter as
+    duckdb_v2_arrow_exporter_create(), with the connection's settings. It holds
+    the connection's client context, which its settings point at, so it may
+    outlive the connection handle. In duckdb_v2_connection_arrow_exporter.h.
+  - Creation is shared with duckdb_v2_arrow_exporter_create().
+
+A connection's context handle could be lent out instead, but other context
+functions (the Arrow importer, statistics checks) use it without entering a
+transaction, which callbacks provide and a connection does not.
+
+Note for upstreaming: duckdb_v2.h is generated; an upstream PR would add this
+to its generator's definitions.
+diff --git a/src/include/duckdb_v2_connection_arrow_exporter.h b/src/include/duckdb_v2_connection_arrow_exporter.h
+new file mode 100644
+index 00000000..be94dd57
+--- /dev/null
++++ b/src/include/duckdb_v2_connection_arrow_exporter.h
+@@ -0,0 +1,53 @@
++//===----------------------------------------------------------------------===//
++//
++//                         DuckDB
++//
++// duckdb_v2_connection_arrow_exporter.h
++//
++//
++//===----------------------------------------------------------------------===//
++
++#pragma once
++
++#include "duckdb_v2.h"
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#if DUCKDB_V2_API_ALLOW_UNSTABLE
++/*!
++ * Creates an exporter for one fixed list of columns, with the connection's Arrow settings; see
++ * `duckdb_v2_arrow_exporter_create()`, which takes a callback's context instead. Converts the chunks of a result outside
++ * any callback.
++ *
++ * Captures the connection's Arrow settings, so every array this exporter produces matches the schema
++ * `duckdb_v2_arrow_exporter_get_schema()` reports, even if a setting changes afterwards. Needs no transaction. The
++ * exporter keeps the connection's session alive, so it may outlive the connection handle.
++ *
++ * history:
++ * - unstable: v2.0.0
++ *
++ * @param conn The connection whose Arrow settings are captured.
++ * @param types An array of `count` column types. May be NULL only when `count` is 0.
++ * @param names An array of `count` column names, parallel to `types`. Each name must be valid UTF-8. May be NULL only
++ * when `count` is 0.
++ * @param names_lengths Byte lengths of the entries in `names`; element i is the length of `names[i]`. May be NULL only
++ * when `names` is NULL.
++ * @param count The number of columns, being the length of both `types` and `names`.
++ * @param batch_size Maximum rows per produced array, or 0 for no maximum: each chunk becomes one array.
++ * @param out_exporter On success, receives the new exporter. Owned by the caller; destroy via
++ * `duckdb_v2_arrow_exporter_destroy()`.
++ * @param err Optional. On failure, receives an opaque info handle the caller must destroy via
++ * `duckdb_v2_error_info_destroy()`.
++ * @return DUCKDB_V2_ERROR
++ */
++DUCKDB_C_API DUCKDB_V2_ERROR duckdb_v2_connection_create_arrow_exporter(
++    duckdb_v2_connection_handle conn, const duckdb_v2_logical_type_handle *types, const char **names,
++    const idx_t *names_lengths, idx_t count, idx_t batch_size, duckdb_v2_arrow_exporter_handle *out_exporter,
++    duckdb_v2_error_info_handle *err);
++#endif
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/src/main/capi/v2/capi_v2_arrow.cpp b/src/main/capi/v2/capi_v2_arrow.cpp
+index f305b7b1..8219ecc5 100644
+--- a/src/main/capi/v2/capi_v2_arrow.cpp
++++ b/src/main/capi/v2/capi_v2_arrow.cpp
+@@ -1,4 +1,5 @@
+ #include "duckdb/main/capi_v2/capi_v2_result_internal.hpp"
++#include "duckdb_v2_connection_arrow_exporter.h"
+ #include "duckdb_v2_result_retain.h"
+ 
+ #include "duckdb/common/arrow/arrow_appender.hpp"
+@@ -88,6 +89,9 @@ public:
+ 	unordered_map<idx_t, const shared_ptr<ArrowTypeExtensionData>> extension_types;
+ 	//! The most rows an array may hold; 0 means no maximum.
+ 	idx_t batch_size = 0;
++	//! The context `properties` points at, held by an exporter created from a connection so it outlives a
++	//! disconnect. One created from a callback's context borrows it.
++	shared_ptr<ClientContext> context;
+ 
+ 	//! Live while rows have been gathered but not yet finalized into an array.
+ 	unique_ptr<ArrowAppender> appender;
+@@ -495,6 +499,36 @@ DUCKDB_V2_ERROR duckdb_v2_arrow_importer_destroy(duckdb_v2_arrow_importer_handle
+ // arrow_exporter
+ //----------------------------------------------------------------------------------------------------------------------
+ 
++namespace duckdb::capiv2 {
++namespace {
++
++unique_ptr<CV2ArrowExporter> CreateArrowExporter(ClientContext &ctx, const duckdb_v2_logical_type_handle *types,
++                                                 const char **names, const idx_t *names_lengths, idx_t count,
++                                                 idx_t batch_size) {
++	auto exporter = make_uniq<CV2ArrowExporter>();
++	exporter->batch_size = batch_size;
++	exporter->types.reserve(count);
++	exporter->names.reserve(count);
++	string_view_array name_views(names, names_lengths, count);
++	for (idx_t i = 0; i < count; i++) {
++		if (!types[i]) {
++			throw InvalidInputException("null logical type at index %llu", i);
++		}
++		auto type = Convert(types[i]);
++		exporter->types.push_back(*type);
++		exporter->names.emplace_back(name_views[i]);
++	}
++	// Pin the settings and the extension map now: the schema below and every array this exporter produces are built
++	// from them, which is what keeps the two consistent. Both come from the client and database config, so no
++	// transaction is needed.
++	exporter->properties = ctx.GetClientProperties();
++	exporter->extension_types = ArrowTypeExtensionData::GetExtensionTypes(ctx, exporter->types);
++	return exporter;
++}
++
++} // namespace
++} // namespace duckdb::capiv2
++
+ DUCKDB_V2_ERROR duckdb_v2_arrow_exporter_create(duckdb_v2_context_handle context,
+                                                 const duckdb_v2_logical_type_handle *types, const char **names,
+                                                 const idx_t *names_lengths, idx_t count, idx_t batch_size,
+@@ -510,24 +544,31 @@ DUCKDB_V2_ERROR duckdb_v2_arrow_exporter_create(duckdb_v2_context_handle context
+ 		return NullArgumentError(err, __func__, "names");
+ 	}
+ 	return WithErrorHandler(err, [&]() {
+-		auto &ctx = Convert(context)->context;
+-		auto exporter = duckdb::make_uniq<CV2ArrowExporter>();
+-		exporter->batch_size = batch_size;
+-		exporter->types.reserve(count);
+-		exporter->names.reserve(count);
+-		string_view_array name_views(names, names_lengths, count);
+-		for (idx_t i = 0; i < count; i++) {
+-			if (!types[i]) {
+-				throw duckdb::InvalidInputException("null logical type at index %llu", i);
+-			}
+-			auto type = Convert(types[i]);
+-			exporter->types.push_back(*type);
+-			exporter->names.emplace_back(name_views[i]);
+-		}
+-		// Pin the settings and the extension map now: the schema below and every array this exporter produces are built
+-		// from them, which is what keeps the two consistent.
+-		exporter->properties = ctx.GetClientProperties();
+-		exporter->extension_types = duckdb::ArrowTypeExtensionData::GetExtensionTypes(ctx, exporter->types);
++		auto exporter =
++		    CreateArrowExporter(Convert(context)->context, types, names, names_lengths, count, batch_size);
++		*out_exporter = Convert(exporter.release());
++	});
++}
++
++DUCKDB_V2_ERROR duckdb_v2_connection_create_arrow_exporter(duckdb_v2_connection_handle conn,
++                                                           const duckdb_v2_logical_type_handle *types,
++                                                           const char **names, const idx_t *names_lengths, idx_t count,
++                                                           idx_t batch_size,
++                                                           duckdb_v2_arrow_exporter_handle *out_exporter,
++                                                           duckdb_v2_error_info_handle *err) {
++	DUCKDB_CHECK_ARG(conn);
++	DUCKDB_CHECK_ARG(out_exporter);
++	*out_exporter = nullptr;
++	if (count > 0 && !types) {
++		return NullArgumentError(err, __func__, "types");
++	}
++	if (count > 0 && !names) {
++		return NullArgumentError(err, __func__, "names");
++	}
++	return WithErrorHandler(err, [&]() {
++		auto &context = Convert(conn)->context;
++		auto exporter = CreateArrowExporter(*context, types, names, names_lengths, count, batch_size);
++		exporter->context = context;
+ 		*out_exporter = Convert(exporter.release());
+ 	});
+ }

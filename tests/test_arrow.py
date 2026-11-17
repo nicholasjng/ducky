@@ -186,3 +186,28 @@ def test_empty_result_emits_no_rows(con) -> None:
     tbl = con.execute("SELECT i::INT v FROM range(10) s(i) WHERE i < 0").arrow()
     assert tbl.num_rows == 0
     assert tbl.column_names == ["v"]
+
+
+def test_result_export_matches_born_as_arrow(con) -> None:
+    con.execute("SET arrow_output_version='1.4'")
+    con.execute("SET produce_arrow_string_view=true")
+    q = (
+        "SELECT i, 'v' || i s, (i * 1.5)::DECIMAL(18,3) d, [i] l, {'a': i} st, "
+        "INTERVAL (i) DAY iv FROM range(5000) r(i) ORDER BY i"
+    )
+    exported = con.sql(q).arrow()
+    assert exported.schema.field("s").type == "string_view"
+    assert exported.equals(con.arrow(q))
+
+
+def test_result_export_keeps_settings_and_outlives_close(con) -> None:
+    import pyarrow as pa
+
+    con.execute("SET arrow_output_version='1.4'")
+    con.execute("SET produce_arrow_string_view=true")
+    reader = con.sql("SELECT 'v' || i s FROM range(5000) r(i)").arrow_batches()
+    con.execute("RESET produce_arrow_string_view")
+    con.close()
+    table = reader.read_all()
+    assert table.schema.field("s").type == pa.string_view()
+    assert table.num_rows == 5000

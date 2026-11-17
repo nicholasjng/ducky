@@ -443,12 +443,12 @@ size_t fast_arrow_width(duckdb_type t) {
 // Arrow stream state for a Result. Callbacks may run on any thread, with or
 // without the GIL; they only touch the Result through its cursor lock.
 struct ArrowStreamState {
-    nb::object owner;              // keeps the Result alive
-    Result* result;                // borrowed from owner
-    duckdb_arrow_options options;  // owned by the stream, destroyed on release
-    bool fast;                     // all columns eligible -> one hand-built batch
-    bool done;                     // fast path emits exactly one combined batch
-    std::vector<size_t> widths;    // per-column element width (fast path only)
+    nb::object owner;                          // keeps the Result alive
+    Result* result;                            // borrowed from owner
+    duckdb_v2_arrow_exporter_handle exporter;  // owned by the stream, destroyed on release
+    bool fast;                                 // all columns eligible -> one hand-built batch
+    bool done;                                 // fast path emits exactly one combined batch
+    std::vector<size_t> widths;                // per-column element width (fast path only)
     std::string last_error;
 };
 
@@ -490,13 +490,11 @@ struct ChunkList {
     }
 };
 
-// Record + destroy a duckdb_error_data; returns true when an error was present.
-bool consume_error(ArrowStreamState* state, duckdb_error_data error) {
-    if (!error) return false;
-    bool has_error = duckdb_error_data_has_error(error);
-    if (has_error) state->last_error = duckdb_error_data_message(error);
-    duckdb_destroy_error_data(&error);
-    return has_error;
+// Records the error of a failed exporter call; returns true when it failed.
+bool consume_error(ArrowStreamState* state, DUCKDB_V2_ERROR code, const V2Error& err) {
+    if (code == DUCKDB_V2_ERROR_NONE) return false;
+    state->last_error = err.text();
+    return true;
 }
 
 // Owns all buffers and child structures for one record batch.
@@ -583,13 +581,9 @@ void finish_fast_batch(std::unique_ptr<FastBatch> b, ArrowArray* out, idx_t tota
 
 int stream_get_schema(ArrowArrayStream* stream, ArrowSchema* out) {
     auto* state = (ArrowStreamState*)stream->private_data;
-    const Result& result = *state->result;
-    std::vector<duckdb_logical_type> types = result.column_logical_types();
-    std::vector<const char*> names;
-    for (const std::string& name : result.column_names()) names.push_back(name.c_str());
-    duckdb_error_data error =
-        duckdb_to_arrow_schema(state->options, types.data(), names.data(), names.size(), out);
-    return consume_error(state, error) ? EIO : 0;
+    V2Error err;
+    DUCKDB_V2_ERROR code = duckdb_v2_arrow_exporter_get_schema(state->exporter, out, err.out());
+    return consume_error(state, code, err) ? EIO : 0;
 }
 
 // Build one combined batch from exactly `total` remaining rows.
@@ -685,8 +679,15 @@ int stream_get_next(ArrowArrayStream* stream, ArrowArray* out) {
         // Convert one DuckDB chunk into Arrow-owned buffers.
         OwnedChunk chunk(state->result->take_chunk_locked());
         if (!chunk.chunk) return 0;  // exhausted
-        duckdb_error_data error = duckdb_data_chunk_to_arrow(state->options, chunk.chunk, out);
-        return consume_error(state, error) ? EIO : 0;
+        // Without a batch size, the chunk comes out as one array.
+        duckdb_v2_data_chunk_handle input = duckdb_data_chunk_get_v2(chunk.chunk);
+        V2Error err;
+        DUCKDB_V2_ERROR code = duckdb_v2_arrow_exporter_append(
+            state->exporter, &input, /*consume=*/false, /*flush=*/false, err.out());
+        if (code == DUCKDB_V2_ERROR_NONE) {
+            code = duckdb_v2_arrow_exporter_next_array(state->exporter, out, err.out());
+        }
+        return consume_error(state, code, err) ? EIO : 0;
     } catch (const std::exception& e) {
         if (out->release) out->release(out);
         state->last_error = e.what();
@@ -702,7 +703,7 @@ const char* stream_get_last_error(ArrowArrayStream* stream) {
 void stream_release(ArrowArrayStream* stream) {
     auto* state = (ArrowStreamState*)stream->private_data;
     if (state) {
-        if (state->options) duckdb_destroy_arrow_options(&state->options);
+        duckdb_v2_arrow_exporter_destroy(&state->exporter);
         nb::gil_scoped_acquire gil;  // drop the owner reference under the GIL
         delete state;
     }
@@ -831,12 +832,26 @@ bool Execution::run(std::chrono::steady_clock::time_point deadline) {
 }
 
 nb::object Result::arrow_c_stream(nb::object self, bool allow_fast) {
-    if (!handle_ || !handle_->connection) {
+    if (!handle_ || !handle_->connection_v2) {
         throw DuckyError("ducky: Arrow export is unavailable; the connection is closed");
     }
-    // Stream-owned conversion options: the connection's Arrow settings.
-    duckdb_arrow_options options = nullptr;
-    duckdb_connection_get_arrow_options(handle_->connection, &options);
+    // A stream-owned exporter with the connection's Arrow settings.
+    std::vector<duckdb_v2_logical_type_handle> field_types(column_count_);
+    std::vector<const char*> field_names(column_count_);
+    std::vector<idx_t> field_lengths(column_count_);
+    V2Error err;
+    DUCKDB_V2_ERROR code = DUCKDB_V2_ERROR_NONE;
+    for (idx_t c = 0; c < column_count_ && code == DUCKDB_V2_ERROR_NONE; ++c) {
+        code = duckdb_v2_schema_get_field(schema_v2_, c, &field_names[c], &field_lengths[c],
+                                          &field_types[c], err.out());
+    }
+    duckdb_v2_arrow_exporter_handle exporter = nullptr;
+    if (code == DUCKDB_V2_ERROR_NONE) {
+        code = duckdb_v2_connection_create_arrow_exporter(
+            handle_->connection_v2, field_types.data(), field_names.data(), field_lengths.data(),
+            column_count_, /*batch_size=*/0, &exporter, err.out());
+    }
+    err.check(code, "ducky: Arrow export failed: ");
 
     // Combine only bit-compatible layouts when permitted.
     std::vector<size_t> widths(column_count_);
@@ -848,13 +863,13 @@ nb::object Result::arrow_c_stream(nb::object self, bool allow_fast) {
 
     auto* stream = (ArrowArrayStream*)calloc(1, sizeof(ArrowArrayStream));
     if (!stream) {
-        if (options) duckdb_destroy_arrow_options(&options);
+        duckdb_v2_arrow_exporter_destroy(&exporter);
         throw std::bad_alloc();
     }
     auto* state = new ArrowStreamState{};
     state->owner = self;
     state->result = this;
-    state->options = options;
+    state->exporter = exporter;
     state->fast = fast;
     state->done = false;
     state->widths = std::move(widths);
@@ -906,11 +921,12 @@ Result::Result(Execution& execution, std::shared_ptr<DuckDBHandle> handle)
         column_types_.push_back(logical);
         types_.push_back(duckdb_get_type_id(logical));
     }
-    duckdb_v2_schema_destroy(&schema_handle);
     if (code != DUCKDB_V2_ERROR_NONE) {
+        duckdb_v2_schema_destroy(&schema_handle);
         for (duckdb_logical_type& logical : column_types_) duckdb_destroy_logical_type(&logical);
         err.check(code);
     }
+    schema_v2_ = schema_handle;
     schema_ = std::move(schema);
 
     // Take the chunks; a running streaming query stays with the Result.
@@ -938,6 +954,7 @@ Result::~Result() {
     for (duckdb_logical_type& logical : column_types_) {
         if (logical) duckdb_destroy_logical_type(&logical);
     }
+    duckdb_v2_schema_destroy(&schema_v2_);
     destroy_v2_result(stream_);
 }
 
