@@ -5,6 +5,7 @@
 #include <utility>
 
 #include "duckdb_v2_bridge.h"
+#include "duckdb_v2_prepared_statement_metadata.h"
 #include "duckdb_v2_result_retain.h"
 #include "ducky.hpp"
 

@@ -116,11 +116,10 @@ class V2Prepared {
     // unresolved. A value of that type reuses the plan.
     DUCKDB_V2_LOGICAL_TYPE_ID planned_type(const std::string& key) const;
     // The statement's result columns as (name, type name) pairs, or none for
-    // a statement that expands into several. Binds without the GIL.
-    std::vector<std::pair<std::string, std::string>> columns(duckdb_v2_connection_handle con) const;
+    // a statement that expands into several.
+    std::vector<std::pair<std::string, std::string>> columns() const;
 
    private:
-    duckdb_v2_sql_statement_handle sql_ = nullptr;
     duckdb_v2_prepared_statement_handle prepared_ = nullptr;
     DUCKDB_V2_STATEMENT_TYPE type_ = DUCKDB_V2_STATEMENT_TYPE_INVALID;
     std::vector<std::string> parameter_names_;

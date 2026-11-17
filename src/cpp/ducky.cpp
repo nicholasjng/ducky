@@ -330,11 +330,11 @@ NB_MODULE(_core, m) {
              "out-of-range.",
              nb::lock_self())
         .def_prop_ro("columns", &PreparedStatement::column_names,
-                     "Result column names, known ahead of execution (empty for "
-                     "non-result statements).",
+                     "Result column names as prepared (empty for a statement that "
+                     "expands into several).",
                      nb::lock_self())
         .def_prop_ro("types", &PreparedStatement::column_types,
-                     "Result column type names, known ahead of execution.", nb::lock_self())
+                     "Result column type names as prepared.", nb::lock_self())
         .def_prop_ro("statement_type", &PreparedStatement::statement_type,
                      nb::sig("def statement_type(self) -> str"),
                      "Statement kind: ``'SELECT'``, ``'INSERT'``, ``'UPDATE'``, ...",

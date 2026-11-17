@@ -1,0 +1,186 @@
+Add C API v2 calls for a prepared statement's schema and parameters
+
+A v2 prepared statement does not report its result schema or its parameters'
+types, though the engine keeps both from preparing it. A client that wants
+them, to show a statement's columns before running it or to convert parameter
+values to the types its plan assumed so the plan is reused, has to keep the
+parsed statement and bind it again with duckdb_v2_statement_bind(). That second
+bind costs about as much as the prepare's own: preparing a join over two
+30-column tables took 563 µs with it and 451 without, a trivial parameterized
+query 123 µs and 76.
+
+  - duckdb_v2_prepared_statement_get_schema(prepared): the result columns as
+    prepared, as statement_bind reports them; ERROR_INPUT_METADATA_DEFERRED for
+    a statement that expands into several.
+  - duckdb_v2_prepared_statement_get_parameters(prepared): the parameters in
+    binding order, each with the type its plan assumed, UNKNOWN when it was not
+    resolved.
+  - PreparedStatement::SubmitsAnew(), which tells a statement that expands into
+    several apart from one whose parameters are unresolved; MetadataAvailable()
+    is false for both.
+  - The calls are declared in duckdb_v2_prepared_statement_metadata.h.
+
+Note for upstreaming: duckdb_v2.h is generated; an upstream PR would add these
+to its generator's definitions.
+diff --git a/src/include/duckdb/main/prepared_statement.hpp b/src/include/duckdb/main/prepared_statement.hpp
+index d0c12139..4108b5ae 100644
+--- a/src/include/duckdb/main/prepared_statement.hpp
++++ b/src/include/duckdb/main/prepared_statement.hpp
+@@ -94,6 +94,9 @@ public:
+ 	DUCKDB_API case_insensitive_map_t<LogicalType> GetExpectedParameterTypes() const;
+ 	//! Whether the result names, types and properties are known before execution; runs nothing
+ 	DUCKDB_API bool MetadataAvailable() const;
++	//! Whether each execution submits the written statement anew, as for a statement that expands into several:
++	//! its result is known only at execution
++	DUCKDB_API bool SubmitsAnew() const;
+ 
+ 	//! Non-blocking. Submits the prepared statement with the given arguments and returns its handle
+ 	template <typename... ARGS>
+diff --git a/src/include/duckdb_v2_prepared_statement_metadata.h b/src/include/duckdb_v2_prepared_statement_metadata.h
+new file mode 100644
+index 00000000..0ca30c0e
+--- /dev/null
++++ b/src/include/duckdb_v2_prepared_statement_metadata.h
+@@ -0,0 +1,62 @@
++//===----------------------------------------------------------------------===//
++//
++//                         DuckDB
++//
++// duckdb_v2_prepared_statement_metadata.h
++//
++//
++//===----------------------------------------------------------------------===//
++
++#pragma once
++
++#include "duckdb_v2.h"
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#if DUCKDB_V2_API_ALLOW_UNSTABLE
++/*!
++ * Returns the result schema the statement was prepared with: the names and types of its result columns, as
++ * `duckdb_v2_statement_bind()` reports them, without binding the statement again. A statement with a parameter whose
++ * type was not resolved reports a single `unknown` column of type UNKNOWN.
++ *
++ * Fails with `ERROR_INPUT_METADATA_DEFERRED` for a statement that expands into several, whose schema is known only once
++ * execution binds the one that produces the result.
++ *
++ * history:
++ * - unstable: v2.0.0
++ *
++ * @param prepared The prepared statement.
++ * @param out_schema On success, receives the schema. Destroy via `duckdb_v2_schema_destroy()`.
++ * @param err Optional. On failure, receives an opaque info handle the caller must destroy via
++ * `duckdb_v2_error_info_destroy()`.
++ * @return DUCKDB_V2_ERROR
++ */
++DUCKDB_C_API DUCKDB_V2_ERROR duckdb_v2_prepared_statement_get_schema(duckdb_v2_prepared_statement_handle prepared,
++                                                                     duckdb_v2_schema_handle *out_schema,
++                                                                     duckdb_v2_error_info_handle *err);
++
++/*!
++ * Returns the parameters of the statement in binding order, as `duckdb_v2_statement_bind()` reports them, without
++ * binding the statement again. Each field's name is the parameter's binding key, "1", "2", ... for a positional
++ * parameter, and its type is the one the plan assumed, or UNKNOWN when it was not resolved. Executing with values of
++ * those types reuses the plan.
++ *
++ * history:
++ * - unstable: v2.0.0
++ *
++ * @param prepared The prepared statement.
++ * @param out_parameters On success, receives the parameters as a schema. Destroy via `duckdb_v2_schema_destroy()`.
++ * @param err Optional. On failure, receives an opaque info handle the caller must destroy via
++ * `duckdb_v2_error_info_destroy()`.
++ * @return DUCKDB_V2_ERROR
++ */
++DUCKDB_C_API DUCKDB_V2_ERROR duckdb_v2_prepared_statement_get_parameters(duckdb_v2_prepared_statement_handle prepared,
++                                                                         duckdb_v2_schema_handle *out_parameters,
++                                                                         duckdb_v2_error_info_handle *err);
++#endif
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/src/main/capi/v2/capi_v2_prepared_statement.cpp b/src/main/capi/v2/capi_v2_prepared_statement.cpp
+index 9cd4e572..ca0efb3a 100644
+--- a/src/main/capi/v2/capi_v2_prepared_statement.cpp
++++ b/src/main/capi/v2/capi_v2_prepared_statement.cpp
+@@ -1,4 +1,5 @@
+ #include "duckdb/main/capi_v2/capi_v2_result_internal.hpp"
++#include "duckdb_v2_prepared_statement_metadata.h"
+ 
+ namespace duckdb::capiv2 {
+ namespace {
+@@ -125,6 +126,54 @@ DUCKDB_V2_ERROR duckdb_v2_prepared_statement_reuses_plan(duckdb_v2_prepared_stat
+ 	});
+ }
+ 
++DUCKDB_V2_ERROR duckdb_v2_prepared_statement_get_schema(duckdb_v2_prepared_statement_handle prepared,
++                                                        duckdb_v2_schema_handle *out_schema,
++                                                        duckdb_v2_error_info_handle *err) {
++	DUCKDB_CHECK_ARG(out_schema);
++	*out_schema = nullptr;
++	DUCKDB_CHECK_ARG(prepared);
++	return WithErrorHandler(err, [&]() {
++		auto &statement = *Convert(prepared)->prepared;
++		if (statement.SubmitsAnew()) {
++			throw MetadataDeferredException(
++			    "the statement expands into several, so its schema is known only once execution binds the one that "
++			    "produces the result; execute it instead");
++		}
++		auto schema = duckdb::make_uniq<CV2Schema>();
++		auto &names = statement.GetNames();
++		auto &types = statement.GetTypes();
++		for (duckdb::idx_t i = 0; i < types.size(); i++) {
++			schema->fields.push_back({names[i].GetIdentifierName(), types[i]});
++		}
++		*out_schema = Convert(schema.release());
++	});
++}
++
++DUCKDB_V2_ERROR duckdb_v2_prepared_statement_get_parameters(duckdb_v2_prepared_statement_handle prepared,
++                                                            duckdb_v2_schema_handle *out_parameters,
++                                                            duckdb_v2_error_info_handle *err) {
++	DUCKDB_CHECK_ARG(out_parameters);
++	*out_parameters = nullptr;
++	DUCKDB_CHECK_ARG(prepared);
++	return WithErrorHandler(err, [&]() {
++		auto &statement = *Convert(prepared)->prepared;
++		// In binding order, as statement_bind reports them; the field name carries the binding key.
++		duckdb::vector<std::pair<duckdb::idx_t, duckdb::Identifier>> order;
++		for (auto &entry : statement.GetNamedParameterMap()) {
++			order.emplace_back(entry.second, entry.first);
++		}
++		std::sort(order.begin(), order.end(),
++		          [](const auto &a, const auto &b) { return a.first < b.first; });
++		auto parameters = duckdb::make_uniq<CV2Schema>();
++		for (auto &entry : order) {
++			duckdb::LogicalType type(duckdb::LogicalTypeId::UNKNOWN);
++			statement.TryGetParameterType(entry.second, type);
++			parameters->fields.push_back({entry.second.GetIdentifierName(), std::move(type)});
++		}
++		*out_parameters = Convert(parameters.release());
++	});
++}
++
+ DUCKDB_V2_ERROR duckdb_v2_prepared_statement_destroy(duckdb_v2_prepared_statement_handle *prepared) {
+ 	return WithErrorHandler(nullptr, [&]() {
+ 		if (!prepared) {
+diff --git a/src/main/prepared_statement.cpp b/src/main/prepared_statement.cpp
+index b6ce3bc1..026089ed 100644
+--- a/src/main/prepared_statement.cpp
++++ b/src/main/prepared_statement.cpp
+@@ -112,6 +112,10 @@ bool PreparedStatement::MetadataAvailable() const {
+ 	return !written_statement && info.properties.bound_all_parameters;
+ }
+ 
++bool PreparedStatement::SubmitsAnew() const {
++	return written_statement != nullptr;
++}
++
+ unique_ptr<SQLStatement> PreparedStatement::CreateStatement(identifier_map_t<BoundParameterData> &named_values,
+                                                             QueryParameters &parameters) const {
+ 	if (written_statement) {

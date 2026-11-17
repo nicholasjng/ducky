@@ -531,8 +531,6 @@ class ParsedStatement {
     ParsedStatement& operator=(const ParsedStatement&) = delete;
 
     duckdb_v2_sql_statement_handle get() const { return stmt_; }
-    // Hands the statement over to the caller.
-    duckdb_v2_sql_statement_handle release() { return std::exchange(stmt_, nullptr); }
 
    private:
     duckdb_v2_sql_statement_handle stmt_ = nullptr;
@@ -1025,44 +1023,7 @@ V2Prepared::V2Prepared(duckdb_v2_connection_handle con, const std::string& query
     ParsedStatement parsed(con, query);
     V2Error err;
     err.check(duckdb_v2_sql_statement_get_type(parsed.get(), &type_, err.out()));
-    idx_t count = 0;
-    err.check(duckdb_v2_sql_statement_get_parameter_count(parsed.get(), &count, err.out()));
-    for (idx_t i = 0; i < count; i++) {
-        const char* name = nullptr;
-        idx_t length = 0;
-        err.check(
-            duckdb_v2_sql_statement_get_parameter_name(parsed.get(), i, &name, &length, err.out()));
-        parameter_names_.emplace_back(name, length);
-    }
     DUCKDB_V2_ERROR code;
-    if (count > 0) {
-        // The parameter types the plan will assume, so executions can pass
-        // values of those types and reuse it. A statement that expands into
-        // several has none, and takes no parameters anyway.
-        duckdb_v2_schema_handle columns = nullptr, params = nullptr;
-        {
-            // Binding takes the client context lock.
-            release_gil_if_held release;
-            code = duckdb_v2_statement_bind(con, parsed.get(), &columns, &params, err.out());
-        }
-        duckdb_v2_schema_destroy(&columns);
-        idx_t n = 0;
-        if (code == DUCKDB_V2_ERROR_NONE &&
-            duckdb_v2_schema_get_count(params, &n, nullptr) == DUCKDB_V2_ERROR_NONE) {
-            for (idx_t i = 0; i < n; i++) {
-                const char* name = nullptr;
-                idx_t length = 0;
-                duckdb_v2_logical_type_handle type = nullptr;
-                DUCKDB_V2_LOGICAL_TYPE_ID id = DUCKDB_V2_LOGICAL_TYPE_ID_INVALID;
-                if (duckdb_v2_schema_get_field(params, i, &name, &length, &type, nullptr) ==
-                    DUCKDB_V2_ERROR_NONE) {
-                    duckdb_v2_logical_type_get_id(type, &id, nullptr);
-                }
-                parameter_types_.push_back(id);
-            }
-        }
-        duckdb_v2_schema_destroy(&params);
-    }
     {
         // Preparing takes the client context lock.
         release_gil_if_held release;
@@ -1070,15 +1031,37 @@ V2Prepared::V2Prepared(duckdb_v2_connection_handle con, const std::string& query
                                                    &prepared_, err.out());
     }
     err.check(code);
-    // Kept for binding the statement's result schema.
-    sql_ = parsed.release();
+    // The parameter types the plan assumed, so executions can pass values of
+    // those types and reuse it.
+    duckdb_v2_schema_handle params = nullptr;
+    code = duckdb_v2_prepared_statement_get_parameters(prepared_, &params, err.out());
+    idx_t n = 0;
+    if (code == DUCKDB_V2_ERROR_NONE) code = duckdb_v2_schema_get_count(params, &n, err.out());
+    for (idx_t i = 0; i < n && code == DUCKDB_V2_ERROR_NONE; i++) {
+        const char* name = nullptr;
+        idx_t length = 0;
+        duckdb_v2_logical_type_handle type = nullptr;
+        DUCKDB_V2_LOGICAL_TYPE_ID id = DUCKDB_V2_LOGICAL_TYPE_ID_INVALID;
+        code = duckdb_v2_schema_get_field(params, i, &name, &length, &type, err.out());
+        if (code != DUCKDB_V2_ERROR_NONE) break;
+        duckdb_v2_logical_type_get_id(type, &id, nullptr);
+        parameter_names_.emplace_back(name, length);
+        parameter_types_.push_back(id);
+    }
+    duckdb_v2_schema_destroy(&params);
+    if (code != DUCKDB_V2_ERROR_NONE) {
+        std::string message = err.text();
+        // Destroying the plan takes the client context lock.
+        release_gil_if_held release;
+        duckdb_v2_prepared_statement_destroy(&prepared_);
+        throw DuckyError(message);
+    }
 }
 
 V2Prepared::~V2Prepared() {
     // Destroying the plan takes the client context lock.
     release_gil_if_held release;
     duckdb_v2_prepared_statement_destroy(&prepared_);
-    duckdb_v2_sql_statement_destroy(&sql_);
 }
 
 int64_t V2Prepared::parameter_index(const std::string& key) const {
@@ -1100,15 +1083,10 @@ DUCKDB_V2_LOGICAL_TYPE_ID V2Prepared::planned_type(const std::string& key) const
     return parameter_types_[(size_t)i];
 }
 
-std::vector<std::pair<std::string, std::string>> V2Prepared::columns(
-    duckdb_v2_connection_handle con) const {
+std::vector<std::pair<std::string, std::string>> V2Prepared::columns() const {
     V2Error err;
     duckdb_v2_schema_handle schema = nullptr;
-    DUCKDB_V2_ERROR code;
-    {
-        release_gil_if_held release;
-        code = duckdb_v2_statement_bind(con, sql_, &schema, nullptr, err.out());
-    }
+    DUCKDB_V2_ERROR code = duckdb_v2_prepared_statement_get_schema(prepared_, &schema, err.out());
     std::vector<std::pair<std::string, std::string>> out;
     if (code == DUCKDB_V2_ERROR_INPUT_METADATA_DEFERRED) return out;
     err.check(code);
@@ -1442,14 +1420,14 @@ nb::object PreparedStatement::parameter_name(int64_t index) const {
 std::vector<std::string> PreparedStatement::column_names() const {
     auto lock = lock_valid();
     std::vector<std::string> out;
-    for (auto& [name, type] : stmt_->columns(handle_->connection_v2)) out.push_back(name);
+    for (auto& [name, type] : stmt_->columns()) out.push_back(name);
     return out;
 }
 
 std::vector<std::string> PreparedStatement::column_types() const {
     auto lock = lock_valid();
     std::vector<std::string> out;
-    for (auto& [name, type] : stmt_->columns(handle_->connection_v2)) out.push_back(type);
+    for (auto& [name, type] : stmt_->columns()) out.push_back(type);
     return out;
 }
 

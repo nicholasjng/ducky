@@ -260,12 +260,12 @@ class PreparedStatement:
     @property
     def columns(self) -> list[str]:
         """
-        Result column names, known ahead of execution (empty for non-result statements).
+        Result column names as prepared (empty for a statement that expands into several).
         """
 
     @property
     def types(self) -> list[str]:
-        """Result column type names, known ahead of execution."""
+        """Result column type names as prepared."""
 
     @property
     def statement_type(self) -> str:
