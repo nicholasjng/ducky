@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <optional>
+#include <string_view>
 
 #include "arrow_scan.hpp"
 #include "arrow_util.hpp"
@@ -734,46 +735,126 @@ nb::tuple Connection::progress() const {
 
 namespace {
 
-// Recursively materialize a duckdb_profiling_info node into a Python dict.
-// The info nodes themselves are borrowed (owned by the connection's profiler
-// state); only the duckdb_value handles for metric keys/values need destroying.
-nb::dict walk_profiling_node(duckdb_profiling_info info) {
-    nb::dict node;
-    nb::dict metrics;
-    duckdb_value map = duckdb_profiling_info_get_metrics(info);
-    if (map) {
-        idx_t n = duckdb_get_map_size(map);
-        for (idx_t i = 0; i < n; ++i) {
-            duckdb_value k = duckdb_get_map_key(map, i);
-            duckdb_value v = duckdb_get_map_value(map, i);
-            char* ks = duckdb_get_varchar(k);
-            char* vs = duckdb_get_varchar(v);
-            metrics[nb::str(ks ? ks : "")] = nb::str(vs ? vs : "");
-            duckdb_free(ks);
-            duckdb_free(vs);
-            duckdb_destroy_value(&k);
-            duckdb_destroy_value(&v);
-        }
-        duckdb_destroy_value(&map);
-    }
-    node["metrics"] = std::move(metrics);
+// Owns a query metrics snapshot.
+struct V2Metrics {
+    duckdb_v2_query_metrics_handle handle = nullptr;
+    V2Metrics() = default;
+    V2Metrics(const V2Metrics&) = delete;
+    V2Metrics& operator=(const V2Metrics&) = delete;
+    ~V2Metrics() { duckdb_v2_query_metrics_destroy(&handle); }
+};
 
-    nb::list children;
-    idx_t cc = duckdb_profiling_info_get_child_count(info);
-    for (idx_t i = 0; i < cc; ++i) {
-        children.append(walk_profiling_node(duckdb_profiling_info_get_child(info, i)));
+// A node's metrics as name and text, the text as v1 rendered it.
+std::vector<std::pair<std::string, std::string>> read_metrics(
+    duckdb_v2_query_metrics_node_handle node) {
+    std::vector<std::pair<std::string, std::string>> out;
+    idx_t count = 0;
+    duckdb_v2_query_metrics_node_get_metric_count(node, &count, nullptr);
+    std::vector<char> text;
+    for (idx_t i = 0; i < count; ++i) {
+        const char* name = nullptr;
+        idx_t name_length = 0;
+        duckdb_v2_value_handle value = nullptr;
+        if (duckdb_v2_query_metrics_node_get_metric_name(node, i, &name, &name_length, nullptr) !=
+                DUCKDB_V2_ERROR_NONE ||
+            duckdb_v2_query_metrics_node_get_metric_value(node, i, &value, nullptr) !=
+                DUCKDB_V2_ERROR_NONE) {
+            continue;
+        }
+        idx_t length = 0;
+        if (duckdb_v2_value_to_string(value, nullptr, 0, &length, nullptr) ==
+            DUCKDB_V2_ERROR_NONE) {
+            text.resize(length + 1);
+            if (duckdb_v2_value_to_string(value, text.data(), text.size(), &length, nullptr) ==
+                DUCKDB_V2_ERROR_NONE) {
+                out.emplace_back(std::string(name, name_length), std::string(text.data(), length));
+            }
+        }
+        duckdb_v2_value_destroy(&value);
     }
+    return out;
+}
+
+nb::dict profile_node(nb::dict metrics, nb::list children) {
+    nb::dict node;
+    node["metrics"] = std::move(metrics);
     node["children"] = std::move(children);
     return node;
+}
+
+// An operator node and its children, with metrics keyed without `operator.`.
+nb::dict walk_operator(duckdb_v2_query_metrics_node_handle node) {
+    constexpr std::string_view prefix = "operator.";
+    nb::dict metrics;
+    for (auto& [name, text] : read_metrics(node)) {
+        std::string_view key = name;
+        if (key.substr(0, prefix.size()) == prefix) key.remove_prefix(prefix.size());
+        metrics[nb::str(key.data(), key.size())] = nb::str(text.data(), text.size());
+    }
+    nb::list children;
+    idx_t count = 0;
+    duckdb_v2_query_metrics_node_get_child_count(node, &count, nullptr);
+    for (idx_t i = 0; i < count; ++i) {
+        duckdb_v2_query_metrics_node_handle child = nullptr;
+        if (duckdb_v2_query_metrics_node_get_child(node, i, &child, nullptr) ==
+            DUCKDB_V2_ERROR_NONE) {
+            children.append(walk_operator(child));
+        }
+    }
+    return profile_node(std::move(metrics), std::move(children));
+}
+
+// The last query's profile in the shape v1's profiling info had: an empty root
+// whose children are the operator tree and one node per metric group (query,
+// system, io, planner, ...), keyed without the group. None without a plan.
+nb::object profile_tree(duckdb_v2_connection_handle con) {
+    V2Metrics metrics;
+    V2Error err;
+    DUCKDB_V2_ERROR code;
+    {
+        release_gil_if_held release;
+        code = duckdb_v2_connection_get_query_metrics(con, &metrics.handle, err.out());
+    }
+    // v1 reported the previous query's profile while a result streamed.
+    if (code == DUCKDB_V2_ERROR_RESOURCE_IN_USE) {
+        throw DuckyError("ducky: no profile while the connection has an open result");
+    }
+    err.check(code, "ducky: ");
+    duckdb_v2_query_metrics_node_handle root = nullptr;
+    err.check(duckdb_v2_query_metrics_get_root(metrics.handle, &root, err.out()), "ducky: ");
+    idx_t count = 0;
+    duckdb_v2_query_metrics_node_get_child_count(root, &count, nullptr);
+    if (count == 0) return nb::none();
+
+    nb::list children;
+    for (idx_t i = 0; i < count; ++i) {
+        duckdb_v2_query_metrics_node_handle child = nullptr;
+        if (duckdb_v2_query_metrics_node_get_child(root, i, &child, nullptr) ==
+            DUCKDB_V2_ERROR_NONE) {
+            children.append(walk_operator(child));
+        }
+    }
+    std::vector<std::pair<std::string, nb::dict>> groups;
+    for (auto& [name, text] : read_metrics(root)) {
+        size_t dot = name.find('.');
+        std::string group = dot == std::string::npos ? std::string() : name.substr(0, dot);
+        std::string key = dot == std::string::npos ? name : name.substr(dot + 1);
+        auto it = std::find_if(groups.begin(), groups.end(),
+                               [&](const auto& entry) { return entry.first == group; });
+        if (it == groups.end()) it = groups.insert(groups.end(), {group, nb::dict()});
+        it->second[nb::str(key.data(), key.size())] = nb::str(text.data(), text.size());
+    }
+    for (auto& [group, group_metrics] : groups) {
+        children.append(profile_node(std::move(group_metrics), nb::list()));
+    }
+    return profile_node(nb::dict(), std::move(children));
 }
 
 }  // namespace
 
 nb::object Connection::get_profiling_info() const {
     std::shared_ptr<DuckDBHandle> handle = open_handle();
-    duckdb_profiling_info info = duckdb_get_profiling_info(handle->connection);
-    if (!info) return nb::none();
-    return walk_profiling_node(info);
+    return profile_tree(handle->connection_v2);
 }
 
 namespace {
@@ -811,14 +892,14 @@ void Connection::set_profile_sink(nb::object sink, int64_t sample, const std::st
     profile_counter_ = 0;
 }
 
-void Connection::maybe_emit_profile(duckdb_connection connection, const std::string& query) {
+void Connection::maybe_emit_profile(duckdb_v2_connection_handle connection,
+                                    const std::string& query) {
     // Fast path: no sink installed.
     if (profile_sink_.is_none()) return;
     int64_t n = profile_counter_++;
     if (n % profile_sample_ != 0) return;
-    duckdb_profiling_info info = duckdb_get_profiling_info(connection);
-    if (!info) return;
-    nb::object tree = walk_profiling_node(info);
+    nb::object tree = profile_tree(connection);
+    if (tree.is_none()) return;
     // Report sink errors without failing the query.
     try {
         profile_sink_(query, tree);
@@ -1124,7 +1205,7 @@ std::shared_ptr<Result> Connection::run(const std::string& query, nb::object par
     stmt.retire();
     // Skip streaming: its query has not finished, so the profile would reflect
     // the previous query.
-    if (!streaming) maybe_emit_profile(handle->connection, query);
+    if (!streaming) maybe_emit_profile(con, query);
     if (!this->handle()) throw DuckyError("ducky: connection was closed while the query ran");
     return std::make_shared<Result>(execution, std::move(handle));
 }

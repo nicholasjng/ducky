@@ -172,7 +172,7 @@ class Connection {
         std::unique_ptr<V2Prepared> stmt_;
     };
     // Fire the sink for sampled materialized queries.
-    void maybe_emit_profile(duckdb_connection connection, const std::string& query);
+    void maybe_emit_profile(duckdb_v2_connection_handle connection, const std::string& query);
 
     // Front is most recently used.
     std::list<CachedStatement> statement_lru_;

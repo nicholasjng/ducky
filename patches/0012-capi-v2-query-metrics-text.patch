@@ -1,0 +1,50 @@
+Keep the text of C API v2 query metrics: the SQL, operator names, extra info
+
+duckdb_v2_connection_get_query_metrics() snapshots only numeric metrics. The
+profiler also gathers query.sql, each operator's name (SEQ_SCAN under a
+TABLE_SCAN node) and its extra_info: the table, pushed filters, projections,
+aggregates and estimated cardinality. That text is what a profile is read for,
+and v1's profiling info reports it, so a client moving its profiling to v2 loses
+it.
+
+  - The snapshot keeps every non-null metric: numbers, VARCHARs (query.sql,
+    operator.name, operator.type) and the MAP(VARCHAR, VARCHAR) of
+    operator.extra_info.
+  - duckdb_v2_query_metrics_node_get_metric_value documents the text types.
+
+Note for upstreaming: duckdb_v2.h is generated; an upstream PR would change its
+generator's definitions.
+diff --git a/src/include/duckdb_v2.h b/src/include/duckdb_v2.h
+index 853ec5d3..9701d392 100644
+--- a/src/include/duckdb_v2.h
++++ b/src/include/duckdb_v2.h
+@@ -4677,8 +4677,9 @@ DUCKDB_C_API DUCKDB_V2_ERROR duckdb_v2_query_metrics_node_get_metric_name(duckdb
+ 
+ #if DUCKDB_V2_API_ALLOW_UNSTABLE
+ /*!
+- * Returns the value of the metric at index, a number such as a UBIGINT count or a DOUBLE duration. An out-of-range
+- * index is rejected with `ERROR_INPUT_OUT_OF_RANGE`.
++ * Returns the value of the metric at index: a number such as a UBIGINT count or a DOUBLE duration, a VARCHAR such as
++ * `query.sql` or `operator.name`, or a MAP(VARCHAR, VARCHAR) such as `operator.extra_info`. An out-of-range index is
++ * rejected with `ERROR_INPUT_OUT_OF_RANGE`.
+  *
+  * history:
+  * - unstable: v2.0.0
+diff --git a/src/main/capi/v2/capi_v2_query_metrics.cpp b/src/main/capi/v2/capi_v2_query_metrics.cpp
+index d8a529a2..1c4b526b 100644
+--- a/src/main/capi/v2/capi_v2_query_metrics.cpp
++++ b/src/main/capi/v2/capi_v2_query_metrics.cpp
+@@ -33,10 +33,11 @@ static auto Convert(CV2QueryMetricsNode *node) -> duckdb_v2_query_metrics_node_h
+ 	return reinterpret_cast<duckdb_v2_query_metrics_node_handle>(node);
+ }
+ 
+-//! Adds the numeric metrics, sorted by name: the others, e.g. the SQL text, are not measurements
++//! Adds the metrics, sorted by name: numbers, and the text a profile is read with, e.g. the SQL and each operator's
++//! name and extra info
+ static void AddQueryMetrics(CV2QueryMetricsNode &node, const profiler_metrics_t &metrics, const string &prefix) {
+ 	for (auto &entry : metrics) {
+-		if (!entry.second.IsNull() && entry.second.type().IsNumeric()) {
++		if (!entry.second.IsNull()) {
+ 			node.metrics.emplace_back(prefix + entry.first, entry.second);
+ 		}
+ 	}

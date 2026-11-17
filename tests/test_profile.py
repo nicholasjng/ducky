@@ -374,3 +374,31 @@ def test_connect_env_sink_compact(tmp_path, monkeypatch):
     rec = json.loads(line)
     assert "info" not in rec
     assert "summary" in rec
+
+
+def test_profile_keeps_operator_text(con):
+    con.execute("CREATE TABLE t AS SELECT i FROM range(1000) r(i)")
+    with ducky.profile(con) as p:
+        con.execute("SELECT count(*) FROM t WHERE i > 500").fetchall()
+    assert p.info is not None
+    summary = next(c for c in p.info["children"] if "sql" in c["metrics"])
+    assert summary["metrics"]["sql"] == "SELECT count(*) FROM t WHERE i > 500"
+
+    def nodes(node):
+        yield node
+        for c in node["children"]:
+            yield from nodes(c)
+
+    scan = next(n for n in nodes(p.info) if n["metrics"].get("type") == "TABLE_SCAN")
+    assert scan["metrics"]["name"] == "SEQ_SCAN"
+    assert "Table=memory.main.t" in scan["metrics"]["extra_info"]
+    assert "Filters=" in scan["metrics"]["extra_info"]
+
+
+def test_profile_refuses_while_result_streams(con):
+    con.execute("SET enable_profiling='no_output'")
+    result = con.execute("SELECT * FROM range(10_000_000)", streaming=True)
+    with pytest.raises(ducky.Error, match="open result"):
+        con.get_profiling_info()
+    result.fetchall()
+    assert con.get_profiling_info() is not None
