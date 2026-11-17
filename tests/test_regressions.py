@@ -932,3 +932,28 @@ def test_prepared_order_by_without_insertion_order():
         assert (a[:-1] <= a[1:]).all()
         b = con.arrow("SELECT a FROM t ORDER BY a").column("a").to_numpy()
         assert (b[:-1] <= b[1:]).all()
+
+
+def test_compact_columns_read_flat_through_every_reader(con):
+    # A materialized result keeps constant and dictionary columns compact;
+    # every reader must see them flat, including after a partial read.
+    pytest.importorskip("pyarrow")
+    query = (
+        "SELECT 42 AS k, 'const' AS c, NULL::INT AS n, ['a', 'bb'][i % 2 + 1] AS d, "
+        "[i, 7] AS l FROM range(5000) r(i)"
+    )
+    expected = [(42, "const", None, ["a", "bb"][i % 2], [i, 7]) for i in range(5000)]
+    assert con.sql(query).fetchall() == expected
+
+    result = con.sql(query)
+    head = result.fetchmany(10)
+    chunk = result.fetch_chunk()
+    assert chunk is not None
+    assert (chunk.column("k") == 42).all()
+    assert head + result.fetchall() == expected[:10] + expected[10 + len(chunk) :]
+
+    table = con.sql(query).arrow()
+    assert [tuple(row.values()) for row in table.to_pylist()] == expected
+
+    k = con.sql("SELECT 42 AS k, i FROM range(5000) r(i)").to_numpy()["k"]
+    assert (k == 42).all()

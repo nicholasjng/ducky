@@ -1,0 +1,174 @@
+Add duckdb_v2_result_take_collection: hand over a retained result's rows
+
+A step of a retained C API v2 result copies its next chunk out of the column
+data collection holding the rows, into a chunk allocated for the step
+(ChunkRetainedCollection::FetchRaw, with DISALLOW_ZERO_COPY). A client that
+must free the connection as soon as the query ends, and so steps every chunk
+before reading any, holds the rows twice: the collection until the last step,
+and the copies. It then copies them once more into its own format. The engine
+can hand the collection over instead (QueryResult::TakeCollection), and v2
+already scans a collection into a caller-owned chunk, zero-copy where possible.
+Born from reading 20M rows of two columns into NumPy through v2: 631 MB held
+after stepping, 320 MB once the collection is taken; 27 ms to convert 10M rows,
+20 ms scanning the taken collection.
+
+  - ResultWrapperV2::TakeCollection(): for a retained chunk result whose
+    execution has ended, hands over the collection and finishes the result,
+    releasing the connection. Null while the query still runs; an error for a
+    result that streams, has handed out a chunk, or has ended.
+  - duckdb_v2_result_take_collection(result, &collection), in
+    duckdb_v2_result_take_collection.h.
+
+Note for upstreaming: duckdb_v2.h is generated; an upstream PR would add this
+to its generator's definitions.
+diff --git a/src/include/duckdb/main/capi_v2/capi_v2_result_internal.hpp b/src/include/duckdb/main/capi_v2/capi_v2_result_internal.hpp
+index 8a1b1e7e..da8c09fa 100644
+--- a/src/include/duckdb/main/capi_v2/capi_v2_result_internal.hpp
++++ b/src/include/duckdb/main/capi_v2/capi_v2_result_internal.hpp
+@@ -39,6 +39,8 @@ struct ResultWrapperV2 {
+ 	//! Decided when the handle is adopted, since a prepared execution's handle reports the EXECUTE that runs it
+ 	//! rather than the statement as written
+ 	bool stream_when_ready = false;
++	//! Set once a retained result hands out a chunk, after which its rows can no longer be taken whole.
++	bool retained_fetched = false;
+ 	//! The statement is submitted in this format; null is the chunk format.
+ 	shared_ptr<ResultFormat> format;
+ 
+@@ -94,6 +96,9 @@ struct ResultWrapperV2 {
+ 	//! Retains a result that would stream, so its query runs to the end without waiting on the consumer. A no-op
+ 	//! for a result that is retained already or has ended. Throws once the result has started streaming.
+ 	void Retain();
++	//! Hands over the rows of a retained chunk result once its query has run to its end, finishing the result. Null
++	//! while the query still runs. Throws for a result that streams, has ended, or has handed out a chunk.
++	unique_ptr<ColumnDataCollection> TakeCollection();
+ 	//! Blocking convenience: steps/waits until a unit is produced (returned)
+ 	//! or the stream ends (nullptr). Cancellation throws InterruptException.
+ 	template <class FORMAT>
+diff --git a/src/include/duckdb_v2_result_take_collection.h b/src/include/duckdb_v2_result_take_collection.h
+new file mode 100644
+index 00000000..34defacb
+--- /dev/null
++++ b/src/include/duckdb_v2_result_take_collection.h
+@@ -0,0 +1,50 @@
++//===----------------------------------------------------------------------===//
++//
++//                         DuckDB
++//
++// duckdb_v2_result_take_collection.h
++//
++//
++//===----------------------------------------------------------------------===//
++
++#pragma once
++
++#include "duckdb_v2.h"
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#if DUCKDB_V2_API_ALLOW_UNSTABLE
++/*!
++ * Takes the rows of a retained result as a column data collection, once its query has run to its end.
++ *
++ * Stepping a retained result copies each chunk out of the collection that holds its rows, into a chunk allocated for
++ * the step. Taking the collection hands those rows over instead, without copying: scan them with
++ * `duckdb_v2_column_data_collection_scan()` into chunks the caller owns and reuses, zero-copy where possible, or in
++ * parallel. The result is finished afterwards, which frees the connection.
++ *
++ * While the query still runs, `*out_collection` receives NULL: step the result and call again. The step that ends
++ * execution reports `WAITING`, so calling this after each `WAITING` step takes the rows before any chunk is fetched.
++ * Fails with `ERROR_INPUT_INVALID`
++ * for a result that streams (see `duckdb_v2_result_retain()`), that has handed out a chunk or ended, or that is an Arrow
++ * result; with the result's error once it failed, and with `ERROR_RUNTIME_INTERRUPT` once it was cancelled.
++ *
++ * history:
++ * - unstable: v2.0.0
++ *
++ * @param result The result.
++ * @param out_collection Receives the collection, or NULL while the query runs. Owned by the caller; destroy via
++ * `duckdb_v2_column_data_collection_destroy()` before the instance.
++ * @param err Optional. On failure, receives an opaque info handle the caller must destroy via
++ * `duckdb_v2_error_info_destroy()`.
++ * @return DUCKDB_V2_ERROR
++ */
++DUCKDB_C_API DUCKDB_V2_ERROR duckdb_v2_result_take_collection(duckdb_v2_result_handle result,
++                                                              duckdb_v2_column_data_collection_handle *out_collection,
++                                                              duckdb_v2_error_info_handle *err);
++#endif
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/src/main/capi/v2/capi_v2_result.cpp b/src/main/capi/v2/capi_v2_result.cpp
+index 3de754c7..6c8839ce 100644
+--- a/src/main/capi/v2/capi_v2_result.cpp
++++ b/src/main/capi/v2/capi_v2_result.cpp
+@@ -1,5 +1,6 @@
+ #include "duckdb/main/capi_v2/capi_v2_result_internal.hpp"
+ #include "duckdb_v2_result_retain.h"
++#include "duckdb_v2_result_take_collection.h"
+ 
+ #include "duckdb/common/arrow/arrow_format.hpp"
+ #include "duckdb/common/arrow/nanoarrow/nanoarrow.hpp"
+@@ -238,6 +239,7 @@ DUCKDB_V2_RESULT_STEP_STATUS ResultWrapperV2::Step(unique_ptr<typename FORMAT::T
+ 			state = State::FINISHED;
+ 			return DUCKDB_V2_RESULT_STEP_STATUS_FINISHED;
+ 		}
++		retained_fetched = retained_fetched || !stream;
+ 		out_unit = std::move(unit);
+ 		return DUCKDB_V2_RESULT_STEP_STATUS_CHUNK;
+ 	}
+@@ -308,6 +310,36 @@ void ResultWrapperV2::Retain() {
+ 	stream_when_ready = false;
+ }
+ 
++unique_ptr<ColumnDataCollection> ResultWrapperV2::TakeCollection() {
++	if (format && !format->Is<ChunkFormat>()) {
++		throw InvalidInputException("only the rows of a chunk result can be taken as a collection");
++	}
++	switch (state) {
++	case State::PENDING:
++		// Still running: the step that ends execution makes the rows available.
++		return nullptr;
++	case State::STREAMING:
++		break;
++	case State::FINISHED:
++		throw InvalidInputException("the result has ended; take its rows before stepping it to its end");
++	case State::CANCELLED:
++		throw InterruptException();
++	case State::ERRORED:
++		error.Throw();
++	}
++	if (stream) {
++		throw InvalidInputException("the result streams; retain it before stepping it to take its rows");
++	}
++	if (retained_fetched) {
++		throw InvalidInputException("a chunk was fetched from the result; take its rows before fetching any");
++	}
++	auto collection = handle->TakeCollection<ChunkFormat>();
++	// As at the end of the steps: the query has ended, and releasing its handle frees the connection.
++	handle.reset();
++	state = State::FINISHED;
++	return collection;
++}
++
+ template <class FORMAT>
+ unique_ptr<typename FORMAT::T> ResultWrapperV2::FetchBlocking() {
+ 	while (true) {
+@@ -591,6 +623,15 @@ DUCKDB_V2_ERROR duckdb_v2_result_retain(duckdb_v2_result_handle result, duckdb_v
+ 	return WithErrorHandler(err, [&]() { Convert(result)->Retain(); });
+ }
+ 
++DUCKDB_V2_ERROR duckdb_v2_result_take_collection(duckdb_v2_result_handle result,
++                                                 duckdb_v2_column_data_collection_handle *out_collection,
++                                                 duckdb_v2_error_info_handle *err) {
++	DUCKDB_CHECK_ARG(out_collection);
++	*out_collection = nullptr;
++	DUCKDB_CHECK_ARG(result);
++	return WithErrorHandler(err, [&]() { *out_collection = Convert(Convert(result)->TakeCollection().release()); });
++}
++
+ // ---------------------------------------------------------------------------
+ // Metadata
+ // ---------------------------------------------------------------------------
