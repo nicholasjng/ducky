@@ -135,8 +135,10 @@ until then.
    or file descriptor signalled when a step can make progress would let the
    event loop step a result without a thread.
 7. **Prepared-statement metadata.** A prepared statement does not report its
-   parameter types or result schema; ducky keeps the parsed statement to bind it
-   again with `statement_bind`, which costs a second bind per prepare.
+   parameter types or result schema, so a client binds it again with
+   `statement_bind`: preparing a join took 563 µs with that second bind and
+   451 µs without. `patches/0013-capi-v2-prepared-statement-metadata.patch`
+   adds `prepared_statement_get_schema` and `prepared_statement_get_parameters`.
 8. **Smaller ones.**
    - A vector reference to an offset and count of another vector, for
      zero-copy windows of a chunk; ducky windows through the Arrow importer.
@@ -205,10 +207,12 @@ destructor, as v1's is, so it runs on every state.
 
 Queries run through v2 prepared statements, cached per query text as before;
 `PreparedStatement` holds one too. A cached statement keeps the parameter types
-its plan assumed, read once with `statement_bind`, and executions convert ints
+its plan assumed, read from the prepared statement (patch 0013), and executions convert ints
 and floats to them, so a plan is reused instead of bound again: a
 parameterized INSERT takes 76 µs instead of 152. v2 binds each execution's
 values afresh, so nothing carries over between executemany rows.
+`PreparedStatement.columns` reports the schema the statement was prepared with,
+as v1 did; a later schema change shows in its results.
 
 A materialized result runs to its end with the GIL released, its result
 retained (patch 0011) and stepped into chunks that the `Result` then hands out

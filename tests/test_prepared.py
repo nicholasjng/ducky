@@ -79,6 +79,24 @@ def test_statement_expanding_into_several_has_no_schema_before_execution(con):
     assert stmt.execute().fetchall() == [(1, 1)]
 
 
+def test_result_schema_is_the_one_prepared(con):
+    con.execute("CREATE TABLE t (a INTEGER)")
+    con.execute("INSERT INTO t VALUES (1)")
+    stmt = con.prepare("SELECT * FROM t")
+    con.execute("ALTER TABLE t ADD COLUMN b INTEGER")
+    assert stmt.columns == ["a"]
+    result = stmt.execute()
+    assert result.columns == ["a", "b"]
+    assert result.fetchall() == [(1, None)]
+
+
+def test_unresolved_parameter_leaves_result_schema_unknown(con):
+    stmt = con.prepare("SELECT ? AS x")
+    assert stmt.columns == ["unknown"]
+    assert stmt.types == ["UNKNOWN"]
+    assert stmt.execute([1]).fetchall() == [(1,)]
+
+
 def test_execute_no_parameters(con):
     stmt = con.prepare("SELECT 42")
     assert stmt.num_parameters == 0
