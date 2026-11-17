@@ -125,12 +125,15 @@ until then.
    filters, projections, aggregates and estimated cardinality: what a profile
    is read for. `patches/0012-capi-v2-query-metrics-text.patch` keeps them,
    as VARCHARs and a MAP.
-5. **Fetching into a caller-owned chunk.** `result_fetch_chunk` and
-   `result_step` allocate a chunk per call. Reading a retained 10M-row result of
-   two columns chunk by chunk, or into one Arrow batch, takes 15–20% longer than
-   v1 with the fetch-into-chunk patch ducky carried. Chunks handed to Python
-   cannot be reused, so this only pays for conversions that copy each chunk
-   out: NumPy, Arrow, rows.
+5. **Taking a retained result's rows.** A step of a retained result copies its
+   next chunk out of the collection holding the rows, into a chunk allocated
+   for the step. Ducky steps every chunk before reading any, so the connection
+   is free when `execute` returns, and so held the rows twice and copied them
+   twice. `patches/0015-capi-v2-result-take-collection.patch` adds
+   `result_take_collection`, which hands the collection over; ducky scans it
+   into chunks it owns with the existing collection scan. A fetch into a
+   caller-owned chunk, as ducky's v1 patch did, would not help: the chunks are
+   all needed before the first is read.
 6. **A wake-up for asynchronous consumers.** `result_wait` blocks a thread, so
    an asyncio driver steps on a worker thread and hops back per tick. A callback
    or file descriptor signalled when a step can make progress would let the
@@ -216,8 +219,11 @@ values afresh, so nothing carries over between executemany rows.
 as v1 did; a later schema change shows in its results.
 
 A materialized result runs to its end with the GIL released, its result
-retained (patch 0011) and stepped into chunks that the `Result` then hands out
-without copying. Retaining matters: a heavy projection over a table read in
+retained (patch 0011), and then hands over its rows as a column data collection
+(patch 0015). The `Result` scans it zero-copy into a chunk it reuses for the
+conversions that copy rows out (NumPy, Arrow, rows) and copies the chunks it
+hands to Python, flattening the constant and dictionary columns the collection
+keeps compact. Retaining matters: a heavy projection over a table read in
 full took 645 ms streamed and takes 173 ms retained, on 8 threads. A streaming
 result runs as it is fetched, so runtime errors surface on fetch, as with v1.
 Async queries step the same way: `execute_tasks` runs steps and waits in
@@ -225,12 +231,14 @@ Async queries step the same way: `execute_tasks` runs steps and waits in
 results and the sleep backoff. Interrupting is v2's `connection_interrupt`,
 which a result reports as cancelled rather than failed.
 
-Against v1, materialized and streaming reads of 10M rows match or are faster
-(a streaming `to_numpy` takes 30 ms instead of 46), except that reading a
-retained result chunk by chunk or as one Arrow batch takes 15–20% longer: v2
-allocates each chunk, where ducky's v1 patch fetched into a reused one. A
-trivial query takes 34 µs instead of 30; most of a query's time goes to waking
-DuckDB's workers for its few tasks and waiting for them, as v1 also did.
+Against v1, most reads of 10M rows are faster: `to_numpy` takes 20 ms
+instead of 24, a streaming one 30 instead of 46, and
+`Result.arrow` 20 instead of 21. Reading chunk by chunk takes 22 ms instead of
+18.5, since every chunk handed to Python is copied out of the collection. Rows
+are held once: 20M rows of two columns take 320 MB once the query has run,
+where stepping them into chunks held 631. A trivial query takes 34 µs instead
+of 30; most of a query's time goes to waking DuckDB's workers for its few tasks
+and waiting for them, as v1 also did.
 
 Rows are still read through v1: the result's chunks and types reach the
 existing conversions through the bridge. Arrow export converts the chunks with

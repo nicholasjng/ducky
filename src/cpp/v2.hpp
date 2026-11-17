@@ -8,6 +8,7 @@
 #include "duckdb_v2_connection_arrow_exporter.h"
 #include "duckdb_v2_prepared_statement_metadata.h"
 #include "duckdb_v2_result_retain.h"
+#include "duckdb_v2_result_take_collection.h"
 #include "ducky.hpp"
 
 // The process's C API v2 environment. Never destroyed: an instance can outlive

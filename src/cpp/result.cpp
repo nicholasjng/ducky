@@ -452,17 +452,6 @@ struct ArrowStreamState {
     std::string last_error;
 };
 
-// Scope owner for a chunk taken from a result.
-struct OwnedChunk {
-    duckdb_data_chunk chunk;
-    explicit OwnedChunk(duckdb_data_chunk chunk) : chunk(chunk) {}
-    ~OwnedChunk() {
-        if (chunk) duckdb_destroy_data_chunk(&chunk);
-    }
-    OwnedChunk(const OwnedChunk&) = delete;
-    OwnedChunk& operator=(const OwnedChunk&) = delete;
-};
-
 // The unconsumed chunks of a result, retained when the row count is unknown.
 struct ChunkList {
     std::vector<duckdb_data_chunk> chunks;
@@ -599,8 +588,9 @@ void build_fast_batch_known_total(ArrowStreamState* state, ArrowArray* out, idx_
     }
 
     size_t row_off = 0;
-    while (duckdb_data_chunk taken = result.take_chunk_locked()) {
-        OwnedChunk scratch(taken);
+    while (true) {
+        BorrowedChunk scratch = result.borrow_chunk_locked();
+        if (!scratch.chunk) break;
         idx_t sz = duckdb_data_chunk_get_size(scratch.chunk);
         if (row_off + sz > total) {
             throw DuckyError("ducky: result produced more rows than expected");
@@ -677,7 +667,8 @@ int stream_get_next(ArrowArrayStream* stream, ArrowArray* out) {
             return 0;
         }
         // Convert one DuckDB chunk into Arrow-owned buffers.
-        OwnedChunk chunk(state->result->take_chunk_locked());
+        // The exporter copies the chunk, so it may be borrowed.
+        BorrowedChunk chunk = state->result->borrow_chunk_locked();
         if (!chunk.chunk) return 0;  // exhausted
         // Without a batch size, the chunk comes out as one array.
         duckdb_v2_data_chunk_handle input = duckdb_data_chunk_get_v2(chunk.chunk);
@@ -787,6 +778,63 @@ void destroy_v2_result(duckdb_v2_result_handle& result) {
     duckdb_v2_result_destroy(&result);
 }
 
+TakenRows::TakenRows(duckdb_v2_column_data_collection_handle collection,
+                     std::vector<duckdb_logical_type>& types)
+    : collection_(collection) {
+    V2Error err;
+    DUCKDB_V2_ERROR code =
+        duckdb_v2_column_data_collection_row_count(collection_, &remaining_, err.out());
+    if (code == DUCKDB_V2_ERROR_NONE) {
+        code = duckdb_v2_column_data_collection_shared_scan_state_create(collection_, &shared_,
+                                                                         err.out());
+    }
+    if (code == DUCKDB_V2_ERROR_NONE) {
+        code = duckdb_v2_column_data_collection_worker_scan_state_create(collection_, &worker_,
+                                                                         err.out());
+    }
+    if (code != DUCKDB_V2_ERROR_NONE) {
+        duckdb_v2_column_data_collection_worker_scan_state_destroy(&worker_);
+        duckdb_v2_column_data_collection_shared_scan_state_destroy(&shared_);
+        duckdb_v2_column_data_collection_destroy(&collection_);
+        err.check(code, "ducky: ");
+    }
+    scratch_ = duckdb_create_data_chunk(types.data(), (idx_t)types.size());
+}
+
+TakenRows::~TakenRows() {
+    duckdb_destroy_data_chunk(&scratch_);
+    duckdb_v2_column_data_collection_worker_scan_state_destroy(&worker_);
+    duckdb_v2_column_data_collection_shared_scan_state_destroy(&shared_);
+    duckdb_v2_column_data_collection_destroy(&collection_);
+}
+
+duckdb_data_chunk TakenRows::scan() {
+    while (remaining_ > 0) {
+        bool produced = false;
+        V2Error err;
+        err.check(duckdb_v2_column_data_collection_scan(collection_, shared_, worker_,
+                                                        duckdb_data_chunk_get_v2(scratch_),
+                                                        &produced, err.out()),
+                  "ducky: ");
+        if (!produced) break;
+        idx_t size = duckdb_data_chunk_get_size(scratch_);
+        remaining_ -= size < remaining_ ? size : remaining_;
+        if (size == 0) continue;
+        // The collection keeps constant and dictionary columns compact; rows
+        // are read flat, as fetches return them.
+        duckdb_v2_data_chunk_handle chunk = duckdb_data_chunk_get_v2(scratch_);
+        idx_t columns = duckdb_data_chunk_get_column_count(scratch_);
+        for (idx_t c = 0; c < columns; ++c) {
+            duckdb_v2_vector_handle vector = nullptr;
+            err.check(duckdb_v2_data_chunk_get_vector(chunk, c, &vector, err.out()), "ducky: ");
+            err.check(duckdb_v2_vector_flatten(vector, err.out()), "ducky: ");
+        }
+        return scratch_;
+    }
+    remaining_ = 0;
+    return nullptr;
+}
+
 Execution::Execution(duckdb_v2_result_handle result, bool streaming) : result_(result) {
     // A statement without rows runs to its end anyway, and its count and
     // schema need it; so does one that expands into several, whose result
@@ -797,12 +845,28 @@ Execution::Execution(duckdb_v2_result_handle result, bool streaming) : result_(r
                type == DUCKDB_V2_RESULT_TYPE_QUERY_RESULT;
     // Its workers then run without waiting for each chunk to be taken. Were
     // it to fail, the result would stream, which reads the same rows.
-    if (!streaming) duckdb_v2_result_retain(result, nullptr);
+    retained_ = !streaming && duckdb_v2_result_retain(result, nullptr) == DUCKDB_V2_ERROR_NONE;
 }
 
 Execution::~Execution() {
     for (duckdb_data_chunk& chunk : chunks_) duckdb_destroy_data_chunk(&chunk);
+    duckdb_v2_column_data_collection_destroy(&rows_);
     destroy_v2_result(result_);
+}
+
+bool Execution::take_rows() {
+    // Statements without rows keep stepping: their count is a chunk's row.
+    DUCKDB_V2_RESULT_TYPE type;
+    if (duckdb_v2_result_get_result_type(result_, &type, nullptr) != DUCKDB_V2_ERROR_NONE ||
+        type != DUCKDB_V2_RESULT_TYPE_QUERY_RESULT) {
+        return false;
+    }
+    // Without the rows, it steps on, which fails as the query did, if it did.
+    if (duckdb_v2_result_take_collection(result_, &rows_, nullptr) != DUCKDB_V2_ERROR_NONE) {
+        retained_ = false;
+        return false;
+    }
+    return rows_ != nullptr;
 }
 
 bool Execution::run(std::chrono::steady_clock::time_point deadline) {
@@ -821,6 +885,12 @@ bool Execution::run(std::chrono::steady_clock::time_point deadline) {
             case DUCKDB_V2_RESULT_STEP_STATUS_CANCELLED:
                 throw DuckyError(kInterrupted);
             default:  // WAITING
+                // The step that ends execution reports WAITING, before any
+                // chunk is fetched.
+                if (retained_ && take_rows()) {
+                    settled_ = finished_ = true;
+                    break;
+                }
                 if (std::chrono::steady_clock::now() >= deadline) return false;
                 // Bounded, and woken when a task completes.
                 duckdb_v2_result_wait(result_, nullptr);
@@ -929,7 +999,18 @@ Result::Result(Execution& execution, std::shared_ptr<DuckDBHandle> handle)
     schema_v2_ = schema_handle;
     schema_ = std::move(schema);
 
-    // Take the chunks; a running streaming query stays with the Result.
+    // Take the rows; a running streaming query stays with the Result.
+    if (execution.rows_) {
+        duckdb_v2_column_data_collection_handle rows = std::exchange(execution.rows_, nullptr);
+        try {
+            taken_ = std::make_unique<TakenRows>(rows, column_types_);
+        } catch (...) {
+            for (duckdb_logical_type& logical : column_types_)
+                duckdb_destroy_logical_type(&logical);
+            duckdb_v2_schema_destroy(&schema_v2_);
+            throw;
+        }
+    }
     buffered_ = std::move(execution.chunks_);
     execution.chunks_.clear();
     for (duckdb_data_chunk chunk : buffered_) buffered_rows_ += duckdb_data_chunk_get_size(chunk);
@@ -959,10 +1040,9 @@ Result::~Result() {
 }
 
 void Result::release_chunk() {
-    if (chunk_) {
-        duckdb_destroy_data_chunk(&chunk_);
-        chunk_ = nullptr;
-    }
+    if (chunk_ && !chunk_borrowed_) duckdb_destroy_data_chunk(&chunk_);
+    chunk_ = nullptr;
+    chunk_borrowed_ = false;
     chunk_size_ = 0;
     cursor_ = 0;
 }
@@ -985,6 +1065,13 @@ duckdb_data_chunk Result::next_query_chunk_locked() {
     }
     // The error is sticky; the end too, since a finished stream is gone.
     if (!error_.empty()) throw DuckyError(error_);
+    if (taken_) {
+        // The scanned chunk is reused, so hand over a copy.
+        if (duckdb_data_chunk chunk = taken_->scan()) {
+            return copy_rows(chunk, 0, duckdb_data_chunk_get_size(chunk));
+        }
+        taken_.reset();
+    }
     while (stream_) {
         duckdb_v2_data_chunk_handle chunk = nullptr;
         V2Error err;
@@ -1010,27 +1097,47 @@ duckdb_data_chunk Result::next_query_chunk_locked() {
     return nullptr;
 }
 
+duckdb_data_chunk Result::copy_rows(duckdb_data_chunk chunk, idx_t offset, idx_t count) {
+    idx_t end = offset + count;
+    duckdb_data_chunk out = duckdb_create_data_chunk(column_types_.data(), column_count_);
+    duckdb_selection_vector sel = nullptr;
+    for (idx_t c = 0; c < column_count_; ++c) {
+        duckdb_vector source = duckdb_data_chunk_get_vector(chunk, c);
+        duckdb_vector target = duckdb_data_chunk_get_vector(out, c);
+        // Whole chunks of fixed-width values copy as bytes; copy_sel goes
+        // row by row.
+        if (size_t width = offset == 0 ? fast_arrow_width(types_[c]) : 0) {
+            std::memcpy(duckdb_vector_get_data(target), duckdb_vector_get_data(source),
+                        count * width);
+            if (uint64_t* validity = duckdb_vector_get_validity(source)) {
+                duckdb_vector_ensure_validity_writable(target);
+                std::memcpy(duckdb_vector_get_validity(target), validity,
+                            (count + 63) / 64 * sizeof(uint64_t));
+            }
+            continue;
+        }
+        if (!sel) {
+            sel = duckdb_create_selection_vector(end);
+            sel_t* index = duckdb_selection_vector_get_data_ptr(sel);
+            for (idx_t i = 0; i < end; ++i) index[i] = (sel_t)i;
+        }
+        duckdb_vector_copy_sel(source, target, sel, end, offset, 0);
+    }
+    if (sel) duckdb_destroy_selection_vector(sel);
+    duckdb_data_chunk_set_size(out, count);
+    return out;
+}
+
 duckdb_data_chunk Result::take_chunk_locked() {
     if (chunk_ && cursor_ < chunk_size_) {
         duckdb_data_chunk out;
-        if (cursor_ == 0) {
+        if (cursor_ == 0 && !chunk_borrowed_) {
             // Nothing of it was returned: hand the chunk over.
             out = chunk_;
             chunk_ = nullptr;
         } else {
             // Copy out the rows the row cursor buffered but has not returned.
-            idx_t count = chunk_size_ - cursor_;
-            out = duckdb_create_data_chunk(column_types_.data(), column_count_);
-            duckdb_selection_vector sel = duckdb_create_selection_vector(chunk_size_);
-            sel_t* index = duckdb_selection_vector_get_data_ptr(sel);
-            for (idx_t i = 0; i < chunk_size_; ++i) index[i] = (sel_t)i;
-            for (idx_t c = 0; c < column_count_; ++c) {
-                duckdb_vector_copy_sel(duckdb_data_chunk_get_vector(chunk_, c),
-                                       duckdb_data_chunk_get_vector(out, c), sel, chunk_size_,
-                                       cursor_, 0);
-            }
-            duckdb_destroy_selection_vector(sel);
-            duckdb_data_chunk_set_size(out, count);
+            out = copy_rows(chunk_, cursor_, chunk_size_ - cursor_);
         }
         release_chunk();
         return out;
@@ -1039,10 +1146,21 @@ duckdb_data_chunk Result::take_chunk_locked() {
     return next_query_chunk_locked();
 }
 
+BorrowedChunk Result::borrow_chunk_locked() {
+    if ((chunk_ && cursor_ < chunk_size_) || !taken_ || !buffered_.empty()) {
+        return BorrowedChunk(take_chunk_locked(), true);
+    }
+    release_chunk();
+    if (duckdb_data_chunk chunk = taken_->scan()) return BorrowedChunk(chunk, false);
+    taken_.reset();
+    return BorrowedChunk(next_query_chunk_locked(), true);
+}
+
 std::optional<idx_t> Result::remaining_rows_locked() const {
     // A failed query's rows are unknown; fetching raises its error.
     if (stream_ || !error_.empty()) return std::nullopt;
-    return buffered_rows_ + (chunk_ ? chunk_size_ - cursor_ : 0);
+    return buffered_rows_ + (taken_ ? taken_->remaining() : 0) +
+           (chunk_ ? chunk_size_ - cursor_ : 0);
 }
 
 std::vector<std::string> Result::column_types() const {
@@ -1067,7 +1185,10 @@ nb::object Result::description() const {
 bool Result::ensure_row() {
     if (chunk_ && cursor_ < chunk_size_) return true;
     release_chunk();
-    chunk_ = next_query_chunk_locked();
+    // Rows are decoded out of the chunk, so it may be borrowed.
+    BorrowedChunk next = borrow_chunk_locked();
+    chunk_ = std::exchange(next.chunk, nullptr);
+    chunk_borrowed_ = !next.owned;
     if (!chunk_) return false;
     chunk_size_ = duckdb_data_chunk_get_size(chunk_);
     cursors_.resize(column_count_);
@@ -1378,8 +1499,9 @@ nb::object Result::to_numpy(nb::object columns) {
 
         if (total > 0 && column_count_ > 0) {
             idx_t offset = 0;
-            while (duckdb_data_chunk taken = take_chunk_locked()) {
-                OwnedChunk scratch(taken);
+            while (true) {
+                BorrowedChunk scratch = borrow_chunk_locked();
+                if (!scratch.chunk) break;
                 idx_t sz = duckdb_data_chunk_get_size(scratch.chunk);
                 if (offset + sz > total) {
                     throw DuckyError("ducky: to_numpy: result produced more rows than expected");

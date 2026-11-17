@@ -10,6 +10,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "chunk.hpp"
@@ -38,9 +39,34 @@ struct CellDecoder {
     explicit CellDecoder(duckdb_logical_type logical);
 };
 
+// The rows of a retained query, taken whole from its result. Scans them
+// zero-copy into a chunk it owns and reuses.
+class TakenRows {
+   public:
+    // Takes `collection`, whose column types are `types`.
+    TakenRows(duckdb_v2_column_data_collection_handle collection,
+              std::vector<duckdb_logical_type>& types);
+    ~TakenRows();
+
+    TakenRows(const TakenRows&) = delete;
+    TakenRows& operator=(const TakenRows&) = delete;
+
+    idx_t remaining() const { return remaining_; }
+    // The next chunk of rows, or nullptr at the end. Owned by this and valid
+    // until the next scan: it may reference the collection's buffers.
+    duckdb_data_chunk scan();
+
+   private:
+    duckdb_v2_column_data_collection_handle collection_;
+    duckdb_v2_column_data_collection_shared_scan_state_handle shared_ = nullptr;
+    duckdb_v2_column_data_collection_worker_scan_state_handle worker_ = nullptr;
+    duckdb_data_chunk scratch_ = nullptr;
+    idx_t remaining_ = 0;
+};
+
 // Runs a C API v2 result to its end on the calling thread, unless it streams
 // rows: those run as they are fetched, so they settle at once. Owns the result
-// until a Result takes it, and the chunks stepped so far.
+// until a Result takes it, and the rows stepped or taken so far.
 class Execution {
    public:
     // Takes `result`.
@@ -61,11 +87,35 @@ class Execution {
    private:
     friend class Result;
 
+    // Takes the rows of a retained query that has run to its end. Returns
+    // whether it did.
+    bool take_rows();
+
     duckdb_v2_result_handle result_;
     bool settled_;
     bool finished_ = false;
+    // Whether the result is retained, so its rows can be taken whole.
+    bool retained_;
     // v1 views of the v2 chunks; see duckdb_v2_data_chunk_get_v1.
     std::deque<duckdb_data_chunk> chunks_;
+    // The rows of a retained query, taken instead of stepped into chunks_.
+    duckdb_v2_column_data_collection_handle rows_ = nullptr;
+};
+
+// A chunk that a consumer reads before taking the next one: owned by the
+// consumer or, when `owned` is false, borrowed from the Result.
+struct BorrowedChunk {
+    duckdb_data_chunk chunk = nullptr;
+    bool owned = false;
+    BorrowedChunk() = default;
+    BorrowedChunk(duckdb_data_chunk chunk, bool owned) : chunk(chunk), owned(owned) {}
+    ~BorrowedChunk() {
+        if (owned && chunk) duckdb_destroy_data_chunk(&chunk);
+    }
+    BorrowedChunk(const BorrowedChunk&) = delete;
+    BorrowedChunk& operator=(const BorrowedChunk&) = delete;
+    BorrowedChunk(BorrowedChunk&& other) noexcept
+        : chunk(std::exchange(other.chunk, nullptr)), owned(other.owned) {}
 };
 
 // The message of a query that connection_interrupt cancelled.
@@ -135,6 +185,11 @@ class Result {
     // chunk. Returns nullptr at the end; raises DuckyError when the query
     // failed. Requires the cursor lock.
     duckdb_data_chunk take_chunk_locked();
+    // The same rows as take_chunk_locked(), for a consumer that copies them
+    // out before taking more: valid until the next take or borrow, and
+    // borrowed from the Result where that saves copying them. Requires the
+    // cursor lock.
+    BorrowedChunk borrow_chunk_locked();
     // Exact number of unconsumed rows, or nullopt while a streaming query still
     // runs or after it failed. Requires the cursor lock.
     std::optional<idx_t> remaining_rows_locked() const;
@@ -149,6 +204,8 @@ class Result {
     // The next chunk of the query, skipping empty ones, or nullptr at its end.
     // Fetches with the GIL released. Requires the cursor lock.
     duckdb_data_chunk next_query_chunk_locked();
+    // A copy of `count` rows of `chunk` from `offset`, owned by the caller.
+    duckdb_data_chunk copy_rows(duckdb_data_chunk chunk, idx_t offset, idx_t count);
     // Ends the query, keeping `error` to raise from every later fetch.
     void end_stream(std::string error = "");
 
@@ -158,6 +215,8 @@ class Result {
     // Chunks stepped but not yet consumed, as v1 views, and their rows.
     std::deque<duckdb_data_chunk> buffered_;
     idx_t buffered_rows_ = 0;
+    // The rows of a retained query, read after buffered_; nullptr once read.
+    std::unique_ptr<TakenRows> taken_;
     // Set when the stream failed; raised by every later fetch.
     std::string error_;
     std::shared_ptr<DuckDBHandle> handle_;
@@ -181,6 +240,8 @@ class Result {
     };
 
     duckdb_data_chunk chunk_ = nullptr;
+    // Whether chunk_ is taken_'s, which the next scan overwrites.
+    bool chunk_borrowed_ = false;
     idx_t chunk_size_ = 0;
     idx_t cursor_ = 0;
     std::vector<ColumnCursor> cursors_;
