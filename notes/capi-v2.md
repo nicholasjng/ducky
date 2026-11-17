@@ -122,9 +122,8 @@ until then.
    lacks the SQL text, each operator's own name (`SEQ_SCAN` under a
    `TABLE_SCAN` node) and its `extra_info`, which carries the table, the pushed
    filters, projections, aggregates and estimated cardinality: what a profile
-   is read for. Its names differ (`query.total_time`, `operator.timing`) and it
-   has no grouped summary nodes, which a format change in ducky could absorb.
-   String-valued metrics would let ducky move profiling to v2.
+   is read for. `patches/0012-capi-v2-query-metrics-text.patch` keeps them,
+   as VARCHARs and a MAP.
 5. **Fetching into a caller-owned chunk.** `result_fetch_chunk` and
    `result_step` allocate a chunk per call. Reading a retained 10M-row result of
    two columns chunk by chunk, or into one Arrow batch, takes 15–20% longer than
@@ -235,6 +234,12 @@ exporter.
 
 `Connection.progress()` reads `connection_progress_get`, the same snapshot
 v1's `query_progress` reads.
+
+Profiles come from `connection_get_query_metrics`, with the text metrics of
+patch 0012, rendered into the tree v1's profiling info gave: an operator tree
+and one node per metric group, keyed without the group, with v1's text for each
+value. While a result streams, reading the profile fails instead of reporting
+the previous query's.
 
 Next candidates:
 
