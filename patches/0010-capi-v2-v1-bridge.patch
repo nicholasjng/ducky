@@ -10,6 +10,8 @@ duckdb_v2_bridge.h:
     the v1 handle does not count as the v2 connection's running statement.
   - duckdb_v2_data_chunk_get_v1(chunk): the v1 handle of a v2 data chunk. Both
     are the DataChunk, so the chunk is destroyed once, through either API.
+  - duckdb_data_chunk_get_v2(chunk): the reverse, for passing a v1 chunk to v2
+    functions such as an Arrow exporter.
   - duckdb_v2_logical_type_to_v1(type): a v1 copy of a v2 logical type, whose
     handles do not share a representation.
 
@@ -18,10 +20,10 @@ to its generator's definitions, or keep them in a hand-written header like this
 one.
 diff --git a/src/include/duckdb_v2_bridge.h b/src/include/duckdb_v2_bridge.h
 new file mode 100644
-index 00000000..92e2dfdc
+index 00000000..85b8e382
 --- /dev/null
 +++ b/src/include/duckdb_v2_bridge.h
-@@ -0,0 +1,63 @@
+@@ -0,0 +1,76 @@
 +//===----------------------------------------------------------------------===//
 +//
 +//                         DuckDB
@@ -71,6 +73,19 @@ index 00000000..92e2dfdc
 +DUCKDB_C_API duckdb_data_chunk duckdb_v2_data_chunk_get_v1(duckdb_v2_data_chunk_handle chunk);
 +
 +/*!
++ * Returns the C API v2 handle of a v1 data chunk, for passing it to v2 functions such as an Arrow exporter.
++ *
++ * Both handles are the same chunk: destroying it through either API destroys it for both, so destroy it once.
++ *
++ * history:
++ * - unstable: v2.0.0
++ *
++ * @param chunk The v1 data chunk.
++ * @return The v2 data chunk handle, or NULL when `chunk` is NULL.
++ */
++DUCKDB_C_API duckdb_v2_data_chunk_handle duckdb_data_chunk_get_v2(duckdb_data_chunk chunk);
++
++/*!
 + * Copies a v2 logical type into a C API v1 logical type.
 + *
 + * history:
@@ -86,7 +101,7 @@ index 00000000..92e2dfdc
 +}
 +#endif
 diff --git a/src/main/capi/v2/capi_v2_connection.cpp b/src/main/capi/v2/capi_v2_connection.cpp
-index 2d88d63c..301870cb 100644
+index 2d88d63c..62af4b01 100644
 --- a/src/main/capi/v2/capi_v2_connection.cpp
 +++ b/src/main/capi/v2/capi_v2_connection.cpp
 @@ -1,4 +1,5 @@
@@ -95,7 +110,7 @@ index 2d88d63c..301870cb 100644
  
  using namespace duckdb::capiv2;
  
-@@ -26,6 +27,25 @@ DUCKDB_V2_ERROR duckdb_v2_connection_destroy(duckdb_v2_connection_handle *conn)
+@@ -26,6 +27,29 @@ DUCKDB_V2_ERROR duckdb_v2_connection_destroy(duckdb_v2_connection_handle *conn)
  	});
  }
  
@@ -108,6 +123,10 @@ index 2d88d63c..301870cb 100644
 +duckdb_data_chunk duckdb_v2_data_chunk_get_v1(duckdb_v2_data_chunk_handle chunk) {
 +	// Both handles are the DataChunk itself
 +	return reinterpret_cast<duckdb_data_chunk>(chunk ? Convert(chunk) : nullptr);
++}
++
++duckdb_v2_data_chunk_handle duckdb_data_chunk_get_v2(duckdb_data_chunk chunk) {
++	return Convert(reinterpret_cast<duckdb::DataChunk *>(chunk));
 +}
 +
 +duckdb_logical_type duckdb_v2_logical_type_to_v1(duckdb_v2_logical_type_handle type) {
