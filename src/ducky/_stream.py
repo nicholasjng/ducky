@@ -64,7 +64,7 @@ def shuffle(buffer: int | Literal["global"] = 64, *, seed: int = 0) -> Shuffle:
 
 def _auto_shard() -> tuple[int, int, bool]:
     """This process's (rank, world size) across DDP ranks and DataLoader
-    workers, and whether there are several DDP ranks."""
+    workers, and whether there are several DDP ranks, which even_shards needs."""
     torch = sys.modules.get("torch")
     if torch is None:  # nothing to shard across without torch
         return 0, 1, False
@@ -155,8 +155,9 @@ class _Batcher:
         bs, n = self.batch_size, self.n
         picked = np.sort(self.rng.choice(n, bs, replace=False))
         out = {name: buf[picked] for name, buf in self.bufs.items()}
-        # Move the unpicked rows among the last `bs` into the picked rows'
-        # holes below them; both sets have the same size.
+        # The unpicked rows among the last `bs` fill the picked rows' holes
+        # below them, which keeps the buffer contiguous. Both sets have the same
+        # size.
         tail = n - bs
         holes = picked[picked < tail]
         picked_in_tail = np.zeros(bs, dtype=bool)
@@ -239,8 +240,8 @@ def _to_backend(batch: dict[str, np.ndarray], backend: str, device: Any) -> dict
 
 
 def _register_with_torch() -> None:
-    """Make streams torch ``IterableDataset``s, which DataLoader requires of
-    iterable inputs, once torch is in use; ducky doesn't import torch itself."""
+    """DataLoader requires an ``IterableDataset`` of iterable inputs, but ducky
+    doesn't import torch itself, so streams register once torch is in use."""
     if "torch" in sys.modules:
         import torch.utils.data
 
@@ -248,7 +249,7 @@ def _register_with_torch() -> None:
 
 
 class Stream[ArrayT: AbstractArray]:
-    """Batches of one fold, streamed from the source; iterate once per epoch.
+    """Batches of one fold, streamed from the source. Iterate once per epoch.
 
     :attr:`categories` holds each category field's categories, indexed by its
     codes. Each full pass advances :attr:`epoch`, which reseeds the shuffle. Under
@@ -326,7 +327,7 @@ class Stream[ArrayT: AbstractArray]:
         return {"epoch": self.epoch, "batch": self._batch}
 
     def load_state_dict(self, state: dict[str, int]) -> None:
-        """Resume where :meth:`state_dict` was taken; the next iteration skips
+        """Resume where :meth:`state_dict` was taken. The next iteration skips
         the batches already yielded (reading, not training on, them). Without
         it, an iteration cut short is not resumed: the next starts its epoch over."""
         self.epoch = int(state["epoch"])
@@ -357,8 +358,8 @@ class Stream[ArrayT: AbstractArray]:
     def _connect(self) -> tuple[Connection, bool]:
         if self._con is not None:
             return self._con, False
-        # How far DuckDB executes ahead of the reader; at the default (10 MiB)
-        # wide rows such as embeddings stream mostly single-threaded.
+        # At the default read-ahead (10 MiB), wide rows such as embeddings
+        # stream mostly single-threaded.
         con = connect()
         con.execute(f"SET streaming_buffer_size = {_quote_literal(self.read_ahead)}")
         return con, True
@@ -452,7 +453,7 @@ class Stream[ArrayT: AbstractArray]:
                     self._count(con, self._shard_source(files, rank, world)[0])[0]
                     for rank in range(world)
                 ]
-                # Uneven files would trim too much; shard their rows instead.
+                # Uneven files would trim too much, so shard their rows instead.
                 if min(counts) * world < 0.99 * sum(counts):
                     files = None
             if files is None:
@@ -654,7 +655,7 @@ def stream(
     read per epoch instead of held in memory.
 
     ``shard=(rank, world_size)`` reads only every ``world_size``-th share of
-    the fold; by default it comes from ``torch.distributed`` and DataLoader
+    the fold. By default it comes from ``torch.distributed`` and DataLoader
     workers. Shards hash each row's identity, so every shard scans the whole
     source, except that with a ``key`` and at least ``world_size`` Parquet files
     each shard reads only its own files.

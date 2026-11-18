@@ -116,7 +116,7 @@ def run_mlx() -> None:
         if epoch % 50 == 0:
             tr_loss = bce(params, Xtr, ytr)
             val_loss = bce(params, Xval, yval)
-            # `array == array` is typed `array | bool`; it's always an array here.
+            # `array == array` is typed `array | bool`, but it's always an array here.
             correct = (model(params, Xval) > 0.5) == (yval > 0.5)
             assert isinstance(correct, mx.array)
             val_acc = mx.mean(correct)

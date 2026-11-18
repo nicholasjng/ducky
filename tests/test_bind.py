@@ -120,10 +120,9 @@ def test_bind_unsupported_type(con):
         con.execute("SELECT ?", [object()])
 
 
-# Integer parameters bind at the width the statement expects (see
-# bind_int64_as_param_type in connection.cpp): a BIGINT value bound into e.g.
-# an INTEGER parameter would otherwise force DuckDB to re-bind and re-plan the
-# statement on every execute.
+# Integers bind at the width the plan assumed (see V2Parameters in
+# connection.cpp), since a BIGINT bound to an INTEGER parameter would make
+# DuckDB bind and plan again on every execute.
 
 
 def test_bind_int_widths_roundtrip(con):

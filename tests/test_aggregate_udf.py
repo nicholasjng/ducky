@@ -113,9 +113,9 @@ def test_rmse(con):
 
 def test_combine_is_required(con):
     # DuckDB merges partial states for parallel scans, DISTINCT, window frames
-    # and large GROUP BYs, even single-threaded, and arbitrary Python state has
-    # no generic merge: registration rejects a class without combine() rather
-    # than failing (or answering wrongly) depending on data size.
+    # and large GROUP BYs, even single-threaded. Rejecting a class without
+    # combine() at registration beats failing, or answering wrongly, depending
+    # on data size.
     with pytest.raises(ducky.Error, match="must define combine"):
         con.create_aggregate_function(
             "no_comb_sum", NoCombineSum, parameters=["DOUBLE"], return_type="DOUBLE"

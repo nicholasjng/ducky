@@ -10,8 +10,7 @@ import ducky
 
 
 def test_load_statically_linked_extension_succeeds(con):
-    # json is statically linked and already registered, so LOAD is a no-op that
-    # returns success — a clean positive path through load_extension.
+    # json is statically linked, so LOAD is a successful no-op.
     con.load_extension("json")
     assert con.execute("SELECT json('[1,2]')").fetchone() == ("[1,2]",)
 
@@ -28,8 +27,8 @@ def test_load_after_close_raises(con):
 
 
 def test_single_quote_in_path_is_escaped(con):
-    # A path with a single quote must not break the `LOAD '<path>'` literal:
-    # the failure should be a file/IO error, never a SQL parser error.
+    # A single quote must not break the `LOAD '<path>'` literal, so the failure
+    # is an IO error, never a parser error.
     with pytest.raises(ducky.Error) as exc:
         con.load_extension("/tmp/we'ird.duckdb_extension")
     assert "Parser" not in str(exc.value)
@@ -37,9 +36,8 @@ def test_single_quote_in_path_is_escaped(con):
 
 
 def test_allow_unsigned_extensions_reaches_open_config():
-    # allow_unsigned_extensions is an open-only DuckDB setting exposed as a typed
-    # DuckDBConfig key; it must reach duckdb_set_config before open, observable
-    # via current_setting().
+    # allow_unsigned_extensions can only be set when opening, so it must reach
+    # the config before open.
     con = ducky.connect(allow_unsigned_extensions=True)
     assert con.execute("SELECT current_setting('allow_unsigned_extensions')").fetchone() == (True,)
 
@@ -49,8 +47,8 @@ def test_default_connect_is_signed_only(con):
 
 
 def test_icu_statically_linked(con):
-    # icu is in ducky's static set (parity with duckdb-python), so ICU-only
-    # features like the TimeZone setting work out of the box — no extension load.
+    # icu is linked statically, as in duckdb-python, so the TimeZone setting
+    # works without loading anything.
     loaded = {
         name
         for (name,) in con.execute(
@@ -71,10 +69,9 @@ def test_icu_statically_linked(con):
     ),
 )
 def test_load_external_unsigned_extension(con):
-    # Integration test for a genuinely not-statically-linked extension. DuckDB's
-    # embedded BUILD_EXTENSIONS model force-links every extension it builds, so
-    # ducky's own build can't emit a loadable-only binary — CI builds one
-    # out-of-band (against our pinned commit) and points DUCKY_EXT_BINARY at it.
+    # DuckDB's build links every extension it builds statically, so a loadable
+    # one has to be built separately against the pin and passed in
+    # DUCKY_EXT_BINARY.
     binary = os.environ["DUCKY_EXT_BINARY"]
 
     # Self-built binaries are unsigned: the default (signed-only) connection must
@@ -83,7 +80,7 @@ def test_load_external_unsigned_extension(con):
     with pytest.raises(ducky.Error):
         signed_only.load_extension(binary)
 
-    # With allow_unsigned_extensions, the same binary loads (its platform / ABI /
-    # version were stamped from our exact build, so the metadata check passes).
+    # With allow_unsigned_extensions it loads, since its metadata was stamped
+    # from the same build.
     con = ducky.connect(allow_unsigned_extensions=True)
     con.load_extension(binary)

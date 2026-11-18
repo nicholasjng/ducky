@@ -11,10 +11,8 @@
 
 namespace nb = nanobind;
 
-// Forward decl; full type in connection.hpp.
 class Connection;
 
-// Flat DuckDB and DLPack type metadata.
 struct TypeSpec {
     const char* name;
     duckdb_type type;
@@ -23,10 +21,8 @@ struct TypeSpec {
     nb::dlpack::dtype (*dtype)();
 };
 
-// Return a supported type or throw.
 const TypeSpec& lookup_typespec(const std::string& name);
 
-// Return flat type metadata, or nullptr when unsupported.
 const TypeSpec* typespec_for(duckdb_type type);
 
 // A fixed-size ARRAY of a flat type, nested to any depth (FLOAT[4][3]). Its
@@ -38,17 +34,14 @@ struct ArrayLayout {
     size_t values_per_row = 1;
 };
 
-// Fill `out` and return true if `logical` is such an ARRAY.
 bool array_layout(duckdb_logical_type logical, ArrayLayout& out);
 
-// Descend from an ARRAY vector to the child vector holding its values.
 inline duckdb_vector array_leaf(duckdb_vector v, const ArrayLayout& layout) {
     for (size_t i = 0; i < layout.dims.size(); ++i) v = duckdb_array_vector_get_child(v);
     return v;
 }
 
-// An ENUM type's labels, in code order; raises for other types, naming
-// column `name`.
+// `name` is for the error other types raise.
 nb::list enum_categories(duckdb_logical_type logical, const std::string& name);
 
 // Cached NumPy dtypes for structured DuckDB storage.
@@ -59,12 +52,10 @@ struct StructDtypes {
 };
 const StructDtypes& struct_dtypes();
 
-// Register a chunk-wise NumPy scalar UDF.
 void create_scalar_function(Connection& con, const std::string& name, nb::callable fn,
                             nb::object parameters, nb::object return_type, nb::object varargs,
                             nb::object init, bool is_volatile, bool special_handling);
 
-// Register an Arrow scalar UDF.
 void create_arrow_scalar_function(Connection& con, const std::string& name, nb::callable fn,
                                   nb::object parameters, const std::string& return_type,
                                   bool record_batch);

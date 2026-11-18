@@ -1,10 +1,8 @@
 #pragma once
 
-// The Arrow C Data Interface and C Stream Interface, copied verbatim from the
-// ABI-stable specification (https://arrow.apache.org/docs/format/CDataInterface.html).
-// DuckDB's duckdb.h only forward-declares `struct ArrowSchema` / `struct
-// ArrowArray`; these are the full definitions, guarded by the canonical macros
-// so they coexist with any other copy in the translation unit.
+// Copied verbatim from the ABI-stable specification
+// (https://arrow.apache.org/docs/format/CDataInterface.html), since duckdb.h only
+// forward-declares the structs. The canonical guards let other copies coexist.
 
 #include <cstdint>
 

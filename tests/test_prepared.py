@@ -141,7 +141,7 @@ def test_dataframe_path_on_prepared_result(con):
 
 
 def test_close_waits_for_running_executemany(con):
-    # executemany releases the GIL per row; close() from another thread must
+    # executemany releases the GIL per row, so close() from another thread must
     # wait for it rather than free the statement underneath it.
     con.execute("CREATE TABLE t (a INT)")
     stmt = con.prepare("INSERT INTO t VALUES (?)")

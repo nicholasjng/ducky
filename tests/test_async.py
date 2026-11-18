@@ -63,11 +63,9 @@ async def test_aexecute_loop_stays_responsive():
     await con.aexecute("SELECT count(*) FROM range(40_000_000) t(i) WHERE i % 7 = 0")
     elapsed = time.monotonic() - start
     hb.cancel()
-    # Self-normalized against the query's own measured duration (not an
-    # absolute machine-speed guess): a loop blocked for most of that time
-    # would tick once or twice regardless of how long the query actually
-    # took, so requiring ticks roughly proportional to elapsed/interval (50%
-    # tolerance for scheduling jitter) catches that "ticks > 0" cannot.
+    # Normalized by the query's measured duration rather than a machine-speed
+    # guess: a blocked loop ticks once or twice however long the query takes,
+    # which "ticks > 0" would miss. 50% tolerance absorbs scheduling jitter.
     expected_min = max(1, int(elapsed / interval * 0.5))
     assert ticks >= expected_min, (
         f"event loop was blocked during the async query: {ticks} ticks over {elapsed:.3f}s "
@@ -84,7 +82,7 @@ async def test_aexecute_cancellation_interrupts_and_survives():
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
-    # The connection survives an interrupted query — a fresh one still runs.
+    # The connection survives an interrupted query.
     res = await con.aexecute("SELECT 1")
     assert res.fetchitem() == 1
 

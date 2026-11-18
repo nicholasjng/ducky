@@ -17,7 +17,7 @@ def test_repeated_execute_returns_fresh_results(con):
 
 def test_parameters_do_not_leak_between_calls(con):
     assert con.execute("SELECT ?::INT", [1]).fetchone() == (1,)
-    # A fresh prepare starts unbound; the cached statement must behave the same.
+    # A fresh prepare starts unbound, and the cached statement must too.
     with pytest.raises(ducky.Error, match=r"[Pp]arameter"):
         con.execute("SELECT ?::INT")
 
@@ -38,7 +38,7 @@ def test_rebind_after_schema_change(con):
 
 def test_set_invalidates_settings_dependent_plans(con):
     # The optimizer folds current_setting() into the plan, and DuckDB does not
-    # rebind prepared statements on SET — so SET must flush the cache.
+    # rebind prepared statements on SET, so SET must flush the cache.
     query = "SELECT current_setting('enable_profiling')"
     assert con.execute(query).fetchitem() is None
     con.execute("SET enable_profiling='no_output'")
@@ -81,7 +81,7 @@ def test_streaming_and_materialized_share_cached_statement(con):
 
 
 def test_correct_past_lru_capacity(con):
-    # More distinct queries than the cache holds; eviction must be invisible.
+    # More distinct queries than the cache holds, whose eviction must be invisible.
     for i in range(300):
         assert con.execute(f"SELECT {i}").fetchone() == (i,)
     assert con.execute("SELECT 0").fetchone() == (0,)
@@ -96,9 +96,9 @@ def test_close_with_populated_cache(con):
 
 
 def test_concurrent_eviction_keeps_cache_consistent(con):
-    # Evicting destroys a statement with the GIL released; other threads
-    # filling the cache meanwhile must not see it half-updated. Overlapping
-    # queries on one connection are refused, which is fine here.
+    # Evicting destroys a statement with the GIL released, so other threads
+    # filling the cache must not see it half-updated. DuckDB refusing overlapping
+    # queries on one connection is fine here.
     errors = []
 
     def worker(base):

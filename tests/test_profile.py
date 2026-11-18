@@ -70,17 +70,13 @@ def test_profile_restores_on_exception(con):
 
 
 def test_profile_result_does_not_pin_connection(con):
-    # A long-lived ProfileResult must not keep a transient connection open —
-    # _con is dropped on context exit. Connection is a nanobind type without
-    # weakref support, so verify via the refcount delta instead.
+    # A long-lived ProfileResult must not keep a transient connection open.
+    # Connection has no weakref support, hence the refcount check.
     before = sys.getrefcount(con)
     with ducky.profile(con) as p:
         con.execute("SELECT 1").fetchall()
     assert p._con is None
     after = sys.getrefcount(con)
-    # The only added refs across the block come from the `with` machinery's
-    # locals, which are gone by the time we check. ProfileResult must not
-    # contribute one.
     assert after == before, f"profile leaked a reference (before={before}, after={after})"
 
 
@@ -197,10 +193,8 @@ def test_set_profile_sink_rejects_bad_mode(con):
 
 
 def test_set_profile_sink_skips_streaming(con):
-    # Streaming results profile the *previous* materialized query (the chunks
-    # for the streaming one haven't been pulled yet), so we deliberately skip
-    # emission. Verify by interleaving and checking the sink doesn't see the
-    # streaming query.
+    # A streaming result's profile would be the previous query's, since its
+    # chunks haven't been pulled yet, so the sink skips it.
     sqls: list[str] = []
     con.set_profile_sink(lambda sql, _info: sqls.append(sql))
     con.execute("SELECT 1").fetchall()
@@ -212,15 +206,15 @@ def test_set_profile_sink_skips_streaming(con):
 
 
 def test_set_profile_sink_swallows_sink_errors(con):
-    # A buggy sink must not break the query; the exception is forwarded to
-    # sys.unraisablehook instead of propagating.
+    # A buggy sink must not break the query, so its exception goes to
+    # sys.unraisablehook.
     import sys
 
     def bad(_sql, _info):
         raise RuntimeError("sink boom")
 
-    # Keep only the exception type: retaining the UnraisableHookArgs would pin
-    # its traceback (and through the frame chain, this test's locals) forever.
+    # Retaining the UnraisableHookArgs would pin its traceback, and through it
+    # this test's locals.
     seen = []
     previous_hook = sys.unraisablehook
     sys.unraisablehook = lambda args: seen.append(args.exc_type)
@@ -262,12 +256,8 @@ def test_jsonl_profile_sink_with_info_false(tmp_path, con):
 
 
 def test_jsonl_profile_sink_thread_safe_under_concurrent_writers(tmp_path):
-    # jsonl_profile_sink documents its writes as lock-serialized across
-    # threads; every prior test only exercises it from one thread. Hammer one
-    # shared sink from several threads/connections at once and check every
-    # line is intact, valid JSON with the right total count -- a broken (or
-    # removed) lock would show up as interleaved/corrupted lines, dropped
-    # writes, or a json.loads failure.
+    # jsonl_profile_sink serializes writes with a lock. A broken lock would show
+    # as interleaved lines, dropped writes or invalid JSON.
     import json
     import threading
 
@@ -322,8 +312,7 @@ def test_profile_config_from_env_reads_all_knobs(monkeypatch, tmp_path):
 
 
 def test_profile_config_constructor_defaults():
-    # The class is general-purpose, not tied to env — defaults match
-    # set_profile_sink's defaults.
+    # Defaults match set_profile_sink's.
     def sink(_sql, _info):
         return None
 
@@ -343,8 +332,7 @@ def test_connect_installs_env_sink(tmp_path, monkeypatch):
 
     _profile._env_sink_cache.clear()
 
-    # Must connect() after setenv above — the sink installs at connect time,
-    # so the `con` fixture (connects before the test body runs) would miss it.
+    # The sink installs at connect time, which the `con` fixture would precede.
     con = ducky.connect()
     for k in range(5):
         con.execute(f"SELECT {k}").fetchall()

@@ -138,8 +138,8 @@ def test_table_udf_blob_with_embedded_nul(con):
 
 
 def test_profile_sink_cycle_is_collectable():
-    # `con` must live only inside make() — a fixture-provided one would stay
-    # reachable for the whole test, and the cycle below would never collect.
+    # `con` must live only inside make(), since a fixture's would stay reachable
+    # for the whole test, and the cycle below would never collect.
     def make():
         con = ducky.connect()
 
@@ -922,7 +922,7 @@ def test_arrow_fast_path_validity_across_misaligned_chunks(con):
 
 
 def test_prepared_order_by_without_insertion_order():
-    # Every query runs as a prepared statement (an EXECUTE in DuckDB); its ORDER
+    # Every query runs as a prepared statement (an EXECUTE in DuckDB), whose ORDER
     # BY must keep the result ordered when insertion order is not preserved.
     con = ducky.connect(threads=4)
     con.execute("CREATE TABLE t AS SELECT (hash(range) % 1000000)::BIGINT a FROM range(3000000)")
@@ -935,7 +935,7 @@ def test_prepared_order_by_without_insertion_order():
 
 
 def test_compact_columns_read_flat_through_every_reader(con):
-    # A materialized result keeps constant and dictionary columns compact;
+    # A materialized result keeps constant and dictionary columns compact, but
     # every reader must see them flat, including after a partial read.
     pytest.importorskip("pyarrow")
     query = (

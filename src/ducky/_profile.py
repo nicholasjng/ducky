@@ -20,7 +20,7 @@ ProfileSink = Callable[[str, dict[str, Any]], None]
 
 
 class ProfileResult:
-    """Profile captured by :func:`profile`; ``info`` holds the latest tree."""
+    """Profile captured by :func:`profile`. ``info`` holds the latest tree."""
 
     __slots__ = ("_con", "info")
 

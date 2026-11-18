@@ -8,12 +8,7 @@
 
 #include "arrow_abi.h"
 
-// Shared helpers for the Arrow C Data/Stream interface paths (appender,
-// arrow_scan, UDF trampoline in function.cpp). Header-only so the single
-// definition is shared across translation units.
-
-// Drain a duckdb_error_data into `out`; returns true if it carried an error
-// (and copied its message out). The error_data is always destroyed.
+// Always destroys the error_data, so callers cannot leak it on either path.
 inline bool drain_arrow_error(duckdb_error_data err, std::string& out) {
     if (!err) return false;
     bool has = duckdb_error_data_has_error(err);
@@ -22,7 +17,7 @@ inline bool drain_arrow_error(duckdb_error_data err, std::string& out) {
     return has;
 }
 
-// Release-on-scope-exit for Arrow C structs we own (e.g. on exception).
+// Releases owned Arrow C structs on scope exit, including on exceptions.
 struct SchemaRelease {
     ArrowSchema* s;
     ~SchemaRelease() {
@@ -36,8 +31,7 @@ struct ArrayRelease {
     }
 };
 
-// RAII for a duckdb_arrow_converted_schema: default-construct, then fill
-// `.schema` (typically by passing &guard.schema as an out-param).
+// Filled through `&guard.schema` as an out-parameter.
 struct ConvertedSchemaRelease {
     duckdb_arrow_converted_schema schema = nullptr;
     ~ConvertedSchemaRelease() {
@@ -45,7 +39,7 @@ struct ConvertedSchemaRelease {
     }
 };
 
-// Takes `batch` over for windows to share; the last one releases it.
+// Windows share the batch, so the last one releases it.
 inline std::shared_ptr<ArrowArray> share_batch(ArrowArray& batch) {
     auto* owned = new ArrowArray(batch);
     batch.release = nullptr;
@@ -68,12 +62,11 @@ inline void release_window(ArrowArray* array) {
     array->release = nullptr;
 }
 
-// The batch owns the columns; a view's release only marks it released.
+// The batch owns the columns, so a view's release only marks it released.
 inline void release_column_view(ArrowArray* array) { array->release = nullptr; }
 
-// Rows [offset, offset + count) of `batch`, zero-copy, sliced as Arrow slices a
-// record batch: each column's offset and length change, and nested arrays
-// follow their parent's offset.
+// Sliced as Arrow slices a record batch, so it stays zero-copy: each column's
+// offset and length change, and nested arrays follow their parent's offset.
 inline ArrowArray window_of(const std::shared_ptr<ArrowArray>& batch, idx_t offset, idx_t count) {
     auto* w = new ArrowWindow{batch, {}, {}};
     w->columns.reserve((size_t)batch->n_children);

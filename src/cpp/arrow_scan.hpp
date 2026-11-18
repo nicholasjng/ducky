@@ -13,13 +13,11 @@ namespace nb = nanobind;
 
 class Connection;
 
-// A registered Arrow source.
 struct ArrowSource {
     // Reusable sources (tables, data frames) are re-streamed for every scan.
     nb::object object;
-    // One-shot sources (readers, query results) yield their batches once: their
-    // single stream capsule is taken at registration, and `consumed` is set when
-    // a scan starts reading it.
+    // One-shot sources (readers, query results) yield their batches once, so the
+    // capsule is taken at registration and `consumed` lets a second scan raise.
     nb::object stream;
     bool consumed = false;
 };
@@ -38,8 +36,7 @@ struct ArrowRegistry {
     tsl::robin_map<std::string, ArrowSource> sources;
 };
 
-// Install Arrow table and replacement scans, returning their shared registry.
 std::shared_ptr<ArrowRegistry> install_arrow_scan(Connection& con);
 
-// Register (or replace) `obj` as `name`. Requires the GIL.
+// Requires the GIL.
 void register_arrow_source(ArrowRegistry& registry, const std::string& name, nb::object obj);

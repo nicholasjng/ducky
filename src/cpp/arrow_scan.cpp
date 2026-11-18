@@ -26,8 +26,8 @@ std::string lowercase(const std::string& s) {
     return out;
 }
 
-// The registry reference DuckDB holds in its user-data slots. Heap-allocated so
-// the C void*/destroy-callback pair can carry a strong reference.
+// Heap-allocated so DuckDB's void* and destroy callback can carry a strong
+// reference.
 using RegistryRef = std::shared_ptr<ArrowRegistry>;
 
 void registry_ref_destroy(void* ptr) { delete (RegistryRef*)ptr; }
@@ -38,10 +38,9 @@ duckdb_v2_opaque registry_ref(const std::shared_ptr<ArrowRegistry>& reg) {
 
 ArrowRegistry* registry_of(void* user_data) { return ((RegistryRef*)user_data)->get(); }
 
-// Plan-time state, immutable after bind. Plans outlive single executions —
-// Connection.run()'s statement cache and explicit PreparedStatements re-execute
-// the same plan — so nothing consumable (the stream, its cursor) may live here;
-// that is per-execution state and goes in ArrowScanState below.
+// Immutable after bind. The statement cache and PreparedStatements re-execute
+// a plan, so nothing consumable (the stream, its cursor) may live here. That
+// goes in ArrowScanState.
 struct ArrowScanBind {
     std::string key;                   // registry key (lowercased name)
     ArrowRegistry* reg = nullptr;      // kept alive by the table function's user data
@@ -51,18 +50,17 @@ struct ArrowScanBind {
 
 void arrow_scan_bind_destroy(void* ptr) { delete (ArrowScanBind*)ptr; }
 
-// Per-execution state. Batches are pulled lazily, one at a time, by whichever
-// worker needs the next window (holding `mu`, and the GIL while the producer
-// runs), so a LIMIT stops reading early and memory stays bounded to the
-// batches still being emitted. Workers convert vector-size windows of the
-// current batch in parallel without the GIL, each with its own importer.
+// Batches are pulled one at a time by whichever worker needs the next window,
+// so a LIMIT stops reading early and memory stays bounded to the batches still
+// being emitted. Workers convert vector-size windows of the current batch in
+// parallel without the GIL, each with its own importer.
 struct ArrowScanState {
     std::mutex mu;
-    nb::object capsule;                  // owns the stream; dropped under the GIL
+    nb::object capsule;                  // owns the stream, dropped under the GIL
     ArrowArrayStream* stream = nullptr;  // borrowed from capsule
     ArrowSchema schema{};                // the stream's, owned
-    // Source column for each output column, and the schema of those columns:
-    // a view of `schema`.
+    // The source column of each output column, and their schema, a view of
+    // `schema`.
     std::vector<idx_t> projection;
     std::vector<ArrowSchema*> projected_children;
     ArrowSchema projected{};
@@ -76,8 +74,7 @@ struct ArrowScanState {
     }
 };
 
-// A worker's converter. It borrows the query's client context, which outlives
-// the scan.
+// Borrows the query's client context, which outlives the scan.
 struct ArrowScanLocal {
     duckdb_v2_arrow_importer_handle importer = nullptr;
     ~ArrowScanLocal() { duckdb_v2_arrow_importer_destroy(&importer); }
@@ -91,9 +88,8 @@ void arrow_scan_local_destroy(void* ptr) { delete (ArrowScanLocal*)ptr; }
                      (m ? std::string(": ") + m : ""));
 }
 
-// A stream capsule for the source registered under `key`: a fresh one for a
-// reusable source, the stored one for a one-shot source. With `consume`, a
-// one-shot source is marked as read and a second read raises. Requires the GIL.
+// With `consume`, a one-shot source is marked as read so a second read raises
+// instead of returning nothing. Requires the GIL.
 nb::object source_stream(ArrowRegistry* reg, const std::string& key, bool consume,
                          ArrowArrayStream*& out) {
     nb::object object, capsule;
@@ -125,8 +121,7 @@ nb::object source_stream(ArrowRegistry* reg, const std::string& key, bool consum
     return capsule;
 }
 
-// A struct ArrowArray exposing a subset of another's children. Owns the
-// original array, which it releases (with every child) when released itself.
+// Owns the original array, releasing it with every child when released itself.
 struct ProjectedArray {
     ArrowArray original;
     std::vector<ArrowArray*> children;
@@ -140,7 +135,6 @@ void release_projected(ArrowArray* array) {
     array->release = nullptr;
 }
 
-// Move `source` into a view with the given children; `source` is left released.
 ArrowArray project_array(ArrowArray& source, const std::vector<idx_t>& columns) {
     auto* p = new ProjectedArray{source, {}};
     source.release = nullptr;
@@ -155,9 +149,8 @@ ArrowArray project_array(ArrowArray& source, const std::vector<idx_t>& columns) 
     return view;
 }
 
-// The next window of at most a vector of rows, pulling batches until one has
-// rows; a released array at the end. Requires the scan state's lock; takes the
-// GIL for the producer only.
+// A released array at the end. Requires the scan state's lock, and takes the
+// GIL only while the producer runs.
 ArrowArray next_window(ArrowScanState& s) {
     while (!s.current || s.next_offset >= (idx_t)s.current->length) {
         s.current.reset();
@@ -185,7 +178,6 @@ ArrowArray next_window(ArrowScanState& s) {
     return window;
 }
 
-// The registered table name, the scan's sole argument.
 std::string scan_key(duckdb_v2_function_bind_info_handle info) {
     V2Error err;
     duckdb_v2_value_handle value = nullptr;
@@ -290,12 +282,12 @@ void arrow_scan_init(duckdb_v2_table_function_init_global_info_handle info,
             s->projection.push_back(col);
             s->projected_children.push_back(schema.children[col]);
         }
-        s->projected = schema;  // borrowed children; never released
+        s->projected = schema;  // borrowed children, never released
         s->projected.n_children = (int64_t)s->projected_children.size();
         s->projected.children = s->projected_children.data();
         s->projected.release = nullptr;
 
-        // Workers share the stream; DuckDB caps this at its thread count.
+        // Workers share the stream, and DuckDB caps this at its thread count.
         e.check(duckdb_v2_table_function_init_global_set_max_threads(info, 1024, e.out()));
         duckdb_v2_opaque data{state.release(), &gil_delete<ArrowScanState>, nullptr};
         DUCKDB_V2_ERROR set =
@@ -377,9 +369,8 @@ void arrow_scan_function(duckdb_v2_table_function_exec_info_handle info,
     });
 }
 
-// When DuckDB can't resolve a table name, rewrite it to ducky_arrow_scan('name')
-// if that name is in the registry. Runs during planning; only touches the map
-// structure (no nb::object), so no GIL needed here.
+// Runs during planning and touches only the map structure, not Python objects,
+// so it needs no GIL.
 void arrow_replacement_scan(duckdb_v2_replacement_scan_info_handle info,
                             duckdb_v2_context_handle context, duckdb_v2_error_info_handle* err) {
     report(err, [&] {
@@ -421,8 +412,8 @@ void arrow_replacement_scan(duckdb_v2_replacement_scan_info_handle info,
     });
 }
 
-// Readers and query results yield their batches once; tables and data frames
-// can be streamed again for every scan.
+// Readers and query results yield their batches once, while tables and data
+// frames can be streamed again for every scan.
 bool is_one_shot(nb::handle obj) {
     return nb::hasattr(obj, "read_next_batch") || nb::hasattr(obj, "fetch_chunk");
 }
@@ -476,7 +467,6 @@ std::shared_ptr<ArrowRegistry> install_arrow_scan(Connection& con) {
         set_registry(&duckdb_v2_table_function_set_user_data, f);
         check(duckdb_v2_table_function_set_name(f, SCAN_FUNCTION, std::strlen(SCAN_FUNCTION),
                                                 err.out()));
-        // Sole parameter: the registered table name.
         duckdb_v2_function_signature_handle sig = nullptr;
         check(duckdb_v2_table_function_get_signature(f, &sig, err.out()));
         duckdb_v2_logical_type_handle varchar = nullptr;

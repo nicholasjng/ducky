@@ -10,9 +10,8 @@
 
 namespace {
 
-// DuckDB primitive type → DLPack/numpy dtype matching the in-memory layout.
-// Temporal types come back as their raw integer storage (DATE int32 days,
-// TIMESTAMP int64 micros). Non-flat types return false.
+// Temporal types map to their integer storage (DATE int32 days, TIMESTAMP int64
+// micros), which keeps their views zero-copy.
 bool dtype_for(duckdb_type t, nb::dlpack::dtype& out) {
     if (const TypeSpec* spec = typespec_for(t)) {
         out = spec->dtype();
@@ -21,8 +20,8 @@ bool dtype_for(duckdb_type t, nb::dlpack::dtype& out) {
     return false;
 }
 
-// Wrap n * itemsize bytes as a zero-copy uint8 ndarray, then .view(dtype) it
-// into a structured array of n elements. `owner` pins the underlying buffer.
+// nanobind cannot describe structured dtypes, so NumPy reinterprets a uint8 view.
+// `owner` pins the underlying buffer.
 nb::object make_struct_view(void* data, size_t n, size_t itemsize, nb::object dtype,
                             nb::handle owner) {
     size_t byte_count = n * itemsize;
@@ -93,8 +92,8 @@ std::vector<std::string> Chunk::column_types() {
 
 idx_t ChunkSchema::resolve(nb::object key) const {
     if (nb::isinstance<nb::str>(key)) {
-        // Borrow PyUnicode's cached UTF-8; the std::string ctor only allocates
-        // for the probe key (and once more on miss for the error message).
+        // PyUnicode's cached UTF-8 saves a copy, so only the probe key and a
+        // miss's error message allocate.
         Py_ssize_t size = 0;
         const char* data = PyUnicode_AsUTF8AndSize(key.ptr(), &size);
         if (!data) throw nb::python_error();
@@ -119,7 +118,6 @@ nb::object Chunk::column(nb::object key, nb::handle owner) {
 }
 
 nb::object Chunk::column_at(idx_t i, nb::handle owner) {
-    // Primitive / temporal types and ARRAYs of them — zero-copy ndarray.
     void* data;
     nb::dlpack::dtype dtype;
     std::vector<size_t> shape;
@@ -131,7 +129,6 @@ nb::object Chunk::column_at(idx_t i, nb::handle owner) {
     size_t n = (size_t)size_;
     duckdb_type tid = type_id(i);
 
-    // Structured types — zero-copy uint8 buffer reinterpreted via numpy .view().
     const StructDtypes& sd = struct_dtypes();
     if (tid == DUCKDB_TYPE_HUGEINT) {
         return make_struct_view(data, n, sizeof(duckdb_hugeint), sd.hugeint, owner);

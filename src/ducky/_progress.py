@@ -28,10 +28,10 @@ class _AsciiBar:
         self._desc = desc
         self._out = out
         self._width = width
-        self._last = -1  # last rendered integer percent; skip redundant redraws
+        self._last = -1  # last rendered integer percent, to skip redundant redraws
 
     def update_to(self, pct: float) -> None:
-        # DuckDB reports -1.0 until it has an estimate; clamp into [0, 100].
+        # DuckDB reports -1.0 until it has an estimate, so clamp into [0, 100].
         pct = 0.0 if pct < 0 else min(pct, 100.0)
         if int(pct) == self._last:
             return
@@ -54,7 +54,7 @@ class _TqdmBar:
         self._bar = tqdm_cls(total=100, desc=desc, file=out, unit="%")
 
     def update_to(self, pct: float) -> None:
-        if pct < 0:  # no estimate yet — leave the bar at its current position
+        if pct < 0:  # no estimate yet, so the bar stays where it is
             return
         self._bar.n = min(pct, 100.0)
         self._bar.refresh()

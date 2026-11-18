@@ -23,7 +23,6 @@ using namespace nb::literals;
 
 namespace {
 
-// Cached module handles.
 const nb::module_& conversions() {
     static std::atomic<nb::module_*> cached{nullptr};
     static nb::ft_mutex mu;
@@ -36,7 +35,6 @@ const nb::module_& aio() {
     return cached_singleton(cached, mu, [] { return nb::module_::import_("ducky._aio"); });
 }
 
-// Register conversions shared by Result and Connection.
 template <typename Cls, typename Src>
 void def_conversions(Cls& cls, Src src) {
     cls.def(
@@ -61,7 +59,7 @@ void def_conversions(Cls& cls, Src src) {
         [src](nb::object self) { return conversions().attr("fetchnumpy")(src(self)); },
         nb::sig("def fetchnumpy(self) -> dict[str, numpy.ndarray]"),
         "Return the result as a dict of column name -> numpy array. Numeric and temporal columns,\n"
-        "fixed-size ARRAYs of them, and ENUM codes only; use arrow() for strings and other nested\n"
+        "fixed-size ARRAYs of them, and ENUM codes only. Use arrow() for strings and other nested\n"
         "types. NULLs become NaN in FLOAT/DOUBLE columns and raise elsewhere.");
     cls.def(
         "chunks", [src](nb::object self) { return conversions().attr("chunks")(src(self)); },
@@ -164,8 +162,8 @@ NB_MODULE(_core, m) {
     // NOLINTNEXTLINE(bugprone-unused-raii)
     nb::exception<DuckyError>(m, "Error");
 
-    nb::class_<DefaultSentinel>(m, "Default",
-                                "Sentinel type for appender DEFAULT values; use ``ducky.DEFAULT``.")
+    nb::class_<DefaultSentinel>(
+        m, "Default", "Type of ``ducky.DEFAULT``, the appender's marker for a column DEFAULT.")
         .def("__repr__", [](const DefaultSentinel&) { return "ducky.DEFAULT"; });
     m.attr("DEFAULT") = nb::cast(DefaultSentinel{});
 
@@ -179,7 +177,7 @@ NB_MODULE(_core, m) {
                 return nb::cast<Chunk&>(self).column(key, self);
             },
             "key"_a, nb::sig("def column(self, key: int | str) -> numpy.ndarray"),
-            "Return a zero-copy ndarray view by index or name; (rows, *dims) for an ARRAY, codes "
+            "Return a zero-copy ndarray view by index or name: (rows, *dims) for an ARRAY, codes "
             "for\n"
             "an ENUM.")
         .def("categories", &Chunk::categories, "key"_a,
@@ -228,7 +226,7 @@ NB_MODULE(_core, m) {
              ":class:`Error` on any other shape.",
              nb::lock_self())
         .def_prop_ro("rows_changed", &Result::rows_changed,
-                     "Rows affected by INSERT, UPDATE, or DELETE; otherwise 0.", nb::lock_self())
+                     "Rows affected by INSERT, UPDATE, or DELETE, otherwise 0.", nb::lock_self())
         .def("fetch_chunk", &Result::fetch_chunk, nb::sig("def fetch_chunk(self) -> Chunk | None"),
              "Pull the next :class:`Chunk`, or None at end of stream.", nb::lock_self())
         .def("fetch_numpy_chunk", &Result::fetch_numpy_chunk, "fill_nulls"_a = false,
@@ -246,9 +244,9 @@ NB_MODULE(_core, m) {
             "an\n"
             "(n, *dims) array and an ENUM column its integer codes (see categories()). NULLs "
             "become\n"
-            "NaN in FLOAT/DOUBLE columns and raise elsewhere. Raises on VARCHAR/LIST/STRUCT/MAP; "
-            "use\n"
-            "arrow() for those.",
+            "NaN in FLOAT/DOUBLE columns and raise elsewhere. Raises on VARCHAR/LIST/STRUCT/MAP, "
+            "for\n"
+            "which arrow() works.",
             nb::lock_self())
         .def("categories", &Result::categories, "key"_a,
              nb::sig("def categories(self, key: int | str) -> list[str]"),
@@ -353,10 +351,10 @@ NB_MODULE(_core, m) {
 
     nb::enum_<PendingState>(m, "PendingState", "State of an async query's executor after a tick.")
         .value("READY", PendingState::READY, "The result is ready to materialize.")
-        .value("NOT_READY", PendingState::NOT_READY, "More work remains; tick again.")
-        .value("ERROR", PendingState::ERROR, "Execution failed; see ``.error()``.")
+        .value("NOT_READY", PendingState::NOT_READY, "More work remains, so tick again.")
+        .value("ERROR", PendingState::ERROR, "Execution failed, see ``.error()``.")
         .value("NO_TASKS", PendingState::NO_TASKS,
-               "Workers own the outstanding tasks; yield, then tick again.");
+               "Workers own the outstanding tasks, so yield, then tick again.");
 
     nb::class_<PendingResult>(m, "PendingResult", "Steppable in-flight query handle.")
         .def("execute_task", &PendingResult::execute_task,
@@ -369,7 +367,7 @@ NB_MODULE(_core, m) {
         .def("error", &PendingResult::error, nb::sig("def error(self) -> str"),
              "DuckDB's message for the most recent error, may be empty.")
         .def("materialize", &PendingResult::materialize, nb::sig("def materialize(self) -> Result"),
-             "Materialize the finished result; call once ``execute_task`` reports ``READY``.")
+             "Materialize the finished result once ``execute_task`` reports ``READY``.")
         .def("drain", &PendingResult::drain, nb::sig("def drain(self) -> None"),
              "Interrupt the query and drain the executor (cancellation teardown).");
 
@@ -464,7 +462,7 @@ NB_MODULE(_core, m) {
                      "Column names of the most recent result, or None.", nb::lock_self())
         .def_prop_ro("current_result", &Connection::current_result,
                      nb::sig("def current_result(self) -> Result"),
-                     "The latest execute result; raises if no query has run.", nb::lock_self());
+                     "The latest execute result. Raises if no query has run.", nb::lock_self());
     def_conversions(conn_cls, [](nb::object self) {
         return nb::cast(nb::cast<Connection&>(self).current_result());
     });
@@ -497,7 +495,7 @@ NB_MODULE(_core, m) {
         nb::sig("def to_numpy(self, columns: collections.abc.Iterable[str] | None = None) "
                 "-> dict[str, numpy.ndarray]"),
         "Drain the latest result into a {name: numpy.ndarray} dict. Raises on\n"
-        "VARCHAR/LIST/STRUCT/MAP; use arrow() for those.");
+        "VARCHAR/LIST/STRUCT/MAP, for which arrow() works.");
     conn_cls
         .def(
             "create_function",
@@ -518,7 +516,7 @@ NB_MODULE(_core, m) {
                     "*, volatile: bool = False, special_handling: bool = False) -> None"),
             "Register a chunk-wise NumPy scalar UDF. Types may be explicit or inferred. Rows with "
             "a NULL\n"
-            "argument are not passed to fn and yield NULL; with special_handling, inputs and "
+            "argument are not passed to fn and yield NULL. With special_handling, inputs and "
             "output use\n"
             "``(values, validity)`` tuples instead.",
             nb::lock_self())
@@ -573,10 +571,10 @@ NB_MODULE(_core, m) {
                     "catalog: str | None = None) -> Appender"),
             "Open a bulk appender for ``table``.", nb::lock_self())
         .def("interrupt", &Connection::interrupt,
-             "Request cancellation of a running query; thread-safe.")
+             "Request cancellation of a running query. Thread-safe.")
         .def("progress", &Connection::progress,
              nb::sig("def progress(self) -> tuple[float, int, int]"),
-             "Return ``(percentage, rows_processed, total_rows)``; percentage is -1 "
+             "Return ``(percentage, rows_processed, total_rows)``, with percentage -1 "
              "until estimated.")
         .def("get_profiling_info", &Connection::get_profiling_info,
              nb::sig("def get_profiling_info(self) -> dict[str, typing.Any] | None"),
@@ -593,9 +591,9 @@ NB_MODULE(_core, m) {
              nb::sig("def register_arrow(self, name: str, obj: typing.Any) -> None"),
              "Register an Arrow C stream source as table ``name`` (matched case-insensitively). "
              "Tables and\n"
-             "data frames are re-read by every query; readers and query results are one-shot and "
-             "can be\n"
-             "scanned once.",
+             "data frames are re-read by every query, while readers and query results are one-shot "
+             "and can\n"
+             "be scanned once.",
              nb::lock_self())
         .def("load_extension", &Connection::load_extension, "name"_a,
              nb::sig("def load_extension(self, name: str) -> None"),

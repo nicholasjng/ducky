@@ -41,12 +41,9 @@ def test_progress_bar_runs_query_and_finalizes():
 
 
 def test_progress_bar_renders_live_progress():
-    # The bar must reflect actual *intermediate* progress while the query
-    # runs, not just close()'s unconditional 100% finalize -- a broken poll
-    # loop, or a dead con.progress() binding, would still pass a test that
-    # only checks the final render (see test_progress_bar_runs_query_and_finalizes).
-    # A real table scan (not range(), which doesn't report progress) with
-    # threads=1 gives deterministic, monotonically increasing percentages.
+    # close() always renders 100%, so a broken poll loop would pass a test of
+    # the final render alone. A table scan with threads=1 reports monotonic
+    # progress, which range() doesn't.
     con = ducky.connect(threads=1)
     con.execute("CREATE TABLE t AS SELECT i FROM range(30_000_000) t(i)")
     out = io.StringIO()
@@ -89,8 +86,7 @@ def test_progress_bar_restores_settings(con):
 
 
 def test_progress_bar_does_not_print_duckdb_native_bar(capfd):
-    # enable_progress_bar_print is forced off, so DuckDB never writes its own
-    # bar to stdout — only our handle (here a StringIO) sees output.
+    # enable_progress_bar_print is forced off, so only our handle sees output.
     con = ducky.connect(threads=2)
     out = io.StringIO()
     with ducky.progress_bar(con, out=out, use_tqdm=False, interval=0.01):

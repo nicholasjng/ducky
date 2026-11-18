@@ -77,7 +77,7 @@ def test_arrow_query_overload_born_as_arrow(con):
     import pyarrow as pa
 
     con.execute("CREATE TABLE t AS SELECT range AS a, range * 2 AS b FROM range(20000)")
-    # arrow(query) collects; arrow() (no arg) converts the current result. Both equal.
+    # arrow(query) collects, while arrow() converts the current result.
     collected = con.arrow("SELECT * FROM t")
     assert isinstance(collected, pa.Table)
     converted = con.execute("SELECT * FROM t").arrow()

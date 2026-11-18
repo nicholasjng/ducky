@@ -49,7 +49,7 @@ def test_dict_style(con):
 
 
 def test_dtype_round_trip(con):
-    # FLOAT in, FLOAT out — verify the dtype check is strict.
+    # FLOAT in, FLOAT out, so the dtype check must be strict.
     con.create_function(
         "neg",
         lambda x: -x,
@@ -300,9 +300,8 @@ def test_volatile_function_runs(con):
 
 
 def test_volatile_not_constant_folded(con):
-    # Two calls with the same literal argument should both invoke the UDF when
-    # marked volatile — without volatile the optimizer is free to evaluate it
-    # once and reuse the result (common subexpression elimination).
+    # Without volatile, the optimizer may evaluate two calls with the same
+    # literal once.
     calls = [0]
 
     def stamp(x):
@@ -323,8 +322,8 @@ def test_volatile_not_constant_folded(con):
 
 
 def test_special_handling_observes_null_input(con):
-    # With special_handling=True, the UDF sees the input mask and can produce
-    # a non-NULL output even where the input is NULL — here, coalesce to 0.
+    # special_handling lets the UDF see the mask and return a value for a NULL
+    # input, here 0.
     con.execute("CREATE TABLE t (x BIGINT)")
     con.execute("INSERT INTO t VALUES (1), (NULL), (3)")
 
@@ -372,8 +371,7 @@ def test_special_handling_all_valid_mask(con):
 
 
 def test_special_handling_dict_style(con):
-    # Dict-style input under special_handling: each value in the kwargs dict is
-    # a (values, mask) tuple keyed by the parameter name.
+    # Under special_handling, each dict value is a (values, mask) tuple.
     con.execute("CREATE TABLE t (a BIGINT, b BIGINT)")
     con.execute("INSERT INTO t VALUES (1, 10), (NULL, 20), (3, NULL)")
 
@@ -395,13 +393,9 @@ def test_special_handling_dict_style(con):
 
 
 def test_init_state_threads_through_call(con):
-    # init='s return value is passed as the first positional arg of the UDF
-    # on every call. This only exercises a single chunk/thread; see
-    # test_init_state_persists_across_chunks for state persisting across
-    # multiple chunks on one thread. Genuine multi-worker-thread init=
-    # isolation isn't independently covered here -- forcing DuckDB to
-    # actually parallelize a specific query isn't something a unit test can
-    # do deterministically.
+    # init='s return value is the UDF's first argument on every call. Per-thread
+    # isolation goes untested, since a unit test can't force DuckDB to
+    # parallelize a query deterministically.
 
     def factory():
         return {"calls": 0}
@@ -419,13 +413,13 @@ def test_init_state_threads_through_call(con):
         volatile=True,
     )
     rows = con.sql("SELECT stamp(i) FROM range(8) t(i)").fetchall()
-    # Single chunk in a small range; state increments to 1 for every row.
+    # A single chunk, so the state increments to 1 for every row.
     assert {r[0] for r in rows} == {1}
 
 
 def test_init_state_persists_across_chunks():
-    # With >STANDARD_VECTOR_SIZE rows DuckDB emits multiple chunks; per-thread
-    # state must persist so the counter keeps incrementing.
+    # More than STANDARD_VECTOR_SIZE rows span several chunks, across which
+    # per-thread state must persist.
     n = 5000
     con = ducky.connect("", threads=1)
 
@@ -445,7 +439,7 @@ def test_init_state_persists_across_chunks():
         volatile=True,
     )
     arr = con.sql(f"SELECT stamp(i) AS v FROM range({n}) t(i)").to_numpy()["v"]
-    # The counter must reach > 1 — at least one chunk boundary was crossed.
+    # A counter above 1 shows a chunk boundary was crossed.
     assert arr.max() > 1
 
 
@@ -545,15 +539,14 @@ def test_special_handling_state_and_mask_combine(con):
         volatile=True,
     )
     rows = sorted(r[0] for r in con.sql("SELECT fillnc(x) FROM t").fetchall())
-    # Non-null values pass through (1, 3, 5); the two NULL slots get the
-    # running NULL count (the exact replacement depends on chunk ordering,
-    # but at least one of the NULL-replaced rows must reflect a count >= 1).
+    # Non-null values pass through (1, 3, 5), and the NULL slots get the running
+    # NULL count, whose exact values depend on chunk order.
     assert {1, 3, 5}.issubset(set(rows))
     assert any(r >= 1 and r not in (1, 3, 5) for r in rows)
 
 
 def test_constant_arguments(con):
-    # Constant arguments arrive unflattened; with only constants, the UDF runs
+    # Constant arguments arrive unflattened, so with only constants the UDF runs
     # for a single row.
     con.create_function(
         "add", lambda a, b: a + b, parameters=["BIGINT", "BIGINT"], return_type="BIGINT"

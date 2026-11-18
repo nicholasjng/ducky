@@ -20,7 +20,6 @@ using namespace nb::literals;
 
 namespace {
 
-// Cached Python conversion types.
 struct PyTypes {
     nb::object timezone_utc;    // datetime.timezone.utc
     nb::type_object timezone;   // datetime.timezone
@@ -66,8 +65,7 @@ nb::object steal_checked(PyObject* obj) {
     return nb::steal(obj);
 }
 
-// Build a Python int from a 128-bit value: unsigned low half + already-boxed
-// (signed or unsigned) high half.
+// The high half arrives boxed, so its signedness is already decided.
 nb::object combine_128(nb::object high, uint64_t low) {
     nb::object shift = steal_checked(PyLong_FromLong(64));
     nb::object hi = steal_checked(PyNumber_Lshift(high.ptr(), shift.ptr()));
@@ -88,8 +86,8 @@ int64_t floor_div(int64_t a, int64_t b) {
     return (a % b != 0 && (a < 0) != (b < 0)) ? q - 1 : q;
 }
 
-// Finite dates outside Python's range raise ValueError; ±infinity maps to
-// date.min / date.max.
+// Finite dates outside Python's range raise ValueError, while ±infinity maps to
+// date.min and date.max.
 nb::object date_to_py(int32_t days) {
     if (!duckdb_is_finite_date(duckdb_date{days})) {
         return days > 0 ? py_types().date_max : py_types().date_min;
@@ -138,7 +136,7 @@ nb::object timestamp_to_py(int64_t micros, bool utc) {
     return timestamp_micros_to_py(micros, utc);
 }
 
-// TIMESTAMP_S / TIMESTAMP_MS: scale to microseconds without overflowing.
+// Scaling TIMESTAMP_S and TIMESTAMP_MS to microseconds can overflow.
 nb::object scaled_timestamp_to_py(int64_t value, int64_t micros_per_unit, bool finite) {
     if (!finite) return infinite_timestamp(value, false);
     if (value > std::numeric_limits<int64_t>::max() / micros_per_unit ||
@@ -152,13 +150,13 @@ nb::object timestamp_ns_to_py(int64_t nanos) {
     if (!duckdb_is_finite_timestamp_ns(duckdb_timestamp_ns{nanos})) {
         return infinite_timestamp(nanos, false);
     }
-    // datetime has microsecond resolution: round towards negative infinity so
-    // instants before the epoch don't move forward.
+    // datetime has microsecond resolution. Rounding towards negative infinity
+    // keeps instants before the epoch from moving forward.
     return timestamp_micros_to_py(floor_div(nanos, 1000), false);
 }
 
-// DuckDB stores UUIDs as int128 with the high bit flipped (so signed ordering
-// matches UUID ordering); flip it back for the unsigned 128-bit value.
+// DuckDB flips the high bit of a UUID's int128 so signed ordering matches UUID
+// ordering.
 nb::object uuid_to_py(duckdb_hugeint value) {
     uint64_t high = (uint64_t)value.upper ^ (uint64_t(1) << 63);
     nb::object as_int = combine_128(steal_checked(PyLong_FromUnsignedLongLong(high)), value.lower);
@@ -183,14 +181,13 @@ nb::object decimal_to_py(void* data, idx_t row, duckdb_type internal, uint8_t sc
         default:
             throw DuckyError("ducky: unexpected DECIMAL storage type");
     }
-    // scaleb shifts the decimal point exactly; the wide context avoids rounding.
+    // scaleb shifts the decimal point exactly, and the wide context avoids rounding.
     return py_types().decimal(unscaled).attr("scaleb")(-(int)scale, py_types().decimal_ctx);
 }
 
 nb::object interval_to_py(duckdb_interval value) {
-    // timedelta approximates one month as 30 days; Arrow preserves components.
-    // Normalize in 64 bits: PyDelta_FromDSU takes ints, so seconds and
-    // microseconds must already be in range.
+    // timedelta approximates one month as 30 days, unlike Arrow, which keeps the
+    // components. PyDelta_FromDSU takes ints, so normalize in 64 bits first.
     int64_t seconds = floor_div(value.micros, 1000000);
     int64_t micros = value.micros - seconds * 1000000;
     int64_t days = (int64_t)value.days + (int64_t)value.months * 30 + floor_div(seconds, 86400);
@@ -249,7 +246,6 @@ nb::object bignum_to_py(const duckdb_string_t& value) {
 
 nb::object convert_value(CellDecoder& decoder, duckdb_vector vector, idx_t row);
 
-// Convert one cell of `vector`, whose data and validity are passed in.
 nb::object convert_cell(CellDecoder& decoder, duckdb_vector vector, void* data, uint64_t* validity,
                         idx_t row) {
     if (validity && !duckdb_validity_row_is_valid(validity, row)) return nb::none();
@@ -368,8 +364,8 @@ nb::object convert_cell(CellDecoder& decoder, duckdb_vector vector, void* data, 
             return fields;
         }
         case DUCKDB_TYPE_UNION: {
-            // Physical layout: STRUCT(tag UTINYINT, member_0, member_1, ...);
-            // the value is the member the tag selects.
+            // Physical layout: STRUCT(tag UTINYINT, member_0, member_1, ...), the
+            // tag selecting the member.
             duckdb_vector tags = duckdb_struct_vector_get_child(vector, 0);
             uint8_t tag = ((uint8_t*)duckdb_vector_get_data(tags))[row];
             if (tag >= decoder.children.size()) throw DuckyError("ducky: UNION tag out of range");
@@ -405,13 +401,12 @@ nb::object convert_cell(CellDecoder& decoder, duckdb_vector vector, void* data, 
     }
 }
 
-// Convert one cell of `vector`, resolving its data and validity.
 nb::object convert_value(CellDecoder& decoder, duckdb_vector vector, idx_t row) {
     return convert_cell(decoder, vector, duckdb_vector_get_data(vector),
                         duckdb_vector_get_validity(vector), row);
 }
 
-// Return the byte width when DuckDB and Arrow layouts match, otherwise 0.
+// 0 unless DuckDB's and Arrow's layouts match, so the bytes copy as they are.
 size_t fast_arrow_width(duckdb_type t) {
     switch (t) {
         case DUCKDB_TYPE_TINYINT:
@@ -440,8 +435,8 @@ size_t fast_arrow_width(duckdb_type t) {
     }
 }
 
-// Arrow stream state for a Result. Callbacks may run on any thread, with or
-// without the GIL; they only touch the Result through its cursor lock.
+// Callbacks may run on any thread, with or without the GIL, so they only touch
+// the Result through its cursor lock.
 struct ArrowStreamState {
     nb::object owner;                          // keeps the Result alive
     Result* result;                            // borrowed from owner
@@ -479,14 +474,13 @@ struct ChunkList {
     }
 };
 
-// Records the error of a failed exporter call; returns true when it failed.
+// True when the exporter call failed, recording its error.
 bool consume_error(ArrowStreamState* state, DUCKDB_V2_ERROR code, const V2Error& err) {
     if (code == DUCKDB_V2_ERROR_NONE) return false;
     state->last_error = err.text();
     return true;
 }
 
-// Owns all buffers and child structures for one record batch.
 struct FastBatch {
     std::vector<void*> allocations;                      // data + validity buffers to free
     std::vector<ArrowArray> children;                    // one struct per column (stable)
@@ -501,7 +495,6 @@ struct FastBatch {
     FastBatch(const FastBatch&) = delete;
     FastBatch& operator=(const FastBatch&) = delete;
 
-    // Allocate and register a buffer owned by this batch.
     void* alloc(size_t bytes) {
         void* p = std::malloc(bytes);
         if (!p) throw std::bad_alloc();
@@ -518,7 +511,7 @@ void fast_release_root(ArrowArray* a) {
     a->private_data = nullptr;
 }
 
-// Merge a chunk's NULLs into a lazily allocated Arrow validity bitmap.
+// Allocated lazily, since most columns have no NULLs.
 void mark_nulls(FastBatch* b, uint8_t*& validity, size_t valid_bytes, uint64_t* val, idx_t sz,
                 size_t row_off) {
     if (!validity) {
@@ -527,9 +520,9 @@ void mark_nulls(FastBatch* b, uint8_t*& validity, size_t valid_bytes, uint64_t* 
     }
     idx_t r = 0;
 #if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
-    // DuckDB's mask is LSB-first uint64 words, so on little-endian machines
-    // its bytes are Arrow bitmap bytes: copy the whole ones (every chunk but
-    // a short last one starts byte-aligned).
+    // DuckDB's mask is LSB-first uint64 words, so on little-endian machines its
+    // bytes are Arrow bitmap bytes. Every chunk but a short last one starts
+    // byte-aligned, so whole bytes copy directly.
     if (row_off % 8 == 0) {
         r = sz / 8 * 8;
         std::memcpy(validity + row_off / 8, val, r / 8);
@@ -543,7 +536,6 @@ void mark_nulls(FastBatch* b, uint8_t*& validity, size_t valid_bytes, uint64_t* 
     }
 }
 
-// Publish the batch as a struct array, transferring ownership to `out`.
 void finish_fast_batch(std::unique_ptr<FastBatch> b, ArrowArray* out, idx_t total, idx_t ncols,
                        const std::vector<uint8_t*>& validities) {
     for (idx_t c = 0; c < ncols; ++c) {
@@ -575,7 +567,6 @@ int stream_get_schema(ArrowArrayStream* stream, ArrowSchema* out) {
     return consume_error(state, code, err) ? EIO : 0;
 }
 
-// Build one combined batch from exactly `total` remaining rows.
 void build_fast_batch_known_total(ArrowStreamState* state, ArrowArray* out, idx_t total) {
     Result& result = *state->result;
     idx_t ncols = result.column_names().size();
@@ -613,7 +604,7 @@ void build_fast_batch_known_total(ArrowStreamState* state, ArrowArray* out, idx_
     finish_fast_batch(std::move(b), out, total, ncols, validities);
 }
 
-// Drain layout-compatible columns into one Arrow batch. Requires the cursor lock.
+// Requires the cursor lock.
 void build_fast_batch(ArrowStreamState* state, ArrowArray* out) {
     // The remaining count is taken now, under the cursor lock, so rows other
     // consumers pulled since the capsule was created are accounted for.
@@ -654,9 +645,8 @@ void build_fast_batch(ArrowStreamState* state, ArrowArray* out) {
 int stream_get_next(ArrowArrayStream* stream, ArrowArray* out) {
     auto* state = (ArrowStreamState*)stream->private_data;
     out->release = nullptr;  // Arrow signals end-of-stream with a released array.
-    // Nothing below touches Python objects; drop the GIL (if the consumer
-    // holds it) before waiting on the cursor, and keep it dropped while DuckDB
-    // executes, so workers running Python callbacks can take it.
+    // Nothing below touches Python objects, so the GIL stays released while
+    // DuckDB executes, letting workers running Python callbacks take it.
     release_gil_if_held release;
     try {
         std::unique_lock<std::mutex> lock = state->result->lock_cursor();
@@ -666,7 +656,6 @@ int stream_get_next(ArrowArrayStream* stream, ArrowArray* out) {
             build_fast_batch(state, out);
             return 0;
         }
-        // Convert one DuckDB chunk into Arrow-owned buffers.
         // The exporter copies the chunk, so it may be borrowed.
         BorrowedChunk chunk = state->result->borrow_chunk_locked();
         if (!chunk.chunk) return 0;  // exhausted
@@ -820,8 +809,8 @@ duckdb_data_chunk TakenRows::scan() {
         idx_t size = duckdb_data_chunk_get_size(scratch_);
         remaining_ -= size < remaining_ ? size : remaining_;
         if (size == 0) continue;
-        // The collection keeps constant and dictionary columns compact; rows
-        // are read flat, as fetches return them.
+        // The collection keeps constant and dictionary columns compact, but
+        // fetches return rows flat.
         duckdb_v2_data_chunk_handle chunk = duckdb_data_chunk_get_v2(scratch_);
         idx_t columns = duckdb_data_chunk_get_column_count(scratch_);
         for (idx_t c = 0; c < columns; ++c) {
@@ -836,9 +825,9 @@ duckdb_data_chunk TakenRows::scan() {
 }
 
 Execution::Execution(duckdb_v2_result_handle result, bool streaming) : result_(result) {
-    // A statement without rows runs to its end anyway, and its count and
-    // schema need it; so does one that expands into several, whose result
-    // type is not known yet.
+    // A statement without rows runs to its end anyway, since its count and
+    // schema need it. So does one that expands into several, whose result type
+    // is not known yet.
     DUCKDB_V2_RESULT_TYPE type;
     settled_ = streaming &&
                duckdb_v2_result_get_result_type(result, &type, nullptr) == DUCKDB_V2_ERROR_NONE &&
@@ -905,7 +894,6 @@ nb::object Result::arrow_c_stream(nb::object self, bool allow_fast) {
     if (!handle_ || !handle_->connection_v2) {
         throw DuckyError("ducky: Arrow export is unavailable; the connection is closed");
     }
-    // A stream-owned exporter with the connection's Arrow settings.
     std::vector<duckdb_v2_logical_type_handle> field_types(column_count_);
     std::vector<const char*> field_names(column_count_);
     std::vector<idx_t> field_lengths(column_count_);
@@ -960,8 +948,8 @@ nb::object Result::arrow_c_stream(nb::object self, bool allow_fast) {
 
 Result::Result(Execution& execution, std::shared_ptr<DuckDBHandle> handle)
     : handle_(std::move(handle)) {
-    // PyDateTimeAPI is static per-TU; prime ours so the *_to_py helpers can
-    // use PyDate_FromDate / PyTime_FromTime / etc. unconditionally.
+    // PyDateTimeAPI is static per translation unit, and the *_to_py helpers
+    // call PyDate_FromDate and friends without checking it.
     if (!PyDateTimeAPI) PyDateTime_IMPORT;
     duckdb_v2_result_handle result = execution.result_;
 
@@ -999,7 +987,7 @@ Result::Result(Execution& execution, std::shared_ptr<DuckDBHandle> handle)
     schema_v2_ = schema_handle;
     schema_ = std::move(schema);
 
-    // Take the rows; a running streaming query stays with the Result.
+    // A running streaming query keeps its rows with the Result.
     if (execution.rows_) {
         duckdb_v2_column_data_collection_handle rows = std::exchange(execution.rows_, nullptr);
         try {
@@ -1063,7 +1051,7 @@ duckdb_data_chunk Result::next_query_chunk_locked() {
         if (size > 0) return chunk;
         duckdb_destroy_data_chunk(&chunk);
     }
-    // The error is sticky; the end too, since a finished stream is gone.
+    // The error is sticky, and so is the end, since a finished stream is gone.
     if (!error_.empty()) throw DuckyError(error_);
     if (taken_) {
         // The scanned chunk is reused, so hand over a copy.
@@ -1077,7 +1065,7 @@ duckdb_data_chunk Result::next_query_chunk_locked() {
         V2Error err;
         DUCKDB_V2_ERROR code;
         {
-            // A fetch drives the query's execution; DuckDB workers running
+            // A fetch drives the query's execution, and DuckDB workers running
             // Python UDFs or Arrow scans need the GIL meanwhile.
             release_gil_if_held release;
             code = duckdb_v2_result_fetch_chunk(stream_, &chunk, err.out());
@@ -1104,8 +1092,8 @@ duckdb_data_chunk Result::copy_rows(duckdb_data_chunk chunk, idx_t offset, idx_t
     for (idx_t c = 0; c < column_count_; ++c) {
         duckdb_vector source = duckdb_data_chunk_get_vector(chunk, c);
         duckdb_vector target = duckdb_data_chunk_get_vector(out, c);
-        // Whole chunks of fixed-width values copy as bytes; copy_sel goes
-        // row by row.
+        // Whole chunks of fixed-width values copy as bytes, while copy_sel
+        // goes row by row.
         if (size_t width = offset == 0 ? fast_arrow_width(types_[c]) : 0) {
             std::memcpy(duckdb_vector_get_data(target), duckdb_vector_get_data(source),
                         count * width);
@@ -1157,7 +1145,7 @@ BorrowedChunk Result::borrow_chunk_locked() {
 }
 
 std::optional<idx_t> Result::remaining_rows_locked() const {
-    // A failed query's rows are unknown; fetching raises its error.
+    // A failed query's rows are unknown, so fetching raises its error.
     if (stream_ || !error_.empty()) return std::nullopt;
     return buffered_rows_ + (taken_ ? taken_->remaining() : 0) +
            (chunk_ ? chunk_size_ - cursor_ : 0);
@@ -1242,7 +1230,7 @@ nb::list Result::fetchall() {
         if (!list) throw nb::python_error();
         nb::list out = nb::steal<nb::list>(list);
         for (idx_t i = 0; i < *remaining; ++i) {
-            if (!ensure_row()) {  // defensive; a materialized count is exact
+            if (!ensure_row()) {  // defensive, since a materialized count is exact
                 if (PyList_SetSlice(list, (Py_ssize_t)i, (Py_ssize_t)*remaining, nullptr) < 0) {
                     throw nb::python_error();
                 }
@@ -1288,7 +1276,6 @@ nb::object Result::fetch_chunk() {
 
 namespace {
 
-// NumPy output layout resolved before scanning.
 struct NumpyColumnPlan {
     size_t elem_size;  // bytes per row
     nb::dlpack::dtype dtype;
@@ -1343,10 +1330,9 @@ NumpyColumnPlan plan_column(duckdb_type tid, duckdb_logical_type logical, const 
     }
 }
 
-// Mark the NULL entries among `count` in `validity`, each covering `span`
-// values of `dst`. NULLs become NaN in FLOAT / DOUBLE columns; other dtypes
-// have no missing-value representation, so NULLs raise rather than surfacing
-// whatever bytes DuckDB left in the slot.
+// NULLs become NaN in FLOAT and DOUBLE columns. Other dtypes have no
+// missing-value representation, so NULLs raise rather than surface whatever
+// bytes DuckDB left in the slot. Each NULL covers `span` values of `dst`.
 void fill_numpy_nulls(char* dst, uint64_t* validity, idx_t count, size_t span,
                       const NumpyColumnPlan& plan, const std::string& name) {
     if (!validity) return;
@@ -1365,8 +1351,8 @@ void fill_numpy_nulls(char* dst, uint64_t* validity, idx_t count, size_t span,
     }
 }
 
-// Copy `count` rows of one column into `dst`. A NULL ARRAY, or a NULL inside
-// one, is filled like a NULL value over every value it covers.
+// A NULL ARRAY, or a NULL inside one, is filled like a NULL value over every
+// value it covers.
 void copy_numpy_values(char* dst, duckdb_vector v, idx_t count, const NumpyColumnPlan& plan,
                        const std::string& name) {
     const std::vector<size_t>& dims = plan.array.dims;
@@ -1397,7 +1383,6 @@ bool has_nulls(duckdb_vector v, idx_t count, const ArrayLayout& array) {
     }
 }
 
-// Wrap a buffer of `total` filled rows as the column's ndarray.
 nb::object wrap_numpy(const NumpyColumnPlan& p, char* buf, idx_t total, nb::object owner) {
     if (p.struct_view) {
         // Wrap as a flat uint8 buffer (total * elem_size bytes) and let
@@ -1412,8 +1397,7 @@ nb::object wrap_numpy(const NumpyColumnPlan& p, char* buf, idx_t total, nb::obje
         nb::ndarray<nb::numpy>(buf, shape.size(), shape.data(), owner, nullptr, p.dtype));
 }
 
-// Allocate `bytes` owned by the returned capsule, which frees them when the
-// last ndarray referencing it goes away.
+// The capsule frees the bytes when the last ndarray referencing it goes away.
 nb::capsule numpy_buffer(size_t bytes, char*& buf) {
     void* p = bytes ? std::malloc(bytes) : nullptr;
     if (bytes && !p) throw std::bad_alloc();

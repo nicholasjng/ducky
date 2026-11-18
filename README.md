@@ -54,7 +54,7 @@ X_val, y_val = ds.val.tensors()
 
 `ducky.category` encodes labels as integer codes. The categories come from
 an ENUM's labels, or else from the train fold's sorted distinct values, unless
-you pass them; NULLs and unseen values become -1.
+you pass them. NULLs and unseen values become -1.
 
 ```python
 ds = ducky.dataset(URL, fields={"sex": ducky.category("Sex")})

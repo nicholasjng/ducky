@@ -22,8 +22,8 @@ def test_pyarrow_table(con) -> None:
 def test_multi_shot(con) -> None:
     tbl = pa.Table.from_pydict({"x": list(range(10))})
     con.register_arrow("t", tbl)
-    # Same query twice; materialized into a real table so the second SELECT
-    # sees the same rows rather than an exhausted stream.
+    # Materialized into a table, so the second SELECT sees the same rows rather
+    # than an exhausted stream.
     first = con.execute("SELECT sum(x) FROM t").fetchall()
     second = con.execute("SELECT sum(x) FROM t").fetchall()
     assert first == second == [(45,)]
@@ -53,9 +53,8 @@ def test_reregister_with_different_schema(con) -> None:
 
 
 def test_large_single_batch_sliced_emit(con) -> None:
-    # One Arrow batch far beyond STANDARD_VECTOR_SIZE: every emitted window
-    # past row 0 goes through the zero-copy dictionary-slice path, including
-    # the VARCHAR column. Verify exact contents, not just counts.
+    # One batch far beyond STANDARD_VECTOR_SIZE, so every window past row 0 is
+    # a zero-copy slice, including the VARCHAR column's.
     n = 10_000
     tbl = pa.Table.from_pydict(
         {"i": list(range(n)), "s": [f"row-{j}" for j in range(n)]}
@@ -110,8 +109,7 @@ def test_rejects_bad_name(name: str, con) -> None:
 
 
 def test_large_scan_spans_many_slices(con) -> None:
-    # 50k rows forces the table function to emit many vector-size (2048) slices
-    # out of the converted Arrow batches — exercises the produce cursor.
+    # 50k rows make the table function emit many vector-size slices.
     con.register_arrow("big", pa.table({"i": pa.array(range(50_000), pa.int64())}))
     assert con.sql("SELECT count(*) FROM big").fetchitem() == 50_000
     assert con.sql("SELECT sum(i) FROM big").fetchitem() == sum(range(50_000))
