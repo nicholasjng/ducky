@@ -1,40 +1,13 @@
 name: UndefinedBehaviorSanitizer check
 
-# Only changes to native code or its build can introduce what UBSAN finds. The
-# weekly run covers new tests that reach existing native code.
+# A cold instrumented build of DuckDB takes about 30 minutes, so this runs
+# weekly and on demand rather than for every change.
 on:
-  push:
-    branches: [master]
-    paths:
-      - "src/cpp/**"
-      - "ext/duckdb"
-      - "patches/**"
-      - "cmake/**"
-      - "CMakeLists.txt"
-      - "pyproject.toml"
-      - "uv.lock"
-      - ".github/actions/duckdb/**"
-      - ".github/workflows/ubsan.yml"
-  pull_request:
-    paths:
-      - "src/cpp/**"
-      - "ext/duckdb"
-      - "patches/**"
-      - "cmake/**"
-      - "CMakeLists.txt"
-      - "pyproject.toml"
-      - "uv.lock"
-      - ".github/actions/duckdb/**"
-      - ".github/workflows/ubsan.yml"
   schedule:
     - cron: "11 4 * * 1"
   workflow_dispatch:
 
 permissions: {}
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
 
 jobs:
   ubsan:
