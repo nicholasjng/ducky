@@ -1,0 +1,79 @@
+name: AddressSanitizer check
+
+# Only changes to native code or its build can introduce what ASAN finds. The
+# weekly run covers new tests that reach existing native code.
+on:
+  push:
+    branches: [master]
+    paths:
+      - "src/cpp/**"
+      - "ext/duckdb"
+      - "patches/**"
+      - "cmake/**"
+      - "CMakeLists.txt"
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".github/actions/duckdb/**"
+      - ".github/workflows/asan.yml"
+  pull_request:
+    paths:
+      - "src/cpp/**"
+      - "ext/duckdb"
+      - "patches/**"
+      - "cmake/**"
+      - "CMakeLists.txt"
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".github/actions/duckdb/**"
+      - ".github/workflows/asan.yml"
+  schedule:
+    - cron: "47 3 * * 1"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  asan:
+    name: asan · ubuntu
+    runs-on: ubuntu-latest
+    # An instrumented Debug build of DuckDB takes most of the job.
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.3.3
+        with:
+          python-version: "3.15"
+
+      - uses: $/.github/actions/duckdb
+
+      - name: Build the ASAN editable install
+        env:
+          CC: gcc
+          CXX: g++
+        run: DUCKY_ASAN=1 uv sync --frozen --group dev --reinstall-package=ducky
+
+      # libstdc++ must be preloaded alongside libasan.
+      - name: Run tests under AddressSanitizer
+        env:
+          PYTHONMALLOC: malloc
+        run: |
+          LD_PRELOAD="$(gcc -print-file-name=libasan.so) $(gcc -print-file-name=libstdc++.so)" \
+          ASAN_OPTIONS="detect_leaks=0:halt_on_error=1:detect_stack_use_after_return=1:strict_string_checks=1:log_path=$RUNNER_TEMP/asan-report" \
+            .venv/bin/python -m pytest --capture no
+
+      - name: Print AddressSanitizer reports
+        if: always()
+        run: |
+          for report in "$RUNNER_TEMP"/asan-report.*; do
+            if [[ -f "$report" ]]; then
+              cat "$report"
+            fi
+          done

@@ -1,0 +1,43 @@
+name: Check out DuckDB
+description: >-
+  Install picky and check out the sparse ext/duckdb at its pin, with patches/
+  applied, and cache DuckDB's compiled objects with sccache.
+
+runs:
+  using: composite
+  steps:
+    # DuckDB's httpfs extension links libcurl, whose headers Ubuntu runners lack.
+    - name: Install libcurl headers
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install --yes libcurl4-openssl-dev
+
+    - name: Install picky
+      shell: bash
+      run: cargo install --locked --git https://github.com/nicholasjng/picky --rev cfb16062ae60ac2f55cfd005089480d7253e6af6
+
+    # `picky init` checks out the pin, and only the `update` to it applies the patches.
+    - name: Check out ext/duckdb and apply its patches
+      shell: bash
+      env:
+        PICKY_TRUST_HOOKS: "1"
+      run: |
+        picky init ext/duckdb
+        picky update ext/duckdb "$(git ls-tree HEAD ext/duckdb | awk '{print $3}')"
+
+    # DuckDB's CMake uses sccache as its compiler launcher once it is on PATH.
+    # ducky's own sources include nanobind from a temporary build environment,
+    # so they miss the cache, but they are a small part of the build.
+    - name: Install sccache
+      # The workflow lockfile pins it (as $/.github/actions/duckdb), which zizmor
+      # does not read for composite actions.
+      uses: mozilla-actions/sccache-action@v0.0.11 # zizmor: ignore[unpinned-uses]
+
+    - name: Store sccache's objects in the GitHub Actions cache
+      shell: bash
+      run: |
+        echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
+        # A cache service hiccup should cost a compile, not fail the build.
+        echo "SCCACHE_IGNORE_SERVER_IO_ERROR=1" >> "$GITHUB_ENV"
