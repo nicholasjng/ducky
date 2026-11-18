@@ -14,7 +14,7 @@ def con() -> ducky.Connection:
 
 
 def _deep_executable() -> str:
-    """Return the framework interpreter needed for ASAN preloading on macOS."""
+    """Return the framework interpreter needed for sanitizer preloading on macOS."""
     dyld = ctypes.cdll.LoadLibrary("/usr/lib/system/libdyld.dylib")
     size = ctypes.c_ulong(1024)
     buf = ctypes.create_string_buffer(b"\000", size.value)
@@ -25,7 +25,7 @@ def _deep_executable() -> str:
 @pytest.fixture
 def subprocess_python() -> tuple[str, dict[str, str]]:
     """Return an executable and environment suitable for child test processes."""
-    preload = os.environ.get("DUCKY_ASAN_PRELOAD")
+    preload = os.environ.get("DUCKY_SANITIZER_PRELOAD")
     if not preload:
         return sys.executable, dict(os.environ)
     env = dict(os.environ)
