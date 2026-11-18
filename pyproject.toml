@@ -42,7 +42,7 @@ bench = [
 ]
 
 [tool.uv.sources]
-mew-bench = { path = "../mew", editable = true }
+mew-bench = { git = "https://github.com/nicholasjng/mew", branch = "master" }
 
 [tool.uv]
 exclude-newer = "1 week"
