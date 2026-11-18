@@ -6,10 +6,10 @@ resolution-markers = [
     "python_full_version >= '3.14' and sys_platform == 'emscripten'",
     "python_full_version >= '3.14' and sys_platform != 'emscripten' and sys_platform != 'win32'",
     "python_full_version == '3.13.*' and sys_platform == 'win32'",
-    "python_full_version < '3.13' and sys_platform == 'win32'",
     "python_full_version == '3.13.*' and sys_platform == 'emscripten'",
-    "python_full_version < '3.13' and sys_platform == 'emscripten'",
     "python_full_version == '3.13.*' and sys_platform != 'emscripten' and sys_platform != 'win32'",
+    "python_full_version < '3.13' and sys_platform == 'win32'",
+    "python_full_version < '3.13' and sys_platform == 'emscripten'",
     "python_full_version < '3.13' and sys_platform != 'emscripten' and sys_platform != 'win32'",
 ]
 
@@ -163,7 +163,7 @@ typing = [
 bench = [
     { name = "duckdb", specifier = ">=1.5" },
     { name = "memray", specifier = ">=1.18" },
-    { name = "mew-bench", editable = "../mew" },
+    { name = "mew-bench", git = "https://github.com/nicholasjng/mew?branch=master" },
     { name = "numpy", specifier = ">=2.4.6" },
     { name = "pyarrow", specifier = ">=24.0.0" },
 ]
@@ -492,34 +492,8 @@ wheels = [
 
 [[package]]
 name = "mew-bench"
-source = { editable = "../mew" }
-
-[package.metadata]
-requires-dist = [
-    { name = "memray", marker = "sys_platform != 'win32' and extra == 'memory'", specifier = ">=1.15.0" },
-    { name = "pyinstrument", marker = "extra == 'cpu'", specifier = ">=4.6" },
-]
-provides-extras = ["cpu", "memory"]
-
-[package.metadata.requires-dev]
-build = [
-    { name = "nanobind", specifier = ">=3.0" },
-    { name = "ruff", specifier = ">=0.17.0" },
-    { name = "ty", specifier = ">=0.0.90" },
-]
-docs = [
-    { name = "furo", specifier = ">=2024.8" },
-    { name = "myst-parser", specifier = ">=4" },
-    { name = "sphinx", specifier = ">=8" },
-    { name = "sphinx-autodoc-typehints", specifier = ">=2.4" },
-    { name = "sphinx-copybutton", specifier = ">=0.5" },
-    { name = "sphinx-design", specifier = ">=0.6" },
-]
-duckdb = [{ name = "duckdb", specifier = ">=1.5" }]
-test = [
-    { name = "coverage", specifier = ">=7.10" },
-    { name = "pytest", specifier = ">=8" },
-]
+version = "0.3.0"
+source = { git = "https://github.com/nicholasjng/mew?branch=master#cba047a1dbd71da401d171e89addfae81de0ff5f" }
 
 [[package]]
 name = "ml-dtypes"
