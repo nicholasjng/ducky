@@ -1,0 +1,82 @@
+name: free-threaded TSAN instrumentation check
+
+on:
+  schedule:
+    - cron: "23 3 * * 1"
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  tsan:
+    name: tsan · free-threaded CPython
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      CPYTHON_REF: v3.15.2
+
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.3.3
+
+      - name: Set CPython build paths
+        run: |
+          echo "CPYTHON_SRC=$RUNNER_TEMP/cpython-src" >> "$GITHUB_ENV"
+          echo "CPYTHON_PREFIX=$RUNNER_TEMP/cpython-tsan" >> "$GITHUB_ENV"
+
+      - name: Install CPython build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            clang make git \
+            libbz2-dev libffi-dev libgdbm-dev liblzma-dev libncursesw5-dev \
+            libreadline-dev libsqlite3-dev libssl-dev libz-dev uuid-dev
+
+      # No --with-pydebug: its cp315td ABI has no wheels for the dev group's
+      # NumPy, torch and JAX.
+      - name: Build free-threaded TSAN CPython
+        env:
+          CC: clang
+          CXX: clang++
+        run: |
+          git clone --depth 1 --branch "$CPYTHON_REF" \
+            https://github.com/python/cpython.git "$CPYTHON_SRC"
+          cd "$CPYTHON_SRC"
+          ./configure \
+            --prefix="$CPYTHON_PREFIX" \
+            --disable-gil \
+            --with-thread-sanitizer
+          make -j"$(nproc)"
+          make install
+
+      - uses: $/.github/actions/duckdb
+
+      # polars ships only abi3 wheels, which free-threaded Python cannot load.
+      - name: Build the TSAN editable install
+        env:
+          CC: clang
+          CXX: clang++
+        run: |
+          DUCKY_TSAN=1 uv sync --frozen \
+            --python "$CPYTHON_PREFIX/bin/python3" \
+            --group dev \
+            --no-install-package polars --no-install-package polars-runtime-32 \
+            --reinstall-package=ducky
+
+      - name: Run tests under ThreadSanitizer
+        run: |
+          TSAN_OPTIONS="halt_on_error=1:detect_deadlocks=0:print_full_thread_history=1:suppressions=$CPYTHON_SRC/Tools/tsan/suppressions_free_threading.txt:log_path=$RUNNER_TEMP/tsan-report" \
+            .venv/bin/python -m pytest --capture no
+
+      - name: Print ThreadSanitizer reports
+        if: always()
+        run: |
+          for report in "$RUNNER_TEMP"/tsan-report.*; do
+            if [[ -f "$report" ]]; then
+              cat "$report"
+            fi
+          done

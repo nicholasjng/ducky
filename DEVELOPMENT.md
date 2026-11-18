@@ -1,6 +1,7 @@
 # Development
 
-Requires CMake 3.29+, Ninja, uv, picky, and a C++17 compiler.
+Requires CMake 3.29+, Ninja, uv, picky, a C++17 compiler, and on Linux the
+libcurl development headers (`libcurl4-openssl-dev` on Debian and Ubuntu).
 
 ## Setup
 

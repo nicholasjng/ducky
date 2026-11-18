@@ -1,0 +1,98 @@
+name: ducky continuous integration checks
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: lint · prek + ty
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.3.3
+        with:
+          python-version: "3.15"
+
+      # The hooks run ruff and ty from the environment, and ty reads ducky from
+      # src/, so the extension need not be built.
+      - name: Install hook dependencies
+        run: uv sync --frozen --no-install-project --group dev --group typing
+
+      - name: Run linters, formatter and type checker
+        uses: j178/prek-action@v3.1.0
+
+  stub:
+    name: stub · nanobind
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.3.3
+        with:
+          python-version: "3.15"
+
+      - uses: $/.github/actions/duckdb
+
+      - name: Install Ninja
+        run: sudo apt-get install --yes ninja-build
+
+      - name: Install build dependencies
+        run: uv sync --frozen --no-install-project
+
+      - name: Check generated native stub
+        run: |
+          uv run --no-sync python scripts/configure-clangd.py
+          cmake --build build/clangd --target check_ducky_core_stub
+
+  test:
+    name: ${{ matrix.os }} · py${{ matrix.python-version }}
+    runs-on: ${{ matrix.os }}
+    # Building DuckDB takes most of a job, and a threading regression hangs rather than fails.
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python-version: ["3.15"]
+        include:
+          # polars ships only abi3 wheels, which free-threaded Python cannot
+          # load, and building it needs nightly Rust. Its tests skip without it.
+          - os: ubuntu-latest
+            python-version: "3.15t"
+            sync-args: --no-install-package polars --no-install-package polars-runtime-32
+
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.3.3
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - uses: $/.github/actions/duckdb
+
+      - name: Install project and its dependencies
+        env:
+          SYNC_ARGS: ${{ matrix.sync-args }}
+        run: uv sync --frozen --group dev $SYNC_ARGS
+
+      - name: Run tests
+        run: uv run --no-sync pytest
