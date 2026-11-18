@@ -200,6 +200,49 @@ def test_unknown_backend_rejected(csv_path):
         )
 
 
+@pytest.mark.parametrize("backend", ["numpy", "jax", "torch", "mlx"])
+def test_dtype_objects_match_dtype_names(csv_path, backend):
+    if backend == "numpy":
+        dtypes = {"i32": np.int32, "f64": np.dtype("float64"), "u8": np.uint8, "bool": np.bool}
+    elif backend == "jax":
+        jnp = pytest.importorskip("jax.numpy")
+        dtypes = {"i32": jnp.int32, "f64": jnp.dtype("float64"), "u8": jnp.uint8, "bool": jnp.bool}
+    elif backend == "torch":
+        torch = pytest.importorskip("torch")
+        dtypes = {"i32": torch.int32, "f64": torch.float64, "u8": torch.uint8, "bool": torch.bool}
+    else:
+        mx = pytest.importorskip("mlx.core")
+        dtypes = {"i32": mx.int32, "f64": mx.float64, "u8": mx.uint8, "bool": mx.bool_}
+    for name, dtype in dtypes.items():
+        assert ducky.vector("x", dtype=dtype).dtype == name
+    assert ducky.category("x", dtype=dtypes["i32"]).dtype == "i32"
+
+    fields = {
+        "x": ducky.vector("x", dtype=dtypes["f64"]),
+        "y": ducky.vector("y", dtype=dtypes["u8"]),
+    }
+    ds = ducky.dataset(csv_path, fields=fields)
+    assert ds["train"]["x"].dtype == np.float64
+    assert ds["train"]["y"].dtype == np.uint8
+
+
+def test_dtype_names_and_builtins():
+    for given, name in [
+        ("float32", "f32"),
+        ("int16", "i16"),
+        (float, "f64"),
+        (int, "i64"),
+        (bool, "bool"),
+    ]:
+        assert ducky.feature("x", dtype=given).dtype == name
+    assert ducky.Tensor("x", (2,), dtype="int8").dtype == "i8"  # direct construction too
+    for bad in ["f16", "float16", np.float16, np.complex64, object]:
+        with pytest.raises(ValueError, match="unknown dtype"):
+            ducky.feature("x", dtype=bad)
+    with pytest.raises(ValueError, match="signed integer dtype"):
+        ducky.category("x", dtype=np.uint8)
+
+
 def test_device_rejected_for_deviceless_backends(csv_path):
     with pytest.raises(ValueError, match="does not take a device"):
         ducky.dataset(

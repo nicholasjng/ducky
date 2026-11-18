@@ -17,6 +17,7 @@ from ._core import connect as _connect
 from ._dataset import (
     Category,
     Dataset,
+    DTypeLike,
     Feature,
     Fold,
     Matrix,
@@ -73,6 +74,7 @@ __all__ = [
     "ArrowSource",
     "Category",
     "Connection",
+    "DTypeLike",
     "Dataset",
     "DuckDBConfig",
     "Error",
