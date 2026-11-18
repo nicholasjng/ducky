@@ -14,29 +14,14 @@ would be reproducing DuckDB internals in Python.
 
 Each ducky `Connection` currently owns both a database and one DuckDB
 connection. Separate `connect(":memory:")` calls therefore see separate data,
-and overlapping pending queries on one connection are invalid. In practice,
-concurrent `aexecute()` calls can close or invalidate one another.
+and queries on one connection run one at a time, so concurrent `aexecute()`
+calls on it take turns.
 
 Expose a `Database` owner with `Database.connect()` and an optional bounded
 pool. Each active query or loader worker would get its own connection while
 sharing the catalog, buffer manager, and in-memory data. This also gives
 `Connection.close()` simpler ownership semantics and provides the foundation
 for asynchronous query concurrency.
-
-## Streaming datasets
-
-**Available C API:** pending and streaming execution, `duckdb_stream_fetch_chunk`,
-Arrow conversion, progress, and interruption already provide the primitives.
-
-`dataset()` currently materializes the complete query, creates backend arrays,
-and gathers each fold into more arrays. Peak memory can therefore be several
-times the source data, and training cannot start until the query finishes.
-
-Add a rescannable loader that yields configurable batches and supports worker
-and rank sharding, bounded shuffle buffers, epochs, prefetch, and cancellation.
-NumPy batches can be filled directly from chunks; accelerator backends can
-transfer coalesced batches from pinned host buffers. This is primarily a ducky
-API gap rather than a missing DuckDB primitive.
 
 ## Batch-producing table functions
 
@@ -77,7 +62,7 @@ Arrow importer fit this design.
 ## Structured types and nested values
 
 **Available C API:** logical-type constructors and inspectors for LIST, ARRAY,
-MAP, STRUCT, UNION, ENUM, and DECIMAL; nested `duckdb_value` constructors; and
+MAP, STRUCT, UNION, ENUM, and DECIMAL, nested `duckdb_value` constructors, and
 `duckdb_bind_value`.
 
 Ducky currently exposes schema types as strings and binds scalar Python values.
@@ -86,16 +71,6 @@ dictionaries, decimals, and UUIDs into typed `duckdb_value` objects. Structured
 schema inspection would let loaders decide whether a column can use a dense
 tensor, needs offsets and values, or should stay in Arrow. Nested parameter
 binding would also remove SQL-literal workarounds for list and struct filters.
-
-## Stable split keys
-
-No new DuckDB API is required. `split()` hashes `row_number() OVER ()`, so fold
-membership depends on scan order. Parallel scans, file ordering, or a changed
-plan can move rows between folds despite an unchanged seed.
-
-Accept a key expression and hash it with the seed. For sources without a stable
-key, document that positional splits reproduce only when input order does. A
-stable key is necessary for comparable training and evaluation runs.
 
 ## Python-backed filesystems
 
@@ -133,8 +108,6 @@ not support.
 ## Suggested order
 
 1. Add `Database`, multiple connections, and a bounded pool.
-2. Build a streaming loader on separate pooled connections.
-3. Add stable split keys and slice unshuffled in-memory batches.
-4. Add batch-producing table functions and parallel Arrow conversion.
-5. Expose structured logical types and nested parameter binding.
-6. Revisit filesystem registration after native extensions prove insufficient.
+2. Add batch-producing table functions and parallel Arrow conversion.
+3. Expose structured logical types and nested parameter binding.
+4. Revisit filesystem registration after native extensions prove insufficient.

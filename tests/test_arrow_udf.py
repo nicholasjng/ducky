@@ -1,4 +1,4 @@
-# FIX: pyarrow.compute's stub is apparently not very good.
+# pyarrow.compute's stubs miss most kernels.
 # ty: ignore[missing-attribute]
 from decimal import Decimal
 

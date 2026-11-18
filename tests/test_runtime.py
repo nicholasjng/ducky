@@ -20,14 +20,14 @@ def test_config_round_trip():
     ).fetchone()
     assert row is not None
     mem, threads = row
-    # DuckDB normalises memory_limit; just make sure it didn't ignore us.
+    # DuckDB normalises memory_limit, so only check it took effect.
     assert "MiB" in mem or "GB" in mem.upper()
     assert threads == 2
 
 
 def test_config_native_types_coerced():
-    # int and bool are coerced to DuckDB's string form; the round-trip confirms
-    # threads=3 (not "3") and the flag arrives as a real boolean (not "1"/"0").
+    # int and bool are coerced to DuckDB's string form, so threads=3 arrives as
+    # a number and the flag as a boolean, not "1" or "0".
     con = ducky.connect(threads=3, preserve_insertion_order=False)
     row = con.execute(
         "SELECT current_setting('threads'), current_setting('preserve_insertion_order')"
@@ -50,8 +50,8 @@ def test_config_str_value_passes_through():
 
 
 def test_config_bad_value_still_raises():
-    # Coercion forwards an unparseable string unchanged; DuckDB rejects it,
-    # surfacing as ducky.Error rather than a Python coercion error.
+    # An unparseable string passes through unchanged, so DuckDB's error surfaces
+    # rather than a Python coercion error.
     with pytest.raises(ducky.Error):
         ducky.connect(threads="not_a_number")  # ty: ignore[invalid-argument-type]
 
@@ -63,9 +63,8 @@ def test_config_typed_dict_unpacked():
 
 
 def test_config_bad_key_raises():
-    # DuckDB validates unknown options at open time — surface the underlying
-    # error verbatim. The kwargs splat deliberately bypasses DuckDBConfig's
-    # static key check, which is exactly the runtime scenario we want.
+    # DuckDB validates options when opening, and its error surfaces verbatim. The
+    # splat bypasses DuckDBConfig's static key check on purpose.
     with pytest.raises(ducky.Error, match="not_a_real_setting"):
         ducky.connect(not_a_real_setting="x")
 
@@ -108,8 +107,8 @@ def test_progress_on_idle_connection(con):
 
 
 def test_interrupt_cancels_long_query():
-    # Force DuckDB to think this query is worth parallelizing — without
-    # threads >= 2 it tends to short-circuit before the interrupt arrives.
+    # With fewer than 2 threads the query tends to finish before the interrupt
+    # arrives.
     con = ducky.connect(threads=2)
 
     err: list[BaseException] = []
@@ -133,32 +132,29 @@ def test_interrupt_cancels_long_query():
 
 
 def test_interrupt_cancels_born_as_arrow_query():
-    # The born-as-Arrow path (Connection.arrow) runs the same pending loop, so a
-    # long collector query is just as interruptible as execute().fetchall().
+    # Connection.arrow runs the same loop, so it must be just as interruptible.
     con = ducky.connect(threads=2)
 
     err: list[BaseException] = []
 
     def runner():
         try:
-            # count(*): a long scan but a one-row result, so the Arrow result
-            # materializes ~nothing — the time is all interruptible scan work.
+            # A long scan with a one-row result, so the time is all interruptible scan.
             con.arrow("SELECT count(*) FROM range(10_000_000_000) t(i) WHERE i % 7 = 0")
         except Exception as e:
             err.append(e)
 
     t = threading.Thread(target=runner)
     t.start()
-    # Settle longer than execute()'s interrupt test: the collected path takes an
-    # extra Python hop (arrow -> arrow_query -> _arrow_collected_stream) before
-    # the executor starts, and interrupting before then would no-op.
+    # Longer than execute()'s test, since the Arrow path takes extra Python hops
+    # before the executor starts, and an earlier interrupt would be a no-op.
     time.sleep(0.2)
     con.interrupt()
     t.join(timeout=10)
     assert not t.is_alive(), "born-as-Arrow query did not respond to interrupt within 10s"
     assert err
     assert isinstance(err[0], ducky.Error)
-    # Connection survives: a fresh collector query still runs.
+    # The connection survives.
     assert con.arrow("SELECT 1 AS x").column("x").to_pylist() == [1]
 
 
@@ -187,15 +183,13 @@ def test_keyboard_interrupt_lands_mid_query():
     finally:
         signal.signal(signal.SIGINT, prior)
 
-    # The connection survives an interrupted query — a fresh query still runs.
+    # The connection survives an interrupted query.
     assert con.execute("SELECT 1").fetchone() == (1,)
 
 
 def test_streaming_result_iterates_all_chunks(con):
-    # Smoke test: streaming=True returns a Result whose chunks are pulled
-    # lazily via duckdb_fetch_chunk. We can't directly observe peak memory in
-    # a unit test, but we can verify the streaming result iterates correctly
-    # and yields every row.
+    # Peak memory isn't observable here, so this only checks a streaming result
+    # yields every row.
     n = 50_000  # several chunks at STANDARD_VECTOR_SIZE=2048
     res = con.execute("SELECT * FROM range(?) t(i)", [n], streaming=True).current_result
     chunks = 0
@@ -242,7 +236,7 @@ def test_progress_during_long_query():
         time.sleep(0.01)
     t.join(timeout=10)
     assert not t.is_alive()
-    # At least one sample should have been collected; values are well-formed.
+    # At least one well-formed sample.
     assert samples
     for pct, rows, total in samples:
         assert pct == -1.0 or 0.0 <= pct <= 100.0
@@ -265,8 +259,8 @@ def test_profiling_info_walks_tree(con):
     assert set(root.keys()) == {"metrics", "children"}
     assert isinstance(root["metrics"], dict)
     assert isinstance(root["children"], list)
-    # The root is the QUERY_ROOT node with summary metrics; the operator tree
-    # hangs off the first child.
+    # The root holds the summary metrics, and the operator tree hangs off the
+    # first child.
     assert root["children"], "expected an operator subtree under the root"
 
     # Walk the tree and confirm we see at least one operator with a timing metric.
@@ -286,8 +280,7 @@ def test_profiling_info_walks_tree(con):
 
 
 def test_profiling_info_detailed_mode_extra_metrics(con):
-    # detailed mode unlocks additional per-operator counters (cardinality,
-    # cpu_time, etc.); verify the dict grows accordingly.
+    # detailed mode adds per-operator counters such as cardinality and cpu_time.
     con.execute("SET enable_profiling='no_output'")
     con.execute("SET profiling_mode='detailed'")
     con.execute("SELECT count(*) FROM range(10_000) t(i)").fetchall()

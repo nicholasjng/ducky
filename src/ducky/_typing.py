@@ -37,7 +37,7 @@ class DuckDBConfig(TypedDict, total=False):
     """Show a progress bar for long-running queries."""
 
     threads: int
-    """Number of worker threads; ``1`` disables parallelism."""
+    """Number of worker threads. ``1`` disables parallelism."""
 
     worker_threads: int
     """Alias of :attr:`threads`."""

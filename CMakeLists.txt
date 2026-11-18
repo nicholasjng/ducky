@@ -28,7 +28,8 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
 endif()
 
-# Instrument DuckDB and the extension with a sanitizer.
+# DuckDB is instrumented too, since misused buffers and callbacks that ducky
+# hands it fail inside DuckDB.
 option(DUCKY_ASAN "Build with AddressSanitizer" OFF)
 option(DUCKY_UBSAN "Build with UndefinedBehaviorSanitizer" OFF)
 option(DUCKY_TSAN "Build with ThreadSanitizer" OFF)
@@ -73,7 +74,6 @@ if((DEFINED ENV{DUCKY_SYMBOLS} OR _ducky_sanitize_compile) AND NOT DUCKY_SYMBOLS
   set(DUCKY_SYMBOLS ON)
 endif()
 
-# Python + nanobind
 find_package(Python 3.12 REQUIRED COMPONENTS Interpreter Development.Module)
 
 execute_process(
@@ -90,7 +90,7 @@ if(NOT EXISTS "${DUCKDB_DIR}/CMakeLists.txt")
     "ext/duckdb is empty. Run: picky init ext/duckdb")
 endif()
 
-# Disable DuckDB's standalone tools by default.
+# Only the library is needed.
 set(BUILD_SHELL OFF CACHE BOOL "")
 set(BUILD_UNITTESTS OFF CACHE BOOL "")
 set(BUILD_BENCHMARKS OFF CACHE BOOL "")
@@ -108,7 +108,6 @@ set(DUCKDB_STATIC_EXTENSIONS core_functions parquet httpfs json icu)
 
 add_subdirectory(${DUCKDB_DIR} duckdb EXCLUDE_FROM_ALL)
 
-# The extension module
 # Opt into free-threaded Python and retain Release optimization for conversion loops.
 set(_ducky_module_options NB_STATIC FREE_THREADED NOMINSIZE)
 if(DUCKY_SYMBOLS)
@@ -141,12 +140,11 @@ target_link_libraries(_core PRIVATE duckdb_static tsl::robin_map)
 # the unstable C API v2, whose shape the DuckDB pin fixes.
 target_compile_definitions(_core PRIVATE DUCKDB_STATIC_BUILD DUCKDB_V2_API_ALLOW_UNSTABLE=1)
 
-# Export only the module's init function. The statically linked DuckDB would
-# otherwise export its C++ symbols, and the loader binds another DuckDB in the
-# process (such as duckdb-python's) to ours: macOS coalesces weak definitions
-# across images, Linux unifies STB_GNU_UNIQUE ones. Loadable extensions do not
-# need the exports: DuckDB links each one against its own copy of DuckDB, unless
-# it was built with EXTENSION_STATIC_BUILD=OFF.
+# The statically linked DuckDB would otherwise export its C++ symbols, and the
+# loader would bind another DuckDB in the process (duckdb-python's, say) to
+# ours: macOS coalesces weak definitions across images, Linux unifies
+# STB_GNU_UNIQUE ones. Loadable extensions link their own copy of DuckDB,
+# unless built with EXTENSION_STATIC_BUILD=OFF.
 if(APPLE)
   target_link_options(_core PRIVATE "LINKER:-exported_symbol,_PyInit__core")
   # Hidden symbols otherwise lose their names, even without stripping.
@@ -168,7 +166,8 @@ endif()
 
 install(TARGETS _core LIBRARY DESTINATION ducky)
 
-# Generate in the build tree; explicit targets update or verify the source stub.
+# Generated in the build tree, so package builds never touch the checked-in stub.
+# Explicit targets update or verify it.
 set(_DUCKY_CORE_STUB "${CMAKE_CURRENT_BINARY_DIR}/_core.pyi")
 nanobind_add_stub(
     ducky_core_stub
@@ -181,7 +180,7 @@ nanobind_add_stub(
 
 install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/src/ducky/_core.pyi DESTINATION ducky)
 
-# Format generated stubs when Ruff is available.
+# Formatted so the checked-in stub passes the repository's ruff hook.
 execute_process(
     COMMAND ${Python_EXECUTABLE} -m ruff --version
     RESULT_VARIABLE _ruff_available

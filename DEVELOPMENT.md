@@ -17,7 +17,7 @@ uv run --no-sync pytest -q
 
 Picky keeps DuckDB sparse. Its paths, patches, and update hook are declared in
 `.gitmodules`. `picky init` checks out the pinned commit but does not apply
-`patches/`; the `picky update` to the same pin applies them. Run that `update`
+`patches/`, which takes the `picky update` to the same pin. Run that `update`
 line again after pulling a commit that moves the pin: without a ref, `picky
 update` re-checks out the submodule's current commit, not the new pin.
 
@@ -37,7 +37,7 @@ Picky updates the gitlink, applies `patches/*.patch`, and writes
 
 If CMake then fails to update `_deps/httpfs_extension_fc-src` ("Failed to
 unstash changes"), the build tree still holds the patched httpfs checkout of the
-previous pin; delete `build/<wheel tag>/_deps/httpfs_extension_fc-*` and build
+previous pin. Delete `build/<wheel tag>/_deps/httpfs_extension_fc-*` and build
 again.
 
 Patches apply in lexical order, each on top of the previous ones. To refresh a

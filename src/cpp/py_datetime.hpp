@@ -29,7 +29,7 @@ namespace pydt {
     return duckdb_to_time(s);
 }
 
-// Unix microseconds; aware values are normalized to UTC.
+// Aware values are normalized to UTC.
 [[maybe_unused]] static int64_t datetime_to_micros(nanobind::handle val) {
     PyObject* raw = val.ptr();
     duckdb_timestamp_struct s{};

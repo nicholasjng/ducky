@@ -99,9 +99,9 @@ build-dir = "build/tsan"
 cmake.build-type = "Debug"
 cmake.args = ["-DDUCKY_TSAN=ON"]
 
-# RelWithDebInfo: Release optimizations + debug symbols. Lets atos/perf/dtrace
-# symbolize ducky frames in profiles. On macOS, dwarf stays in the .o files
-# and atos finds it as long as the build tree is intact (no need for a dSYM).
+# Debug symbols let atos, perf and dtrace symbolize ducky frames in profiles.
+# On macOS the DWARF stays in the .o files, which atos finds while the build
+# tree is intact.
 [[tool.scikit-build.overrides]]
 if.env.DUCKY_RELDBG = "1"
 build-dir = "build/reldbg"

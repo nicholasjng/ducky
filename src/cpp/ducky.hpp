@@ -11,17 +11,15 @@
 
 namespace nb = nanobind;
 
-// Safely copy nullable DuckDB error strings.
 inline std::string duckdb_message(const char* msg) {
     return msg ? std::string(msg) : std::string("unknown DuckDB error");
 }
 
-// Python-visible binding error.
 struct DuckyError : std::runtime_error {
     using std::runtime_error::runtime_error;
 };
 
-// Delete a Python-owning callback context while holding the GIL.
+// DuckDB may destroy callback contexts on threads without the GIL.
 template <typename T>
 void gil_delete(void* ptr) {
     if (!ptr) return;
@@ -29,16 +27,16 @@ void gil_delete(void* ptr) {
     delete (T*)ptr;
 }
 
-// Appender sentinel for a column's DEFAULT expression.
 struct DefaultSentinel {};
 
-// Publish a lazily built, process-lifetime singleton without locking across init.
+// Builds outside the lock, since init runs Python code that could deadlock with
+// a thread holding it. The loser of a race discards its copy.
 template <typename T, typename Init>
 const T& cached_singleton(std::atomic<T*>& cached, nb::ft_mutex& mu, Init&& init) {
     if (T* p = cached.load()) return *p;
     T* built = new T(std::forward<Init>(init)());
     nb::ft_lock_guard lock(mu);
-    if (T* p = cached.load()) {  // lost the race; discard ours
+    if (T* p = cached.load()) {
         delete built;
         return *p;
     }
@@ -46,10 +44,9 @@ const T& cached_singleton(std::atomic<T*>& cached, nb::ft_mutex& mu, Init&& init
     return *built;
 }
 
-// Releases the GIL (detaches the thread state) for the scope if this thread
-// holds it. For blocking DuckDB calls reachable both from Python and from
-// threads that don't hold the GIL (e.g. Arrow stream callbacks): DuckDB
-// workers running Python callbacks need the GIL while the caller waits.
+// For blocking DuckDB calls reachable both from Python and from threads without
+// the GIL (Arrow stream callbacks, say), since DuckDB workers running Python
+// callbacks need the GIL while the caller waits.
 class release_gil_if_held {
    public:
     release_gil_if_held() : state_(PyGILState_Check() ? PyEval_SaveThread() : nullptr) {}
@@ -74,7 +71,7 @@ inline std::unique_lock<std::mutex> lock_releasing_gil(std::mutex& mu) {
     return lock;
 }
 
-// Report callback exceptions through DuckDB instead of crossing the C ABI.
+// Exceptions must not cross the C ABI, so DuckDB reports them.
 template <typename Body, typename SetError>
 bool guard(Body&& body, SetError&& set_error) {
     try {

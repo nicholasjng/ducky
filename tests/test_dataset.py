@@ -72,8 +72,8 @@ def test_standardize_requires_train_fold(csv_path):
 
 
 def test_standardize_empty_train_fold_rejected(csv_path):
-    # Fold named "train" exists, but the fraction rounds to a deterministically
-    # empty bucket range — must error, not silently standardize against NULL stats.
+    # The "train" fraction rounds to an empty bucket range, which must error
+    # rather than standardize against NULL statistics.
     with pytest.raises(ValueError, match="empty"):
         ducky.dataset(
             csv_path,
@@ -84,8 +84,8 @@ def test_standardize_empty_train_fold_rejected(csv_path):
 
 
 def test_reserved_bucket_alias_rejected(csv_path):
-    # "_bucket" is ducky's internal bookkeeping column; a same-named field
-    # must be rejected up front, not surface as a confusing internal KeyError.
+    # "_bucket" is ducky's internal column, so a same-named field must be
+    # rejected up front rather than surface as a confusing KeyError.
     with pytest.raises(ValueError, match="_bucket"):
         ducky.dataset(
             csv_path,
@@ -137,7 +137,7 @@ def test_batches_drop_last(csv_path):
     )
     fold = ds["train"]
     sizes = [Xb.shape[0] for Xb, _ in fold.batches(batch_size=128, drop_last=True)]
-    assert sizes == [128] * 7  # 8th would be partial; dropped
+    assert sizes == [128] * 7  # 8th would be partial, so dropped
 
 
 def test_batches_shuffle_deterministic(csv_path):
@@ -169,8 +169,8 @@ def test_batches_shuffle_changes_order(csv_path):
 
 @pytest.mark.parametrize("backend", ["numpy", "jax", "torch", "mlx"])
 def test_backend_materializes_equivalently(csv_path, backend):
-    # Every backend must produce the same split + feature matrix as numpy; only
-    # the array type differs. Skip backends not installed on this platform.
+    # Every backend must produce numpy's split and feature matrix, only the
+    # array type differs.
     if backend != "numpy":
         pytest.importorskip(backend)
 
@@ -255,13 +255,9 @@ def test_device_rejected_for_deviceless_backends(csv_path):
 
 
 def test_no_leak_train_stats_into_val(csv_path):
-    # A loose statistical sentinel (e.g. "val mean is small") can't actually
-    # distinguish "standardized with train-only stats" from "standardized
-    # with full-dataset stats" -- both land close to 0 for this data. Instead,
-    # independently fetch the *raw* per-fold column (same split/seed, so the
-    # same rows land in the same folds), compute what train-only mean/std
-    # standardization should produce in plain numpy, and compare exactly
-    # against what standardize=True actually returns for both folds.
+    # A loose check such as "val mean is small" can't tell train-only from
+    # full-dataset statistics, which both land near 0 here. So the raw folds
+    # (same split and seed) are standardized in numpy and compared exactly.
     split = ducky.split(0.8, seed=0)
     raw = ducky.dataset(
         csv_path,
@@ -307,8 +303,8 @@ def weighted_csv_path(tmp_path):
 
 
 def test_fields_named_outputs(weighted_csv_path):
-    # The full fields= API: an X matrix, y label vector, sample-weight vector,
-    # and a passthrough id vector — each materialised as its own field.
+    # An X matrix, y labels, sample weights and a passthrough id, each its own
+    # field.
     ds = ducky.dataset(
         weighted_csv_path,
         fields={
@@ -439,7 +435,7 @@ def test_tensors_requires_X_and_y(weighted_csv_path):
 
 
 def test_source_path_with_single_quote(tmp_path):
-    # The source is embedded as a SQL string literal; quotes must be escaped.
+    # The source is embedded as a SQL string literal, so quotes must be escaped.
     p = tmp_path / "it's data.csv"
     p.write_text("x,y\n1.0,0\n2.0,1\n")
     ds = ducky.dataset(
@@ -452,8 +448,8 @@ def test_source_path_with_single_quote(tmp_path):
 
 
 def test_standardize_constant_column_yields_zeros(tmp_path):
-    # std = 0 must not divide by zero; the standardized value is 0
-    # (StandardScaler convention), not NULL-turned-garbage.
+    # std = 0 yields 0 (StandardScaler convention), not a division by zero whose
+    # NULL turns into garbage.
     p = tmp_path / "const.csv"
     p.write_text("x,y\n" + "\n".join("3.0,1" for _ in range(50)))
     ds = ducky.dataset(

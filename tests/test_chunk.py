@@ -23,13 +23,9 @@ def test_fetch_chunk_end_of_stream(con):
 
 
 def test_multi_chunk_scan_reuses_pool_without_corrupting_data(con):
-    # Regression test for fetch_chunk()'s buffer pool: each chunk is dropped
-    # before the next is fetched (the common streaming pattern), so the pool
-    # reuses the same underlying duckdb_data_chunk buffer across calls. Every
-    # chunk's values must still be independently correct -- a reuse bug would
-    # show up as stale/aliased data from a previous chunk bleeding into the
-    # next.
-    n = 5000  # > 2 * STANDARD_VECTOR_SIZE (2048), so several chunks get pooled and reused
+    # Dropping each chunk before the next fetch, the common streaming pattern,
+    # must not let a reused buffer leak one chunk's values into the next.
+    n = 5000  # > 2 * STANDARD_VECTOR_SIZE (2048), so several chunks
     res = con.sql(f"SELECT i FROM range({n}) t(i)")
     seen = []
     while (chunk := res.fetch_chunk()) is not None:
@@ -38,14 +34,12 @@ def test_multi_chunk_scan_reuses_pool_without_corrupting_data(con):
 
 
 def test_two_live_chunks_fall_back_without_pool_and_stay_independent(con):
-    # If the pool is empty (a caller holding more than one live batch at
-    # once), fetch_chunk() must fall back to a fresh allocation rather than
-    # reuse a buffer that's still referenced -- otherwise chunk_a's values
-    # would get silently overwritten once chunk_b is fetched.
+    # A live chunk's buffer must not be reused, or fetching chunk_b would
+    # silently overwrite chunk_a.
     n = 3 * 2048  # three full STANDARD_VECTOR_SIZE chunks
     res = con.sql(f"SELECT i FROM range({n}) t(i)")
     chunk_a = res.fetch_chunk()
-    chunk_b = res.fetch_chunk()  # pool is empty (chunk_a still live) -> fresh allocation
+    chunk_b = res.fetch_chunk()  # chunk_a still live
     assert chunk_a is not None
     assert chunk_b is not None
     a_values = chunk_a.column("i").copy()
@@ -55,8 +49,7 @@ def test_two_live_chunks_fall_back_without_pool_and_stay_independent(con):
     # chunk_a's buffer must not have been mutated by fetching chunk_b.
     np.testing.assert_array_equal(chunk_a.column("i"), a_values)
 
-    # Drop both, so their buffers return to the pool; fetching the third
-    # chunk should still be correct whether or not it reused one of them.
+    # The third chunk must be correct whether or not it reuses a dropped buffer.
     del chunk_a, chunk_b
     chunk_c = res.fetch_chunk()
     assert chunk_c is not None
@@ -110,7 +103,7 @@ def test_column_view_outlives_chunk(con):
     chunk = res.fetch_chunk()
     assert chunk is not None
     arr = chunk.column("i")
-    del chunk  # chunk dropped; arr should keep the buffer alive via nb owner
+    del chunk  # chunk dropped, but arr keeps the buffer alive via its owner
     np.testing.assert_array_equal(arr, np.arange(5, dtype=np.int64))
 
 
@@ -158,8 +151,7 @@ def test_decimal_column_small(con):
     chunk = con.sql("SELECT CAST(1.5 AS DECIMAL(4,2)) d").fetch_chunk()
     assert chunk is not None
     col = chunk.column("d")
-    # DECIMAL(width<=4) is DuckDB's smallest internal storage class, INT16 —
-    # raw integer value should be 150 (1.5 * 10^2).
+    # DECIMAL(width<=4) is stored as INT16, so the raw value is 150 (1.5 * 10^2).
     assert col.dtype == np.dtype("int16")
     assert col[0] == 150
 

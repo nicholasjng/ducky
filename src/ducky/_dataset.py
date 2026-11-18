@@ -176,7 +176,7 @@ def vector(expr: str, *, dtype: DTypeLike = "f32", standardize: bool = False) ->
 
 
 def tensor(expr: str, shape: int | tuple[int, ...], *, dtype: DTypeLike = "f32") -> Tensor:
-    """Shorthand for :class:`Tensor`; an int ``shape`` is a 1-D embedding size."""
+    """Shorthand for :class:`Tensor`. An int ``shape`` is a 1-D embedding size."""
     dims = (shape,) if isinstance(shape, int) else tuple(shape)
     if not dims or not all(isinstance(d, int) and d > 0 for d in dims):
         raise ValueError(f"tensor shape must be one or more positive ints; got {shape!r}")
@@ -189,7 +189,7 @@ _CODE_DTYPES = ("i8", "i16", "i32", "i64")
 def category(
     expr: str, categories: Iterable[Any] | None = None, *, dtype: DTypeLike = "i64"
 ) -> Category:
-    """Shorthand for :class:`Category`; ``categories`` fixes the codes' order."""
+    """Shorthand for :class:`Category`. ``categories`` fixes the codes' order."""
     code_dtype = _canonical_dtype(dtype)
     if code_dtype not in _CODE_DTYPES:
         raise ValueError(
@@ -243,7 +243,6 @@ class AbstractArray(Protocol):
 
 
 def _materialize(result: Result, backend: Backend, device: Any) -> dict[str, Any]:
-    """Drain ``result`` into backend arrays."""
     from . import _conversions as conv
 
     if backend == "numpy":
@@ -251,7 +250,7 @@ def _materialize(result: Result, backend: Backend, device: Any) -> dict[str, Any
     if backend == "mlx":
         return conv.to_mlx(result)
 
-    # Keep the fold bucket on the host.
+    # Folds are split on the host, so the bucket stays a NumPy array.
     arrays = conv.to_numpy(result)
     bucket = arrays.pop("_bucket")
     out: dict[str, Any]
@@ -272,14 +271,12 @@ def _materialize(result: Result, backend: Backend, device: Any) -> dict[str, Any
 
 
 def _bucket_to_host(arr: Any) -> Any:
-    """Return the bucket column as a NumPy array."""
     import numpy as np
 
     return np.asarray(arr)
 
 
 def _gather(arr: Any, idx: Any, backend: Backend) -> Any:
-    """Gather rows `idx` (a 1-D numpy int array) from `arr` along axis 0."""
     if backend == "torch":
         import torch
 
@@ -292,7 +289,6 @@ def _gather(arr: Any, idx: Any, backend: Backend) -> Any:
 
 
 def _stack(cols: list[Any], backend: Backend) -> Any:
-    """Stack 1-D feature columns into an ``(n, len(cols))`` matrix."""
     if backend == "jax":
         import jax.numpy as jnp
 
@@ -312,7 +308,7 @@ def _stack(cols: list[Any], backend: Backend) -> Any:
 
 @dataclass
 class Fold[ArrayT: AbstractArray]:
-    """Named arrays for one split; ``fold.Xy`` returns ``(fold.X, fold.y)``."""
+    """Named arrays for one split. ``fold.Xy`` returns ``(fold.X, fold.y)``."""
 
     backend: Backend
     _fields: dict[str, ArrayT]
@@ -433,17 +429,14 @@ _N_BUCKETS = 1000
 
 
 def _quote_literal(s: str) -> str:
-    """Quote a string for embedding as a SQL string literal ('' escapes ')."""
     return "'" + s.replace("'", "''") + "'"
 
 
 def _quote_ident(s: str) -> str:
-    """Quote an identifier for embedding in SQL ("" escapes ")."""
     return '"' + s.replace('"', '""') + '"'
 
 
 def _fold_ranges(fractions: dict[str, float]) -> list[tuple[str, int, int]]:
-    """Convert fractions to contiguous bucket ranges."""
     ranges: list[tuple[str, int, int]] = []
     cum = 0.0
     items = list(fractions.items())
@@ -459,7 +452,6 @@ Column = Feature | Vector | Tensor | Category
 
 
 def _iter_field_columns(fields: dict[str, Field]) -> Iterator[tuple[str, str, Column]]:
-    """Yield each materialized column's alias, field name, and specification."""
     for field_name, spec in fields.items():
         if isinstance(spec, Vector | Tensor | Category):
             yield field_name, field_name, spec
@@ -469,7 +461,6 @@ def _iter_field_columns(fields: dict[str, Field]) -> Iterator[tuple[str, str, Co
 
 
 def _row_id_expr(key: str | None) -> str:
-    """A row's identity: its ``key`` expression, else its position in the scan."""
     return f"({key})" if key is not None else "row_number() OVER ()"
 
 
@@ -524,7 +515,7 @@ def _resolve_categories(
             learn.append(name)
     if given:
         # Values match by their text, so DuckDB writes the given categories as it
-        # writes the field's values (true, 1.0); one it can't represent raises.
+        # writes the field's values (true, 1.0), and one it can't represent raises.
         exprs = ", ".join(f"{wanted[n].expr} AS _g{i}" for i, n in enumerate(given))
         typeofs = ", ".join(f"typeof(s._g{i})" for i in range(len(given)))
         sql_types = con.sql(
@@ -592,10 +583,9 @@ def _select_item(alias: str, spec: Column, mean: str | None = None, std: str | N
     assert not isinstance(spec, Category), "resolved by _resolve_categories"
     expr = spec.expr
     if mean is not None and std is not None:
-        # coalesce(nullif(std, 0), 1): a constant column (std = 0) yields 0
-        # (sklearn's StandardScaler convention) instead of a division by zero,
-        # whose NULL result would surface as garbage in the dense ndarrays
-        # downstream.
+        # A constant column (std = 0) yields 0, sklearn's StandardScaler
+        # convention, rather than a division by zero whose NULL would surface as
+        # garbage in the dense arrays.
         expr = f"({expr} - {mean}) / coalesce(nullif({std}, 0), 1)"
     sql_type = _DUCKDB_DTYPES[spec.dtype]
     if isinstance(spec, Tensor):
@@ -687,7 +677,6 @@ def _compile_sql(
 
 
 def _assemble_field(name: str, spec: Field, columns_data: dict[str, Any], backend: Backend) -> Any:
-    """Stack a matrix field's columns / return a single-column field's column."""
     if isinstance(spec, Vector | Tensor | Category):
         return columns_data[name]
     cols = [columns_data[f"{name}__{c}"] for c in spec.columns]
@@ -803,7 +792,7 @@ def dataset(
     ``target`` provide the ``X``/``y`` shorthand. Standardization, and the
     categories of category fields that need to learn them, use only the train
     fold. ``key`` is a SQL expression identifying each row, which assigns
-    it to its fold; without one, a row's position in the scan does.
+    it to its fold. Without one, a row's position in the scan does.
     """
     if backend not in _BACKENDS:
         raise ValueError(f"unknown backend {backend!r}; supported backends: {list(_BACKENDS)}")

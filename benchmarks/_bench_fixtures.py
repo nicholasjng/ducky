@@ -8,7 +8,7 @@ import numpy as np
 import pyarrow as pa
 
 SIZES = [10_000, 100_000, 1_000_000]
-# executemany binds one Python value at a time per row; 1M rows takes minutes.
+# executemany binds one Python value at a time per row, so 1M rows take minutes.
 BIND_SIZES = [10_000, 100_000]
 
 

@@ -41,8 +41,7 @@ const PyArrowAPI& pyarrow_api() {
     });
 }
 
-// Primitive types accepted as UDF parameters / return values; mirrors the set
-// Chunk.column() exposes.
+// Matches the set Chunk.column() exposes, so UDF inputs and chunk columns agree.
 const TypeSpec kTypes[] = {
     {"BOOLEAN", DUCKDB_TYPE_BOOLEAN, DUCKDB_V2_LOGICAL_TYPE_ID_BOOLEAN, sizeof(bool), &dt<bool>},
     {"TINYINT", DUCKDB_TYPE_TINYINT, DUCKDB_V2_LOGICAL_TYPE_ID_TINYINT, sizeof(int8_t),
@@ -85,8 +84,8 @@ const TypeSpec& lookup(const std::string& name) {
                      "DATE, TIME, TIMESTAMP[_S/MS/NS/TZ])");
 }
 
-// Python annotation → DuckDB type string. Only bool/int/float; anything else
-// must be made explicit by passing `parameters=` / `return_type=`.
+// Only bool, int and float map unambiguously, so anything else must be passed
+// as `parameters=` or `return_type=`.
 std::string annotation_to_type(nb::handle hint, const std::string& where) {
     nb::module_ builtins = nb::module_::import_("builtins");
     if (hint.is(builtins.attr("bool"))) return "BOOLEAN";
@@ -98,7 +97,6 @@ std::string annotation_to_type(nb::handle hint, const std::string& where) {
                      "explicitly for other types)");
 }
 
-// Build a positional `parameters` list by inspecting `fn`'s annotations.
 nb::list infer_parameters(nb::callable fn) {
     nb::module_ inspect = nb::module_::import_("inspect");
     nb::module_ typing = nb::module_::import_("typing");
@@ -139,8 +137,7 @@ std::string infer_return_type(nb::callable fn) {
     return annotation_to_type(hints["return"], "return value");
 }
 
-// Runs a UDF callback body, reporting what it throws through `err` after
-// `prefix`.
+// Exceptions must not cross into DuckDB, so they are reported through `err`.
 template <typename Body>
 void report_udf_error(duckdb_v2_error_info_handle* err, const char* prefix, Body&& body) {
     report(err, [&] {
@@ -158,7 +155,7 @@ bool row_is_valid(const uint64_t* validity, idx_t row) {
     return !validity || ((validity[row / 64] >> (row % 64)) & 1);
 }
 
-// Marks `row` of a FLAT vector NULL, taking its validity mask on first use.
+// Takes the validity mask on first use, since most outputs have no NULLs.
 void set_row_null(duckdb_v2_vector_handle vector, uint64_t*& validity, idx_t row) {
     if (!validity) {
         V2Error e;
@@ -167,18 +164,18 @@ void set_row_null(duckdb_v2_vector_handle vector, uint64_t*& validity, idx_t row
     validity[row / 64] &= ~((uint64_t)1 << (row % 64));
 }
 
-// Lives in DuckDB's extra_info slot; carries everything the trampoline needs.
+// DuckDB hands the trampoline only its extra_info slot, so everything lives here.
 struct UDFContext {
     // Kept alive by the DuckDBHandle.
     nb::handle callable;
     nb::handle init_callable;  // optional per-worker-thread state factory
-    // If non-empty: dict-style — callable receives one dict {name: ndarray}.
-    // If empty: positional — callable receives ndarrays as positional args.
+    // Non-empty: the callable receives one dict {name: ndarray}. Empty: it
+    // receives the ndarrays as positional arguments.
     std::vector<std::string> param_names;
     std::vector<const TypeSpec*> param_types;
     const TypeSpec* return_type;
-    // When set, the function takes a variable number of arguments, all of this
-    // type. `param_types` is ignored; arity is read from the input chunk.
+    // Set for varargs, all of this type, in which case `param_types` is ignored
+    // and the arity comes from the input chunk.
     const TypeSpec* varargs_type = nullptr;
     // NULL-aware: each input arg is delivered as a (values, mask) tuple, where
     // `mask` is a 1-D uint8 ndarray (1=valid, 0=NULL). Output may emit NULLs
@@ -186,13 +183,11 @@ struct UDFContext {
     bool special_handling = false;
 };
 
-// Per-worker-thread state for a stateful UDF. Holds the Python object returned
-// by the user's init=callable; freed under GIL at thread teardown.
+// Freed under the GIL at thread teardown, since it holds a Python object.
 struct UDFState {
     nb::object obj;
 };
 
-// Called once per worker thread; builds per-thread state via init=callable.
 void udf_init_trampoline(duckdb_v2_scalar_function_init_info_handle info,
                          duckdb_v2_context_handle context, duckdb_v2_error_info_handle* err) {
     nb::gil_scoped_acquire gil;
@@ -209,15 +204,14 @@ void udf_init_trampoline(duckdb_v2_scalar_function_init_info_handle info,
     });
 }
 
-// A heap buffer of `bytes` bytes owned by `owner`, a capsule that frees it.
-// Arrays built over it with that owner are handed to Python without a copy.
+// Arrays built over the buffer with `owner` reach Python without a copy.
 char* owned_buffer(size_t bytes, nb::object& owner) {
     char* buf = new char[bytes ? bytes : 1];
     owner = nb::capsule(buf, [](void* p) noexcept { delete[] (char*)p; });
     return buf;
 }
 
-// A uint8 ndarray (1=valid, 0=NULL) of the first `n` rows of `validity`.
+// 1 marks a valid row, 0 a NULL.
 nb::object build_input_mask(const uint64_t* validity, idx_t n) {
     nb::object owner;
     uint8_t* mask = (uint8_t*)owned_buffer(n, owner);
@@ -231,10 +225,9 @@ nb::object build_input_mask(const uint64_t* validity, idx_t n) {
         nb::ndarray<nb::numpy, nb::ro>(mask, 1, shape, owner, nullptr, nb::dtype<uint8_t>()));
 }
 
-// Default NULL handling: DuckDB only short-circuits constant NULL inputs, so a
-// UDF without special handling sees NULL rows of a flat chunk too. Collects
-// the rows where every input is valid into `keep`; returns false when there is
-// no NULL among the first `n` rows (the caller then passes the chunk as is).
+// DuckDB only short-circuits constant NULL inputs, so a UDF without special
+// handling would see NULL rows of a flat chunk too. False when the first `n`
+// rows have no NULL, so the caller can pass the chunk as is.
 bool collect_valid_rows(const std::vector<duckdb_v2_vector_view>& args, idx_t n,
                         std::vector<idx_t>& keep) {
     std::vector<const uint64_t*> masks;
@@ -305,8 +298,8 @@ void udf_trampoline(duckdb_v2_scalar_function_exec_info_handle info,
         }
 
         // Input arrays own their data, so the callable may keep them.
-        // Without an owner, nanobind copies the chunk's vector; gathered
-        // valid rows are built in an owned buffer instead, copied once.
+        // Without an owner, nanobind would copy the chunk's vector, so gathered
+        // valid rows go into an owned buffer instead, copied once.
         auto build_values = [&](idx_t i) {
             void* data = (void*)args[i].data;
             const TypeSpec* t = ctx->varargs_type ? ctx->varargs_type : ctx->param_types[i];
@@ -324,7 +317,7 @@ void udf_trampoline(duckdb_v2_scalar_function_exec_info_handle info,
             return (nb::object)nb::make_tuple(values, build_input_mask(args[i].validity, n));
         };
 
-        // Borrowed; the holder owns it until thread teardown.
+        // Borrowed, since the holder owns it until thread teardown.
         void* init_data = nullptr;
         e.check(duckdb_v2_scalar_function_exec_get_init_data(info, &init_data, e.out()));
         auto* state_holder = (UDFState*)init_data;
@@ -391,7 +384,7 @@ void udf_trampoline(duckdb_v2_scalar_function_exec_info_handle info,
                 throw DuckyError("ducky: UDF mask shape != (" + std::to_string(m) + ",)");
             }
             nb::dlpack::dtype mdt = mask.dtype();
-            // uint8 or bool — both 8-bit unsigned in DLPack (code=1, bits=8).
+            // uint8 and bool are both 8-bit unsigned in DLPack (code=1, bits=8).
             if (mdt.bits != 8 || (mdt.code != (uint8_t)nb::dlpack::dtype_code::UInt &&
                                   mdt.code != (uint8_t)nb::dlpack::dtype_code::Bool)) {
                 throw DuckyError("ducky: UDF mask must be uint8 or bool");
@@ -507,9 +500,7 @@ void arrow_udf_init(duckdb_v2_scalar_function_init_info_handle info,
     });
 }
 
-// Resolve `return_type` into the pa.Schema the output batch is exported with,
-// under the session's Arrow settings. Cached on the context; called with the
-// GIL held.
+// Cached on the context, since every chunk exports with it. Needs the GIL.
 void ensure_out_schema(ArrowUDFContext* ctx, duckdb_v2_context_handle context) {
     nb::ft_lock_guard lock(ctx->out_schema_mu);
     if (ctx->out_type.is_valid()) return;
@@ -631,8 +622,7 @@ void arrow_udf_trampoline(duckdb_v2_scalar_function_exec_info_handle info,
     });
 }
 
-// Owns a v2 scalar function until it is registered. Errors raise with
-// `failed` before the reported text.
+// Errors raise with `failed` before DuckDB's text.
 class ScalarFunctionHandle {
    public:
     ScalarFunctionHandle(duckdb_v2_factory_handle factory, std::string failed)

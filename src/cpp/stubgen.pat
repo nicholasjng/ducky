@@ -1,8 +1,7 @@
 # nanobind stubgen pattern file.
 #
-# We use this to emit ``@typing.overload`` variants for methods whose return
-# type depends on a boolean argument — something nb::sig can't express
-# directly because each .def has a single signature string.
+# Each .def has a single signature string, so methods whose return type
+# depends on a boolean argument get their ``@typing.overload`` variants here.
 
 pl:
     \from typing import overload, Literal
@@ -14,11 +13,8 @@ pl:
     def pl(self, lazy: bool = False) -> polars.DataFrame | polars.LazyFrame:
         \doc
 
-# __exit__: rewrite the traceback annotation to use `TracebackType` directly.
-# The default sig emits ``types.TracebackType``, which collides with the
-# ``types`` property on Appender (and would similarly collide on any class
-# that exposes a ``types`` member) — at class scope, ``types`` resolves to
-# the descriptor rather than the imported module.
+# __exit__: the default ``types.TracebackType`` collides with Appender's
+# ``types`` property, which at class scope shadows the imported module.
 \.__exit__$:
     \from types import TracebackType
     def __exit__(

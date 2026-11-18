@@ -65,7 +65,7 @@ def test_to_numpy_via_connection(con):
 
 
 def test_to_numpy_filter_nulls_in_sql(con):
-    # NULL slots in dense arrays hold garbage; filter in SQL for clean data.
+    # NULLs in an integer column raise, so filter them in SQL.
     res = con.sql("SELECT b FROM (VALUES (1), (NULL), (3)) AS t(b) WHERE b IS NOT NULL")
     arrs = res.to_numpy()
     np.testing.assert_array_equal(arrs["b"], [1, 3])
@@ -129,9 +129,8 @@ def test_iter_batches_torch_via_connection(con):
 
 
 def test_to_torch_goes_through_to_numpy(con, monkeypatch):
-    # Deliberate: to_numpy is measurably faster than accumulating
-    # iter_batches_torch chunks (see to_torch's docstring). Checked
-    # structurally so a regression to the slow path doesn't slip by unnoticed.
+    # to_numpy is measurably faster than accumulating iter_batches_torch chunks,
+    # and a structural check catches a regression to the slow path.
     torch = pytest.importorskip("torch")
     from ducky._core import Result
 

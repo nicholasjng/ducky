@@ -3,7 +3,7 @@
 Each engine runs ``bench_engine.py`` in its own process, with
 ``DUCKY_BENCH_ENGINE`` picking the engine. The engines take turns for
 ``--rounds`` rounds, each appending to that engine's result file, so drift in
-machine load spreads over both; ``mew compare`` then pools each file's rounds
+machine load spreads over both. ``mew compare`` then pools each file's rounds
 and compares ducky against duckdb-python as the baseline.
 """
 

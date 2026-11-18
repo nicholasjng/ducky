@@ -101,7 +101,7 @@ def test_appender_columns_dtype_mismatch(con):
 
 
 def test_appender_mask_wide_dtype_rejected(con):
-    # uint16/32/64 share the uint8 DLPack type code; they must not pass as masks.
+    # uint16/32/64 share the uint8 DLPack type code, so they must not pass as masks.
     con.execute("CREATE TABLE t (score DOUBLE)")
     scores = np.array([0.1, 0.2, 0.3], dtype=np.float64)
     with con.appender("t") as app, pytest.raises(ducky.Error, match="bool/uint8"):
@@ -152,7 +152,7 @@ def test_appender_default_constant(con):
 
 
 def test_appender_default_foldable_now(con):
-    # now() is a foldable default — duckdb_append_default resolves it.
+    # now() is foldable, so duckdb_append_default resolves it.
     con.execute("CREATE TABLE t (id INTEGER, ts TIMESTAMP DEFAULT now())")
     with con.appender("t") as app:
         app.append_row(1, ducky.DEFAULT)
@@ -166,8 +166,8 @@ def test_appender_default_on_column_without_default_raises(con):
 
 
 def test_appender_default_non_foldable_surfaces_duckdb_error(con):
-    # Sequence defaults aren't foldable; DuckDB's appender rejects them and we
-    # surface its message rather than a generic failure.
+    # Sequence defaults aren't foldable, and DuckDB's own message beats a generic
+    # failure.
     con.execute("CREATE SEQUENCE seq START 100")
     con.execute("CREATE TABLE t (id INTEGER DEFAULT nextval('seq'), v INTEGER)")
     with con.appender("t") as app, pytest.raises(ducky.Error, match="not supported"):
@@ -184,8 +184,7 @@ def test_default_sentinel_is_singleton_and_not_constructible():
 
 
 def test_append_arrow_table_stream(con):
-    # __arrow_c_stream__ path, exercising VARCHAR + LIST + NULLs — types the
-    # ndarray columnar path can't handle.
+    # VARCHAR, LIST and NULLs, which the ndarray path can't handle.
     pa = pytest.importorskip("pyarrow")
     con.execute("CREATE TABLE t (id BIGINT, name VARCHAR, tags VARCHAR[])")
     tbl = pa.table(
@@ -212,8 +211,7 @@ def test_append_arrow_record_batch(con):
 
 
 def test_append_arrow_multiple_batches(con):
-    # A table built from several record batches yields several stream batches;
-    # all must be appended.
+    # A table of several record batches streams several batches, all appended.
     pa = pytest.importorskip("pyarrow")
     con.execute("CREATE TABLE t (id BIGINT)")
     b1 = pa.record_batch({"id": pa.array([1, 2], pa.int64())})
@@ -233,8 +231,8 @@ def test_append_arrow_struct(con):
 
 
 def test_append_arrow_from_ducky_result(con):
-    # A ducky Result is itself an Arrow stream, so it can feed an appender —
-    # an in-database copy with no Python materialization.
+    # A ducky Result is an Arrow stream, so it copies within the database
+    # without materializing in Python.
     con.execute("CREATE TABLE t (i BIGINT)")
     with con.appender("t") as app:
         app.append_arrow(con.sql("SELECT i FROM range(100) t(i)"))

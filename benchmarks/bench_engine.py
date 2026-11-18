@@ -1,7 +1,7 @@
 """ducky and duckdb-python benchmarks, run per engine by ``benchmarks/run_vs_duckdb.py``.
 
 ``DUCKY_BENCH_ENGINE`` picks the engine, ``ducky`` (the default) or ``duckdb``.
-Both runs share these benchmark names, so ``mew compare`` matches them; each
+Both runs share these benchmark names, so ``mew compare`` matches them. Each
 process imports only its own engine.
 """
 
@@ -64,7 +64,7 @@ class _Ducky:
         return con.arrow_reader(query, rows_per_batch=2048)
 
     def insert_rows(self, con: Any) -> Callable[[list], None]:
-        """Prepare a 3-column INSERT; the returned call inserts its rows."""
+        """Prepare a 3-column INSERT. The returned call inserts its rows."""
         return con.prepare("INSERT INTO t VALUES (?, ?, ?)").executemany
 
     def insert_arrow(self, con: Any, tbl: pa.Table) -> Callable[[], None]:
@@ -77,8 +77,8 @@ class _DuckDB:
     """duckdb-python's spelling of the same operations.
 
     duckdb-python 2 produces Arrow and polars output from relations
-    (``con.sql``); from a DB-API result it copies the rows once more, or, for
-    polars, does not offer it.
+    (``con.sql``), since from a DB-API result it copies the rows once more, or,
+    for polars, does not offer it.
     """
 
     def __init__(self) -> None:

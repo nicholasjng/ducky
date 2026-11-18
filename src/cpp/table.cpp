@@ -15,8 +15,7 @@ namespace nb = nanobind;
 
 namespace {
 
-// Convert a bound SQL argument to a Python object. `factory` renders types
-// without a Python counterpart as text.
+// `factory` renders types without a Python counterpart as text.
 nb::object value_to_python(duckdb_v2_factory_handle factory, duckdb_v2_value_handle val) {
     V2Error e;
     bool is_null = false;
@@ -84,7 +83,6 @@ nb::object value_to_python(duckdb_v2_factory_handle factory, duckdb_v2_value_han
     }
 }
 
-// Column types supported by write_column_value.
 bool table_output_type_supported(DUCKDB_V2_LOGICAL_TYPE_ID t) {
     switch (t) {
         case DUCKDB_V2_LOGICAL_TYPE_ID_BOOLEAN:
@@ -144,7 +142,6 @@ int64_t micros_to_nanos(int64_t micros) {
     return micros * 1000;
 }
 
-// An output column of the chunk being filled.
 struct OutColumn {
     duckdb_v2_vector_handle vector = nullptr;
     void* data = nullptr;
@@ -153,8 +150,7 @@ struct OutColumn {
     duckdb_v2_arena_handle arena = nullptr;  // taken on the first long string
 };
 
-// Store `size` bytes as row `row` of a VARCHAR or BLOB column. Bytes may
-// include NULs.
+// Sized explicitly, since the bytes may include NULs.
 void write_bytes(OutColumn& col, idx_t row, const char* bytes, size_t size) {
     if (size > UINT32_MAX) throw DuckyError("ducky: string value is too long");
     duckdb_v2_bytes& out = ((duckdb_v2_bytes*)col.data)[row];
@@ -174,7 +170,6 @@ void write_bytes(OutColumn& col, idx_t row, const char* bytes, size_t size) {
     out.value.pointer.ptr = (char*)stored;
 }
 
-// Write a Python scalar value into row `row` of `col`.
 void write_column_value(OutColumn& col, idx_t row, nb::handle val) {
     if (val.is_none()) {
         if (!col.validity) {
@@ -191,7 +186,7 @@ void write_column_value(OutColumn& col, idx_t row, nb::handle val) {
         return;
     }
     if (col.type == DUCKDB_V2_LOGICAL_TYPE_ID_VARCHAR) {
-        // Borrow PyUnicode's cached UTF-8 buffer; no std::string copy.
+        // PyUnicode's cached UTF-8 buffer saves a copy.
         if (!nb::isinstance<nb::str>(val)) {
             throw DuckyError("ducky: expected str for VARCHAR column");
         }
@@ -377,9 +372,8 @@ void table_main(duckdb_v2_table_function_exec_info_handle info, duckdb_v2_contex
         idx_t vec_size = duckdb_vector_size();
         PyObject* gen = id->generator.ptr();
         while (rows < vec_size) {
-            // PyIter_Next: returns NULL at exhaustion (no error) or NULL +
-            // error set on failure. Avoids a `builtins.next` attr lookup
-            // and a StopIteration throw per row.
+            // PyIter_Next avoids a `builtins.next` lookup and a StopIteration
+            // per row. NULL without an error set means exhaustion.
             PyObject* raw = PyIter_Next(gen);
             if (!raw) {
                 if (PyErr_Occurred()) throw nb::python_error();
@@ -411,7 +405,6 @@ void table_main(duckdb_v2_table_function_exec_info_handle info, duckdb_v2_contex
     });
 }
 
-// Owns the logical types parsed for one registration.
 struct ParsedTypes {
     std::vector<duckdb_v2_logical_type_handle> types;
     ~ParsedTypes() {
@@ -423,9 +416,8 @@ struct ParsedTypes {
 
 void create_table_function(Connection& con, const std::string& name, nb::callable factory,
                            nb::object parameters, nb::object columns) {
-    // PyDateTimeAPI is static per TU; prime ours so the temporal branches in
-    // write_column_value / pydt:: helpers work when the trampolines run.
-    // Registration always precedes execution, so priming here suffices.
+    // PyDateTimeAPI is static per translation unit, and the trampolines'
+    // temporal branches use it. Registration always precedes execution.
     if (!PyDateTimeAPI) PyDateTime_IMPORT;
     std::shared_ptr<DuckDBHandle> handle = con.open_handle();
     duckdb_v2_connection_handle connection = handle->connection_v2;
@@ -435,7 +427,6 @@ void create_table_function(Connection& con, const std::string& name, nb::callabl
     auto ctx = std::make_unique<TableUDFContext>();
     ctx->factory = handle->keep(factory);
 
-    // Parse parameter types.
     if (!nb::isinstance<nb::sequence>(parameters)) {
         throw DuckyError("ducky: table function '" + name + "': parameters must be a list");
     }
@@ -444,7 +435,6 @@ void create_table_function(Connection& con, const std::string& name, nb::callabl
         param_types.types.push_back(v2_parse_type(types, nb::cast<std::string>(item)));
     }
 
-    // Parse output columns from dict {name: type}.
     if (!nb::isinstance<nb::dict>(columns)) {
         throw DuckyError("ducky: table function '" + name + "': columns must be a dict");
     }

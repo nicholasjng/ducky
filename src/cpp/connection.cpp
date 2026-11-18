@@ -24,7 +24,6 @@ namespace {
 
 using namespace nb::literals;
 
-// Cached Python types and 128-bit constants.
 struct BindTypes {
     nb::type_object decimal;          // decimal.Decimal
     nb::type_object uuid;             // uuid.UUID
@@ -64,10 +63,7 @@ nb::object steal_or_throw(PyObject* obj) {
     return nb::steal(obj);
 }
 
-// Split a Python int into a 128-bit (lo, hi) pair.
-//   is_signed=true  → [-2^127, 2^127 - 1]
-//   is_signed=false → [0,      2^128 - 1]
-// Anything outside raises DuckyError.
+// Raises DuckyError outside [-2^127, 2^127) when signed and [0, 2^128) when not.
 void py_long_to_int128(nb::handle value, bool is_signed, uint64_t& lo, uint64_t& hi) {
     const BindTypes& T = bind_types();
     PyObject* v = value.ptr();
@@ -83,14 +79,13 @@ void py_long_to_int128(nb::handle value, bool is_signed, uint64_t& lo, uint64_t&
         }
     }
 
-    // Two's-complement of N bits is value mod 2^N; Python's % on negatives
-    // already returns the positive residue.
+    // N-bit two's complement is value mod 2^N, and Python's % already returns
+    // the positive residue for negatives.
     nb::object wrapped = nb::borrow(value).attr("__mod__")(T.uint128_max_plus_one);
     lo = nb::cast<uint64_t>(wrapped.attr("__and__")(T.mask64));
     hi = nb::cast<uint64_t>(wrapped.attr("__rshift__")(nb::int_(64)));
 }
 
-// Convert a tz-aware datetime to UTC microseconds since the unix epoch.
 int64_t aware_datetime_to_utc_micros(nb::handle value) {
     nb::object delta = nb::borrow(value) - bind_types().epoch_utc;  // datetime.timedelta
     PyObject* d = delta.ptr();
@@ -100,14 +95,13 @@ int64_t aware_datetime_to_utc_micros(nb::handle value) {
     return ((days * 86400) + seconds) * 1000000 + micros;
 }
 
-// A decimal.Decimal's exact DECIMAL(width, scale) form. NaN and infinities
-// have none.
+// nullopt for NaN and infinities, which no DECIMAL holds.
 std::optional<duckdb_decimal> decimal_parts(nb::handle value, idx_t idx) {
     nb::object parts = value.attr("as_tuple")();
     nb::object exponent = parts.attr("exponent");
     if (!nb::isinstance<nb::int_>(exponent)) return std::nullopt;  // 'n', 'N' or 'F'
-    // Build the unscaled integer from the exact digit tuple; Decimal
-    // arithmetic would round to the context precision (28 digits by default).
+    // Built from the exact digit tuple, since Decimal arithmetic rounds to the
+    // context precision (28 digits by default).
     int64_t exp = nb::cast<int64_t>(exponent);
     std::string digits;
     for (nb::handle d : parts.attr("digits")) digits.push_back((char)('0' + nb::cast<int>(d)));
@@ -129,8 +123,8 @@ std::optional<duckdb_decimal> decimal_parts(nb::handle value, idx_t idx) {
     return duckdb_decimal{(uint8_t)width, (uint8_t)scale, duckdb_hugeint{lo, (int64_t)hi}};
 }
 
-// One execution's parameters as C API v2 values, which bind when the
-// statement executes.
+// v2 binds values when a statement executes, so each execution converts its own
+// and none carry over from the previous one.
 class V2Parameters {
    public:
     // With `planned`, ints and floats convert to the types its plan assumed,
@@ -151,11 +145,9 @@ class V2Parameters {
     idx_t count() const { return values_.size(); }
 
    private:
-    // Converts the parameter at position `idx` (1-based). An int becomes the
-    // integer type `planned` names if it fits, else a BIGINT; a float becomes
-    // a FLOAT if planned so, else a DOUBLE.
+    // `idx` is 1-based. Ints and floats take the type `planned` names when they
+    // fit it, else BIGINT and DOUBLE.
     duckdb_v2_value_handle convert(nb::handle value, idx_t idx, DUCKDB_V2_LOGICAL_TYPE_ID planned);
-    // Creates a BIGINT, or the integer type `planned` names when `v` fits it.
     DUCKDB_V2_ERROR convert_int(int64_t v, DUCKDB_V2_LOGICAL_TYPE_ID planned,
                                 duckdb_v2_value_handle* out, duckdb_v2_error_info_handle* err);
 
@@ -238,7 +230,7 @@ DUCKDB_V2_ERROR V2Parameters::convert_int(int64_t v, DUCKDB_V2_LOGICAL_TYPE_ID p
             if (v >= 0) return duckdb_v2_value_create_ubigint(factory_, (uint64_t)v, out, err);
             break;
         case DUCKDB_V2_LOGICAL_TYPE_ID_HUGEINT: {
-            // Any int64 fits; sign-extend into the upper half.
+            // Any int64 fits, sign-extended into the upper half.
             duckdb_v2_hugeint_t h{(uint64_t)v, v < 0 ? (int64_t)-1 : (int64_t)0};
             return duckdb_v2_value_create_hugeint(factory_, &h, out, err);
         }
@@ -261,7 +253,7 @@ duckdb_v2_value_handle V2Parameters::convert(nb::handle value, idx_t idx,
     };
 
     if (value.is_none()) {
-        // An untyped NULL, as duckdb_bind_null binds it; no type id creates
+        // Untyped, as duckdb_bind_null binds it, since no type id creates
         // SQLNULL.
         duckdb_v2_logical_type_handle null_type = nullptr;
         made(duckdb_v2_factory_create_type_from_text(factory_, "NULL", 4, &null_type, err.out()));
@@ -358,8 +350,8 @@ duckdb_v2_value_handle V2Parameters::convert(nb::handle value, idx_t idx,
             duckdb_v2_value_create_decimal(factory_, &h, d->width, d->scale, &out, err.out()));
     }
     if (nb::isinstance(value, T.uuid)) {
-        // UUID.int is the natural unsigned value; storage flips its top bit so
-        // UUIDs sort as signed integers.
+        // UUID.int is the unsigned value, but storage flips its top bit so UUIDs
+        // sort as signed integers.
         uint64_t lo = 0, hi = 0;
         py_long_to_int128(value.attr("int"), /*is_signed=*/false, lo, hi);
         duckdb_v2_hugeint_t h{lo, (int64_t)(hi ^ (uint64_t(1) << 63))};
@@ -389,9 +381,8 @@ void arrow_stream_capsule_destructor(PyObject* capsule) {
     }
 }
 
-// The arrays of a finished v2 Arrow result, served as an ArrowArrayStream.
-// The result stays open to report the schema, and the handle to keep the
-// result's connection.
+// The result stays open to report the schema, and the handle keeps its
+// connection alive.
 struct CollectedArrow {
     std::shared_ptr<DuckDBHandle> handle;
     duckdb_v2_arrow_result_handle result = nullptr;
@@ -443,8 +434,7 @@ struct CollectedArrow {
     }
 };
 
-// Steps `result` to its end with the GIL released and returns its arrays.
-// Resurfaces every 10 ms for Python signals; one interrupts the query.
+// Resurfaces every 10 ms so a Python signal can interrupt the query.
 std::vector<ArrowArray> collect_arrow(duckdb_v2_connection_handle con,
                                       duckdb_v2_arrow_result_handle result) {
     std::vector<ArrowArray> arrays;
@@ -476,8 +466,8 @@ std::vector<ArrowArray> collect_arrow(duckdb_v2_connection_handle con,
                 throw DuckyError(kInterrupted);
             }
             if (PyErr_CheckSignals() != 0) {
-                // Typically KeyboardInterrupt. The signal's exception stays set
-                // while the query winds down; its workers may need the GIL.
+                // Typically KeyboardInterrupt. Its exception stays set while the
+                // query winds down without the GIL, which its workers may need.
                 nb::gil_scoped_release release;
                 duckdb_v2_connection_interrupt(con, nullptr);
                 for (;;) {
@@ -500,7 +490,6 @@ std::vector<ArrowArray> collect_arrow(duckdb_v2_connection_handle con,
     }
 }
 
-// Owns the single statement of `query`, parsed for execution.
 class ParsedStatement {
    public:
     ParsedStatement(duckdb_v2_connection_handle con, const std::string& query) {
@@ -536,9 +525,8 @@ class ParsedStatement {
     duckdb_v2_sql_statement_handle stmt_ = nullptr;
 };
 
-// Runs `execution` until it settles, with the GIL released, resurfacing every
-// 10 ms for Python signals. A signal interrupts the query and raises; the query
-// ends as the execution is destroyed.
+// Resurfaces every 10 ms so a Python signal can interrupt the query, which ends
+// as `execution` is destroyed.
 void drive(duckdb_v2_connection_handle con, Execution& execution) {
     for (;;) {
         bool settled;
@@ -556,8 +544,6 @@ void drive(duckdb_v2_connection_handle con, Execution& execution) {
     }
 }
 
-// Runs `result` to its end with the GIL released, discarding its rows, and
-// destroys it.
 DUCKDB_V2_ERROR drain(duckdb_v2_result_handle& result, duckdb_v2_error_info_handle* err) {
     idx_t rows_changed = 0;
     DUCKDB_V2_ERROR code;
@@ -570,8 +556,7 @@ DUCKDB_V2_ERROR drain(duckdb_v2_result_handle& result, duckdb_v2_error_info_hand
     return code;
 }
 
-// Runs `sql`, one statement without parameters, to its end. Raises DuckDB's
-// message after `prefix` on failure.
+// Raises DuckDB's message after `prefix`.
 void run_statement(duckdb_v2_connection_handle con, const std::string& sql,
                    const std::string& prefix) {
     ParsedStatement stmt(con, sql);
@@ -596,7 +581,6 @@ duckdb_v2_factory_handle connection_factory(duckdb_v2_connection_handle con) {
     return factory;
 }
 
-// Executes `stmt` with `parameters`, returning its unstepped result.
 duckdb_v2_result_handle execute_prepared(duckdb_v2_connection_handle con, const V2Prepared& stmt,
                                          nb::handle parameters) {
     V2Parameters values(connection_factory(con), parameters, &stmt);
@@ -613,8 +597,6 @@ duckdb_v2_result_handle execute_prepared(duckdb_v2_connection_handle con, const 
     return result;
 }
 
-// Runs `stmt` once per parameter set in `seq`, discarding the results, with
-// periodic signal checks.
 void executemany_loop(duckdb_v2_connection_handle con, const V2Prepared& stmt, nb::handle seq) {
     constexpr idx_t SIGNAL_CHECK_PERIOD = 1024;
     idx_t since_check = 0;
@@ -704,20 +686,20 @@ void Connection::interrupt() {
 void Connection::load_extension(const std::string& name) {
     std::shared_ptr<DuckDBHandle> handle = open_handle();
 
-    // Build `LOAD '<name>'`, doubling single quotes for the SQL string literal.
+    // Doubled single quotes keep the name one SQL string literal.
     std::string literal;
     literal.reserve(name.size() + 2);
     for (char c : name) {
         if (c == '\'') literal.push_back('\'');
         literal.push_back(c);
     }
-    // dlopen + metadata/signature checks touch the filesystem; run_statement
-    // releases the GIL so other threads run during the load.
+    // dlopen and the metadata and signature checks touch the filesystem, so
+    // run_statement releases the GIL during the load.
     run_statement(handle->connection_v2, "LOAD '" + literal + "'",
                   "ducky: failed to load extension '" + name + "': ");
 
-    // LOAD can register new functions / types / settings, so drop cached plans
-    // — mirrors the caches_statement() flush run() applies to LOAD statements.
+    // LOAD can register functions, types and settings that cached plans predate,
+    // which is why run() flushes for LOAD statements too.
     statement_cache_clear();
 }
 
@@ -733,7 +715,6 @@ nb::tuple Connection::progress() const {
 
 namespace {
 
-// Owns a query metrics snapshot.
 struct V2Metrics {
     duckdb_v2_query_metrics_handle handle = nullptr;
     V2Metrics() = default;
@@ -742,7 +723,7 @@ struct V2Metrics {
     ~V2Metrics() { duckdb_v2_query_metrics_destroy(&handle); }
 };
 
-// A node's metrics as name and text, the text as v1 rendered it.
+// Renders values as v1 did, so existing profile readers parse them unchanged.
 std::vector<std::pair<std::string, std::string>> read_metrics(
     duckdb_v2_query_metrics_node_handle node) {
     std::vector<std::pair<std::string, std::string>> out;
@@ -780,7 +761,7 @@ nb::dict profile_node(nb::dict metrics, nb::list children) {
     return node;
 }
 
-// An operator node and its children, with metrics keyed without `operator.`.
+// Keys drop `operator.`, as v1's did.
 nb::dict walk_operator(duckdb_v2_query_metrics_node_handle node) {
     constexpr std::string_view prefix = "operator.";
     nb::dict metrics;
@@ -802,9 +783,9 @@ nb::dict walk_operator(duckdb_v2_query_metrics_node_handle node) {
     return profile_node(std::move(metrics), std::move(children));
 }
 
-// The last query's profile in the shape v1's profiling info had: an empty root
-// whose children are the operator tree and one node per metric group (query,
-// system, io, planner, ...), keyed without the group. None without a plan.
+// Shaped like v1's profiling info so existing sinks read it unchanged: an empty
+// root whose children are the operator tree and one node per metric group
+// (query, system, io, planner, ...), keyed without the group. None without a plan.
 nb::object profile_tree(duckdb_v2_connection_handle con) {
     V2Metrics metrics;
     V2Error err;
@@ -857,8 +838,7 @@ nb::object Connection::get_profiling_info() const {
 
 namespace {
 
-// Run a SET (or other no-result) statement, bypassing run() so it doesn't
-// reach the profile sink.
+// Bypasses run() so internal statements don't reach the profile sink.
 void exec_no_result(duckdb_v2_connection_handle con, const std::string& sql) {
     run_statement(con, sql, "ducky: " + sql + " failed: ");
 }
@@ -947,8 +927,8 @@ void Connection::close() {
         nb::ft_lock_guard lock(handle_mu_);
         handle = std::move(handle_);
     }
-    // Stop a query another thread is running; it holds its own reference to
-    // the handle, so the connection stays valid until that call returns.
+    // A query running on another thread holds its own reference to the handle,
+    // so the connection stays valid until that call returns.
     // DuckDB clears the interrupt flag when the next query starts, so results
     // and prepared statements that outlive the Connection are unaffected.
     if (handle && handle->connection_v2) {
@@ -961,8 +941,8 @@ void Connection::close() {
         arrow_registry_->sources.clear();
     }
     profile_sink_ = nb::none();
-    // Results, prepared statements and appenders retain shared ownership of
-    // the database; the last owner closes it.
+    // Results, prepared statements and appenders share ownership of the
+    // database, so the last owner closes it.
 }
 
 int Connection::gc_traverse(visitproc visit, void* arg) const {
@@ -972,7 +952,7 @@ int Connection::gc_traverse(visitproc visit, void* arg) const {
     if (handle_ && handle_.use_count() == 1) {
         for (const nb::object& obj : handle_->py_refs()) Py_VISIT(obj.ptr());
     }
-    // GC holds the GIL or stops all threads; taking mu could deadlock.
+    // GC holds the GIL or stops all threads, so taking mu could deadlock.
     if (arrow_registry_) {
         for (const auto& [name, source] : arrow_registry_->sources) {
             Py_VISIT(source.object.ptr());
@@ -1108,8 +1088,7 @@ std::vector<std::pair<std::string, std::string>> V2Prepared::columns() const {
     return out;
 }
 
-// Retire a successfully executed statement under the cache policy. Writes do
-// not flush the cache: DuckDB re-binds cached plans that read base tables, so
+// Writes do not flush the cache: DuckDB re-binds cached plans that read base tables, so
 // they see the new data and statistics. Statements that change settings,
 // schemas or loaded extensions (everything caches_statement rejects) do.
 void Connection::statement_cache_retire(const std::string& query,
@@ -1227,7 +1206,7 @@ nb::object Connection::arrow_collected_stream(const std::string& query, nb::obje
             params.count(), rows_per_batch, &collected->result, err.out());
     }
     err.check(code);
-    // Read to its end anyway; see Execution.
+    // Read to its end anyway (see Execution).
     duckdb_v2_arrow_result_retain(collected->result, nullptr);
     collected->arrays = collect_arrow(con, collected->result);
     stmt.retire();

@@ -9,12 +9,12 @@ def main() -> None:
     # threads >= 2 lets DuckDB's scheduler report meaningful progress.
     con = ducky.connect(threads=4)
 
-    # Everything inside the block is tracked; the bar finalizes to 100% on exit.
+    # The bar finalizes to 100% on exit.
     with ducky.progress_bar(con, desc="counting"):
         row = con.execute(
             "SELECT count(*) FROM range(2_000_000_000) t(i) WHERE i % 7 = 0"
         ).fetchone()
-    # A COUNT(*) always yields exactly one row; assert narrows tuple | None.
+    # A COUNT(*) always yields one row, which the assert tells the type checker.
     assert row is not None
     (count,) = row
 

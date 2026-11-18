@@ -135,9 +135,8 @@ def fetchnumpy(source: _ChunkSource) -> dict[str, np.ndarray]:
     return source.to_numpy()
 
 
-# Numeric / temporal columns only; for strings / nested types go through .arrow().
-# NULL slots in the dense ndarrays hold raw buffer contents — filter or coalesce
-# in SQL, or use iter_batches(with_validity=True), to handle them safely.
+# Chunk views are zero-copy, so their NULL slots hold whatever DuckDB left there.
+# with_validity=True, COALESCE in SQL, or arrow() handle NULLs.
 
 
 def chunks(source: _ChunkSource) -> Iterator[Chunk]:
@@ -266,7 +265,7 @@ def to_mlx(
     source: _ChunkSource,
     columns: Iterable[str] | None = None,
 ) -> dict[str, mx.array]:
-    """Return selected columns as MLX arrays; ``DOUBLE`` becomes float32."""
+    """Return selected columns as MLX arrays. ``DOUBLE`` becomes float32."""
     import mlx.core as mx
 
     arrays = source.to_numpy(columns)

@@ -47,7 +47,6 @@ void agg_init(duckdb_v2_aggregate_function_init_info_handle info,
     });
 }
 
-// The instance in `state`, created on first use.
 nb::handle instance(AggregateUDFContext* ctx, AggState state) {
     if (!slot(state)) slot(state) = ctx->cls().release().ptr();
     return nb::handle(slot(state));
@@ -74,7 +73,6 @@ bool row_is_valid(const uint64_t* validity, idx_t row) {
     return !validity || ((validity[row / 64] >> (row % 64)) & 1);
 }
 
-// The function's context, from any callback's info.
 template <typename Info, typename Getter>
 AggregateUDFContext* context_of(Info info, Getter getter) {
     V2Error e;
@@ -104,9 +102,8 @@ void agg_update(duckdb_v2_aggregate_function_update_info_handle info,
             e.check(duckdb_v2_vector_get_view(arg, &views[c], e.out()));
         }
 
-        // SQL aggregates ignore rows with a NULL argument; DuckDB passes
-        // them in, so leave them out here. `rows` stays empty when every
-        // row is valid.
+        // SQL aggregates ignore rows with a NULL argument, but DuckDB passes
+        // them in. `rows` stays empty when every row is valid.
         std::vector<const uint64_t*> masks;
         for (const duckdb_v2_vector_view& view : views) {
             if (view.validity) masks.push_back(view.validity);
@@ -129,8 +126,7 @@ void agg_update(duckdb_v2_aggregate_function_update_info_handle info,
         }
         bool all_rows = rows.empty();
 
-        // Input arrays for the rows `selection` lists, gathered into
-        // owned buffers (the caller may keep the arrays).
+        // Owned buffers, since the callable may keep the arrays.
         auto gather_args = [&](const std::vector<idx_t>& selection) {
             size_t shape[1] = {selection.size()};
             nb::list args;
@@ -245,7 +241,6 @@ void agg_finalize(duckdb_v2_aggregate_function_finalize_info_handle info,
                 continue;
             }
 
-            // Cast the returned scalar to the right C type and write it.
             uint8_t* cell = out + (offset + i) * elem_size;
             if (want.code == (uint8_t)nb::dlpack::dtype_code::Bool && want.bits == 8) {
                 // Truthiness, so numpy.bool and other bool-like scalars work.
@@ -277,7 +272,6 @@ void agg_finalize(duckdb_v2_aggregate_function_finalize_info_handle info,
                 }
                 std::memcpy(cell, &v, elem_size);
             } else {
-                // Float / Double
                 double v = nb::cast<double>(val);
                 if (elem_size == 4) {
                     float f = (float)v;
@@ -297,8 +291,8 @@ void create_aggregate_function(Connection& con, const std::string& name, nb::obj
     std::shared_ptr<DuckDBHandle> handle = con.open_handle();
     if (!nb::hasattr(cls, "combine")) {
         // DuckDB merges partial states not only across threads but also for
-        // DISTINCT, window frames and large GROUP BYs, even single-threaded;
-        // arbitrary Python state has no generic merge.
+        // DISTINCT, window frames and large GROUP BYs, even single-threaded,
+        // and arbitrary Python state has no generic merge.
         throw DuckyError("ducky: aggregate UDF '" + name +
                          "' must define combine(self, other), which merges another partial state "
                          "into self; DuckDB merges states for parallel scans, DISTINCT, window "
@@ -340,7 +334,6 @@ void create_aggregate_function(Connection& con, const std::string& name, nb::obj
         });
     check(duckdb_v2_aggregate_function_set_name(f, name.data(), name.size(), err.out()));
 
-    // Adds a parameter or sets the return type to a type id, through `add`.
     auto with_type = [&](DUCKDB_V2_LOGICAL_TYPE_ID id, auto add) {
         duckdb_v2_logical_type_handle t = nullptr;
         check(duckdb_v2_factory_create_type_from_id(factory, id, nullptr, nullptr, nullptr, 0, &t,

@@ -24,7 +24,6 @@ inline duckdb_v2_environment_handle v2_environment() {
     return env;
 }
 
-// Owns the error info a v2 call reports through its `err` slot.
 class V2Error {
    public:
     V2Error() = default;
@@ -48,8 +47,7 @@ class V2Error {
         return std::string(text, length);
     }
 
-    // Raises DuckyError with `prefix` and the reported text unless `code` is
-    // DUCKDB_V2_ERROR_NONE.
+    // Raises with `prefix` before DuckDB's text.
     void check(DUCKDB_V2_ERROR code, const std::string& prefix = "") const {
         if (code != DUCKDB_V2_ERROR_NONE) throw DuckyError(prefix + text());
     }
@@ -58,7 +56,7 @@ class V2Error {
     duckdb_v2_error_info_handle info_ = nullptr;
 };
 
-// Runs a callback body, reporting what it throws through the callback's `err`.
+// Exceptions must not cross into DuckDB, so they go through the callback's `err`.
 template <typename Body>
 void report(duckdb_v2_error_info_handle* err, Body&& body) {
     guard(std::forward<Body>(body), [&](const char* what) {
@@ -67,9 +65,8 @@ void report(duckdb_v2_error_info_handle* err, Body&& body) {
     });
 }
 
-// Parses a DuckDB type expression (e.g. "DECIMAL(18,3)", "STRUCT(a INT)") in
-// the scope of `factory`; the caller owns the result. A connection's factory
-// resolves catalog types in its open transaction, if any.
+// A connection's factory resolves catalog types in its open transaction, so
+// types created there parse without a query. The caller owns the result.
 inline duckdb_v2_logical_type_handle v2_parse_type(duckdb_v2_factory_handle factory,
                                                    const std::string& text) {
     if (text.empty()) throw DuckyError("ducky: empty type string");
@@ -77,7 +74,7 @@ inline duckdb_v2_logical_type_handle v2_parse_type(duckdb_v2_factory_handle fact
     V2Error err;
     DUCKDB_V2_ERROR code;
     {
-        // Resolving catalog types takes the client context lock; Python
+        // Resolving catalog types takes the client context lock, and Python
         // callbacks of a query running elsewhere may need the GIL meanwhile.
         release_gil_if_held release;
         code = duckdb_v2_factory_create_type_from_text(factory, text.data(), text.size(), &out,
@@ -87,7 +84,6 @@ inline duckdb_v2_logical_type_handle v2_parse_type(duckdb_v2_factory_handle fact
     return out;
 }
 
-// The name of a type's id, such as "INTEGER" or "LIST", or its alias.
 inline std::string v2_type_name(duckdb_v2_logical_type_handle type) {
     const char* name = nullptr;
     idx_t length = 0;

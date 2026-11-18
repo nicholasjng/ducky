@@ -32,7 +32,7 @@ def _cached_path(month: str) -> Path:
             shutil.copyfileobj(resp, f)
         tmp.rename(dest)
     finally:
-        tmp.unlink(missing_ok=True)  # no-op once renamed; cleans up on failure
+        tmp.unlink(missing_ok=True)  # cleans up on failure, a no-op once renamed
     return dest
 
 
@@ -143,7 +143,7 @@ def train(
     batch_size: int = BATCH_SIZE,
     lr: float = LR,
 ) -> tuple[MLPParams, float, float]:
-    """Minibatch SGD; returns ``(params, final val_mse, final val_mae_minutes)``."""
+    """Minibatch SGD. Returns ``(params, final val_mse, final val_mae_minutes)``."""
     for epoch in range(epochs):
         for Xb, yb in _batches(Xtr, ytr, batch_size, seed=epoch):
             params = _sgd_step(params, Xb, yb, lr)
@@ -155,7 +155,7 @@ def train(
 def report(
     engine: str, n: int, load_s: float, train_s: float, val_mse: float, val_mae: float
 ) -> None:
-    """Print a machine-parseable result line; read by run_taxi_vs_duckdb.py."""
+    """Print a machine-parseable result line for run_taxi_vs_duckdb.py."""
     print(
         f"RESULT engine={engine} n={n} load_s={load_s:.4f} train_s={train_s:.4f} "
         f"val_mse={val_mse:.4f} val_mae={val_mae:.4f}",

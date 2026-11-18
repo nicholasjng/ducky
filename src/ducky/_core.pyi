@@ -18,7 +18,7 @@ __duckdb_version__: str = "v2.1.0-dev0"
 class Error(Exception): ...
 
 class Default:
-    """Sentinel type for appender DEFAULT values; use ``ducky.DEFAULT``."""
+    """Type of ``ducky.DEFAULT``, the appender's marker for a column DEFAULT."""
 
 DEFAULT: Default = ...
 
@@ -38,7 +38,7 @@ class Chunk:
 
     def column(self, key: int | str) -> numpy.ndarray:
         """
-        Return a zero-copy ndarray view by index or name; (rows, *dims) for an ARRAY, codes for
+        Return a zero-copy ndarray view by index or name: (rows, *dims) for an ARRAY, codes for
         an ENUM.
         """
 
@@ -95,7 +95,7 @@ class Result:
 
     @property
     def rows_changed(self) -> int:
-        """Rows affected by INSERT, UPDATE, or DELETE; otherwise 0."""
+        """Rows affected by INSERT, UPDATE, or DELETE, otherwise 0."""
 
     def fetch_chunk(self) -> Chunk | None:
         """Pull the next :class:`Chunk`, or None at end of stream."""
@@ -110,8 +110,8 @@ class Result:
         """
         Drain the result into a {name: numpy.ndarray} dict. A fixed-size ARRAY column becomes an
         (n, *dims) array and an ENUM column its integer codes (see categories()). NULLs become
-        NaN in FLOAT/DOUBLE columns and raise elsewhere. Raises on VARCHAR/LIST/STRUCT/MAP; use
-        arrow() for those.
+        NaN in FLOAT/DOUBLE columns and raise elsewhere. Raises on VARCHAR/LIST/STRUCT/MAP, for
+        which arrow() works.
         """
 
     def categories(self, key: int | str) -> list[str]:
@@ -141,7 +141,7 @@ class Result:
     def fetchnumpy(self) -> dict[str, numpy.ndarray]:
         """
         Return the result as a dict of column name -> numpy array. Numeric and temporal columns,
-        fixed-size ARRAYs of them, and ENUM codes only; use arrow() for strings and other nested
+        fixed-size ARRAYs of them, and ENUM codes only. Use arrow() for strings and other nested
         types. NULLs become NaN in FLOAT/DOUBLE columns and raise elsewhere.
         """
 
@@ -289,13 +289,13 @@ class PendingState(enum.Enum):
     """The result is ready to materialize."""
 
     NOT_READY = 1
-    """More work remains; tick again."""
+    """More work remains, so tick again."""
 
     ERROR = 2
-    """Execution failed; see ``.error()``."""
+    """Execution failed, see ``.error()``."""
 
     NO_TASKS = 3
-    """Workers own the outstanding tasks; yield, then tick again."""
+    """Workers own the outstanding tasks, so yield, then tick again."""
 
 class PendingResult:
     """Steppable in-flight query handle."""
@@ -315,7 +315,7 @@ class PendingResult:
 
     def materialize(self) -> Result:
         """
-        Materialize the finished result; call once ``execute_task`` reports ``READY``.
+        Materialize the finished result once ``execute_task`` reports ``READY``.
         """
 
     def drain(self) -> None:
@@ -394,7 +394,7 @@ class Connection:
 
     @property
     def current_result(self) -> Result:
-        """The latest execute result; raises if no query has run."""
+        """The latest execute result. Raises if no query has run."""
 
     @overload
     def arrow(self) -> pyarrow.Table:
@@ -422,7 +422,7 @@ class Connection:
     def fetchnumpy(self) -> dict[str, numpy.ndarray]:
         """
         Return the result as a dict of column name -> numpy array. Numeric and temporal columns,
-        fixed-size ARRAYs of them, and ENUM codes only; use arrow() for strings and other nested
+        fixed-size ARRAYs of them, and ENUM codes only. Use arrow() for strings and other nested
         types. NULLs become NaN in FLOAT/DOUBLE columns and raise elsewhere.
         """
 
@@ -483,7 +483,7 @@ class Connection:
     def to_numpy(self, columns: Iterable[str] | None = None) -> dict[str, numpy.ndarray]:
         """
         Drain the latest result into a {name: numpy.ndarray} dict. Raises on
-        VARCHAR/LIST/STRUCT/MAP; use arrow() for those.
+        VARCHAR/LIST/STRUCT/MAP, for which arrow() works.
         """
 
     def create_function(
@@ -500,7 +500,7 @@ class Connection:
     ) -> None:
         """
         Register a chunk-wise NumPy scalar UDF. Types may be explicit or inferred. Rows with a NULL
-        argument are not passed to fn and yield NULL; with special_handling, inputs and output use
+        argument are not passed to fn and yield NULL. With special_handling, inputs and output use
         ``(values, validity)`` tuples instead.
         """
 
@@ -536,11 +536,11 @@ class Connection:
         """Open a bulk appender for ``table``."""
 
     def interrupt(self) -> None:
-        """Request cancellation of a running query; thread-safe."""
+        """Request cancellation of a running query. Thread-safe."""
 
     def progress(self) -> tuple[float, int, int]:
         """
-        Return ``(percentage, rows_processed, total_rows)``; percentage is -1 until estimated.
+        Return ``(percentage, rows_processed, total_rows)``, with percentage -1 until estimated.
         """
 
     def get_profiling_info(self) -> dict[str, Any] | None:
@@ -561,8 +561,8 @@ class Connection:
     def register_arrow(self, name: str, obj: Any) -> None:
         """
         Register an Arrow C stream source as table ``name`` (matched case-insensitively). Tables and
-        data frames are re-read by every query; readers and query results are one-shot and can be
-        scanned once.
+        data frames are re-read by every query, while readers and query results are one-shot and can
+        be scanned once.
         """
 
     def load_extension(self, name: str) -> None:

@@ -8,9 +8,7 @@
 #include "ducky.hpp"
 #include "v2.hpp"
 
-// Shared DuckDB database and connection owner. The instance and connection are
-// C API v2 handles; `connection` bridges the connection to v1 for the
-// functions v2 lacks.
+// `connection` bridges the v2 connection to v1 for the functions v2 lacks.
 struct DuckDBHandle {
     duckdb_v2_instance_handle instance = nullptr;
     duckdb_v2_connection_handle connection_v2 = nullptr;
@@ -41,17 +39,16 @@ struct DuckDBHandle {
         }
     }
 
-    // Keeps `obj` alive as long as the database, returning a borrowed handle.
-    // For the Python callables of registered functions: the Connection reports
-    // them to the garbage collector (see gc_traverse), so a callable that
-    // refers back to its Connection doesn't keep both alive forever.
+    // Owns registered functions' callables, which the Connection reports to the
+    // garbage collector (see gc_traverse), so a callable that refers back to
+    // its Connection doesn't keep both alive forever.
     nb::handle keep(nb::object obj) {
         nb::ft_lock_guard lock(py_refs_mu_);
         py_refs_.push_back(std::move(obj));
         return py_refs_.back();
     }
 
-    // For gc_traverse only: GC holds the GIL or stops all threads.
+    // For gc_traverse only, since GC holds the GIL or stops all threads.
     const std::vector<nb::object>& py_refs() const { return py_refs_; }
 
    private:

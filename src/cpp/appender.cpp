@@ -18,8 +18,8 @@
 
 namespace {
 
-// Flat dtype + element size for numeric / temporal DuckDB types, or false for
-// non-flat types (VARCHAR, nested, DECIMAL, HUGEINT, INTERVAL).
+// False for types without a flat NumPy layout (VARCHAR, nested, DECIMAL,
+// HUGEINT, INTERVAL), which take the row path.
 struct FlatDType {
     nb::dlpack::dtype dtype;
     size_t elem_size;
@@ -34,7 +34,6 @@ bool flat_dtype_for(duckdb_type t, FlatDType& out) {
     return false;
 }
 
-// Quote a DuckDB identifier for safe embedding in a SQL string.
 std::string quote_ident(const std::string& s) {
     std::string out;
     out.reserve(s.size() + 2);
@@ -47,11 +46,9 @@ std::string quote_ident(const std::string& s) {
     return out;
 }
 
-// Names + per-column DEFAULT-ness of the target table's stored columns, read
-// from DuckDB's `table_description` introspection API. Generated columns are
-// skipped: the appender takes no values for them, so the remaining columns line
-// up with the appender's. Called once at construction so callers can use
-// append_columns({name: ndarray}) and append_row's `ducky.DEFAULT` sentinel.
+// The appender API exposes neither names nor DEFAULT-ness, which
+// append_columns({name: ndarray}) and append_row's `ducky.DEFAULT` need.
+// Generated columns are skipped, since the appender takes no values for them.
 struct TableIntrospection {
     std::vector<std::string> names;
     std::vector<bool> has_default;
@@ -122,8 +119,8 @@ TableIntrospection introspect_table(duckdb_v2_connection_handle con,
     return out;
 }
 
-// 1-D, C-contiguous ndarray view of unknown dtype; we dtype-check manually
-// for better error messages than nanobind's templated reject.
+// Checking the dtype by hand gives better errors than nanobind's templated
+// reject.
 using AnyArray = nb::ndarray<nb::ro, nb::c_contig>;
 
 bool dtype_eq(nb::dlpack::dtype a, nb::dlpack::dtype b) {
@@ -134,8 +131,8 @@ bool dtype_eq(nb::dlpack::dtype a, nb::dlpack::dtype b) {
 
 Appender::Appender(Connection& connection, std::string table, std::optional<std::string> schema,
                    std::optional<std::string> catalog) {
-    // PyDateTimeAPI is static per TU; prime ours so append_row's temporal
-    // branches (pydt:: helpers) work. Construction precedes every append.
+    // PyDateTimeAPI is static per translation unit, and append_row's temporal
+    // branches use it. Construction precedes every append.
     if (!PyDateTimeAPI) PyDateTime_IMPORT;
     connection_ = connection.open_handle();
     duckdb_connection con = connection_->connection;
@@ -168,7 +165,6 @@ Appender::Appender(Connection& connection, std::string table, std::optional<std:
         throw DuckyError(message);
     }
 
-    // Cache column types; logical types are owned and destroyed in the dtor.
     idx_t n_cols = duckdb_appender_column_count(handle_);
     types_.reserve(n_cols);
     type_ids_.reserve(n_cols);
@@ -178,8 +174,6 @@ Appender::Appender(Connection& connection, std::string table, std::optional<std:
         types_.push_back(lt);  // ownership transferred
     }
 
-    // Names + DEFAULT-ness need a separate lookup — the appender API exposes
-    // neither. table_description gives both directly.
     try {
         TableIntrospection info =
             introspect_table(connection_->connection_v2, catalog, schema, table);
@@ -206,9 +200,8 @@ Appender::Appender(Connection& connection, std::string table, std::optional<std:
 
 Appender::~Appender() {
     // Not close(): a destructor must not throw, and the final implicit flush
-    // can fail (e.g. a constraint violation). duckdb_appender_destroy closes
-    // internally; its error state is dropped here. Call close() (or use a
-    // `with` block) to observe flush errors.
+    // can fail (a constraint violation, say). duckdb_appender_destroy closes
+    // and drops its error, so only close() or a `with` block reports it.
     if (handle_) {
         release_gil_if_held release;
         duckdb_appender_destroy(&handle_);
@@ -291,8 +284,8 @@ void Appender::close() {
 
 namespace {
 
-// One append_row value, converted to its column's exact C type before any of
-// the row is handed to DuckDB.
+// Converted to the column's exact C type before any of the row reaches DuckDB,
+// so a bad value cannot leave the appender mid-row.
 struct Staged {
     enum class Kind : uint8_t {
         Null,
@@ -339,7 +332,7 @@ std::string type_name_of(nb::handle value) {
     return nb::cast<std::string>(nb::str(value.type().attr("__name__")));
 }
 
-// Integer via __index__ (int, numpy integers), range-checked for the column.
+// __index__ accepts NumPy integers too.
 int64_t staged_signed(nb::handle value, int64_t lo, int64_t hi, duckdb_type t, idx_t col,
                       const std::string& name) {
     int overflow = 0;
@@ -380,7 +373,7 @@ Staged stage_value(duckdb_type t, nb::handle value, idx_t col, const std::string
     PyObject* raw = value.ptr();
     switch (t) {
         case DUCKDB_TYPE_BOOLEAN: {
-            // bool and numpy.bool; integers are rejected rather than coerced.
+            // bool and numpy.bool only, since coercing integers would hide mistakes.
             if (!PyBool_Check(raw) && type_name_of(value) != "bool") {
                 throw_value_error("expected bool, got " + type_name_of(value), t, col, name);
             }
@@ -437,7 +430,7 @@ Staged stage_value(duckdb_type t, nb::handle value, idx_t col, const std::string
             if (!PyUnicode_Check(raw)) {
                 throw_value_error("expected str, got " + type_name_of(value), t, col, name);
             }
-            // Borrow PyUnicode's cached UTF-8 buffer; no std::string copy.
+            // PyUnicode's cached UTF-8 buffer saves a copy.
             Py_ssize_t size = 0;
             const char* data = PyUnicode_AsUTF8AndSize(raw, &size);
             if (!data) throw nb::python_error();
@@ -461,8 +454,8 @@ Staged stage_value(duckdb_type t, nb::handle value, idx_t col, const std::string
         // Temporal columns take the matching datetime object, mirroring what
         // bind_parameters accepts for `INSERT ... VALUES (?)`.
         case DUCKDB_TYPE_DATE:
-            // datetime.datetime is a date subclass; reject it rather than
-            // silently truncating the time part.
+            // datetime.datetime is a date subclass, rejected rather than
+            // silently truncating its time.
             if (!PyDate_Check(raw) || PyDateTime_Check(raw)) {
                 throw_value_error("expected datetime.date, got " + type_name_of(value), t, col,
                                   name);
@@ -484,7 +477,7 @@ Staged stage_value(duckdb_type t, nb::handle value, idx_t col, const std::string
                 throw_value_error("expected datetime.datetime, got " + type_name_of(value), t, col,
                                   name);
             }
-            // Aware values land in UTC micros; naive values are taken as-is.
+            // Aware values convert to UTC, naive ones are taken as they are.
             out.kind = Staged::Kind::Timestamp;
             out.i = pydt::datetime_to_micros(value);
             return out;
@@ -582,7 +575,7 @@ void Appender::append_row(nb::args values) {
     release_gil_if_held release;
     for (idx_t i = 0; i < n_cols; ++i) {
         if (append_staged(handle_, row[i]) == DuckDBError) {
-            // Unexpected; reset the half-written row so the appender stays usable.
+            // Unexpected. Resetting the half-written row keeps the appender usable.
             duckdb_appender_clear(handle_);
             check_state(DuckDBError, ("append failed at column " + std::to_string(i)).c_str());
         }
@@ -636,7 +629,7 @@ void Appender::append_columns(nb::dict columns, nb::object masks) {
             std::string name = nb::cast<std::string>(key);
             idx_t idx = resolve(name);
             if (!col_present[idx]) {
-                // A missing column takes its DEFAULT; there is nothing to mask.
+                // A missing column takes its DEFAULT, so there is nothing to mask.
                 throw DuckyError("ducky: mask for '" + name +
                                  "' has no matching entry in `columns`");
             }
@@ -701,11 +694,8 @@ void Appender::append_column_slices(const std::vector<idx_t>& present,
     types.reserve(present.size());
     for (idx_t i : present) types.push_back(types_[i]);
 
-    // Stream slices of up to vec_size rows through one reusable chunk:
-    // duckdb_append_data_chunk copies the data into the appender, and
-    // duckdb_data_chunk_reset restores capacity and all-valid validity masks
-    // (StandardVectorBuffer::ResetCapacity), so per-slice re-allocation is
-    // pure overhead.
+    // One chunk serves every slice: duckdb_append_data_chunk copies the data,
+    // and duckdb_data_chunk_reset restores capacity and all-valid masks.
     duckdb_data_chunk chunk = duckdb_create_data_chunk(types.data(), (idx_t)types.size());
     for (int64_t offset = 0; offset < n_rows; offset += (int64_t)vec_size) {
         idx_t this_n = (idx_t)std::min<int64_t>(vec_size, n_rows - offset);
@@ -752,10 +742,8 @@ void Appender::append_arrow(nb::object source) {
     duckdb_connection con = connection_->connection;
     if (!con) throw DuckyError("ducky: the appender's connection is closed");
 
-    // Convert Arrow rows (an ArrowArray matching `converted`) into a data chunk
-    // and append it. duckdb_data_chunk_from_arrow takes ownership of the
-    // array's buffers, so we null its release afterward to stop the caller's
-    // RAII / PyCapsule destructor from double-freeing.
+    // duckdb_data_chunk_from_arrow takes the array's buffers, so its release is
+    // nulled to keep the caller's guard or capsule from freeing them again.
     auto append_rows = [&](duckdb_arrow_converted_schema converted, ArrowArray* array) {
         std::string err;
         duckdb_data_chunk chunk = nullptr;
@@ -789,10 +777,8 @@ void Appender::append_arrow(nb::object source) {
     };
 
     if (nb::hasattr(source, "__arrow_c_stream__")) {
-        // Stream path: pyarrow Table / RecordBatchReader / polars / pandas-3 /
-        // a ducky Result. The capsule owns the stream and releases it when it
-        // goes out of scope here; the schema and per-batch arrays it hands us,
-        // we own (hence the *Release guards below).
+        // The capsule owns the stream, but the schema and batches it hands out
+        // are ours, hence the guards below.
         nb::object capsule = source.attr("__arrow_c_stream__")();
         auto* stream = (ArrowArrayStream*)PyCapsule_GetPointer(capsule.ptr(), "arrow_array_stream");
         if (!stream) {
@@ -827,10 +813,9 @@ void Appender::append_arrow(nb::object source) {
             append_batch(conv.schema, &array);
         }
     } else if (nb::hasattr(source, "__arrow_c_array__")) {
-        // Single-batch path: a pyarrow RecordBatch. The (schema, array) capsules
-        // own their structs and release them when `pair` drops at scope exit, so
-        // we don't add our own guards — append_batch only nulls the array's
-        // release after consuming it, which the array capsule honors.
+        // The schema and array capsules release their structs when `pair` drops,
+        // so there are no guards here. append_batch nulls the array's release
+        // once it has consumed it, which the capsule honors.
         nb::tuple pair = nb::cast<nb::tuple>(source.attr("__arrow_c_array__")());
         auto* schema = (ArrowSchema*)PyCapsule_GetPointer(pair[0].ptr(), "arrow_schema");
         auto* array = (ArrowArray*)PyCapsule_GetPointer(pair[1].ptr(), "arrow_array");

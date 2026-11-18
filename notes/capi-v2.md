@@ -31,7 +31,7 @@ They do not make vector or chunk access inherently faster.
 
 Every v2 function is unstable. DuckDB PR #27410 ("Mark C API v2 unstable",
 2026-10-16) demoted the whole surface, which had been marked stable at v2.0.0,
-because it is still being worked on; the `v2.0-cyanoptera` release branch
+because it is still being worked on. The `v2.0-cyanoptera` release branch
 matches. Consumers must define `DUCKDB_V2_API_ALLOW_UNSTABLE=1` to see any
 declaration, and the surface keeps changing (`duckdb_v2_str` parameters were
 removed on 2026-11-05).
@@ -44,18 +44,18 @@ and mature.
 
 A v2 result is an incremental cursor over one connection. `result_step` runs a
 bounded unit of execution without blocking and reports `CHUNK`, `WAITING`,
-`FINISHED`, or `CANCELLED`; `result_wait` blocks until a step can make progress,
+`FINISHED`, or `CANCELLED`. `result_wait` blocks until a step can make progress,
 and `result_fetch_chunk` and `result_drain` are blocking conveniences.
 Cancellation is a status rather than an error. While a result is live, the
 connection rejects another query with `DUCKDB_V2_ERROR_RESOURCE_IN_USE`.
 
 A result of a SELECT always streams. A stream holds at most
 `max_streaming_buffer_size` of rows the consumer has not taken and parks the
-query's workers until the consumer steps; a statement that keeps the source
-order of its rows then runs mostly on the consumer's thread. Statements without
-rows are retained: they run to their end without a consumer. v2 has no call to
-retain a SELECT's result, which reading it to its end in parallel needs;
-`patches/0011-capi-v2-result-retain.patch` adds `result_retain`. See
+query's workers until the consumer steps, so a statement that keeps the source
+order of its rows runs mostly on the consumer's thread. Statements without
+rows are retained: they run to their end without a consumer. Reading a SELECT's result
+to its end in parallel needs it retained, which
+`patches/0011-capi-v2-result-retain.patch` adds as `result_retain`. See
 [What ducky needs from v2](#what-ducky-needs-from-v2).
 
 Actual concurrency still requires separate connections, created by the shared
@@ -74,10 +74,10 @@ Actual concurrency still requires separate connections, created by the shared
   the next array. It covers the windowing that `append_arrow` and the Arrow scan
   build on `patches/0007-capi-vector-reference-slice.patch`.
 - **Table functions.** A claim batch callback hands work to threads one batch
-  at a time; `bind_set_order_preservation(NO_ORDER)` lets such a scan run in
+  at a time, and `bind_set_order_preservation(NO_ORDER)` lets such a scan run in
   parallel into results, INSERT, and COPY, and a partition data callback keeps
   insertion order while running in parallel. A stats callback lets the
-  optimizer prune scans and answer `min()` and `max()`; a filter pushdown
+  optimizer prune scans and answer `min()` and `max()`, and a filter pushdown
   callback lets the function inspect and accept the query's predicates.
 - **Instances and connections.** Environments, instances, and
   `connection_create` support one database shared by several connections.
@@ -110,13 +110,13 @@ until then.
    workers until the consumer steps, so an order-preserving query runs mostly
    on the consumer's thread. A heavy projection over a table, read in full,
    takes 645 ms streamed and 173 ms retained on 8 threads.
-   `patches/0011-capi-v2-result-retain.patch` adds `result_retain`; a flag on
+   `patches/0011-capi-v2-result-retain.patch` adds `result_retain`. A flag on
    the execute functions would do as well.
 3. **Arrow conversion outside callbacks.** An Arrow exporter needs a callback's
    context, so a chunk result cannot be converted to Arrow with v2.
    `patches/0014-capi-v2-connection-arrow-exporter.patch` adds
    `connection_create_arrow_exporter`, which takes the connection's settings
-   instead; lending out a connection's context would do as well, if the
+   instead. Lending out a connection's context would do as well, if the
    functions taking a context entered a transaction of their own.
 4. **Profiling metrics with their text.** `connection_get_query_metrics` keeps
    only numeric metrics. Against v1's profiling info for the same query, it
@@ -130,7 +130,7 @@ until then.
    for the step. Ducky steps every chunk before reading any, so the connection
    is free when `execute` returns, and so held the rows twice and copied them
    twice. `patches/0015-capi-v2-result-take-collection.patch` adds
-   `result_take_collection`, which hands the collection over; ducky scans it
+   `result_take_collection`, which hands the collection over, and ducky scans it
    into chunks it owns with the existing collection scan. A fetch into a
    caller-owned chunk, as ducky's v1 patch did, would not help: the chunks are
    all needed before the first is read.
@@ -145,9 +145,9 @@ until then.
    adds `prepared_statement_get_schema` and `prepared_statement_get_parameters`.
 8. **Smaller ones.**
    - A vector reference to an offset and count of another vector, for
-     zero-copy windows of a chunk; ducky windows through the Arrow importer.
-   - Telling a table function's `count(*)` from a scan of its first column;
-     ducky's Arrow scan converts a column it does not read.
+     zero-copy windows of a chunk. Ducky windows through the Arrow importer.
+   - Telling a table function's `count(*)` from a scan of its first column.
+     Ducky's Arrow scan converts a column it does not read.
    - Registering a filesystem without a C++ adapter.
    - `value_get_ubigint` converts a query metric's DOUBLE duration, such as
      0.0003, to 0 without an error, so a caller that tries the integer getters
@@ -157,13 +157,13 @@ until then.
 
 A complete migration would touch nearly every binding subsystem:
 
-- database and connection ownership;
-- prepared, pending, and streaming query execution;
-- result, chunk, vector, type, and value conversion;
-- Arrow import and export;
-- appenders, which v2 lacks, and Python UDF registration;
-- errors, progress, profiling, and extension loading;
-- the carried DuckDB patches.
+- database and connection ownership
+- prepared, pending, and streaming query execution
+- result, chunk, vector, type, and value conversion
+- Arrow import and export
+- appenders, which v2 lacks, and Python UDF registration
+- errors, progress, profiling, and extension loading
+- the carried DuckDB patches
 
 DuckDB exports both symbol families. With the bridge patch, subsystems move one
 at a time on a database that v2 owns.
@@ -174,7 +174,7 @@ Ducky creates every database as a v2 instance in one process-wide environment,
 attaches the path as its default database, and connects through v2. The bridge
 hands the v1 handles to everything not yet migrated. Because the environment
 detects file conflicts across instances, opening a file that the process
-already has open now fails; v1 opened a second instance on it.
+already has open now fails, where v1 opened a second instance on it.
 
 `Connection.arrow()` runs through `prepared_statement_execute_arrow` on the
 cached statement of the query, with parameters converted to v2 values, retains
@@ -185,7 +185,7 @@ query takes 33 µs, as with v1's collector, and 10M rows of two columns take
 The appender reads its target's columns through `connection_describe_table`,
 which reports generated columns, and the Arrow scan is a v2 table function and
 replacement scan. Each scan worker converts vector-size windows of the current
-batch with its own Arrow importer, outside the scan's lock; windows are Arrow
+batch with its own Arrow importer, outside the scan's lock. Windows are Arrow
 slices of the batch, so neither the importer nor `append_arrow`, which windows
 long batches the same way for the v1 appender, needs a vector slice. Against
 the v1 scan, string columns convert 3.4x faster and numeric scans match.
@@ -195,7 +195,7 @@ cannot tell that projection from a scan of its first column.
 v2 table functions let a prepared plan be reused, where v1 rebound on every
 execution, so a plan keeps the Arrow schema it was bound with. A ducky
 `PreparedStatement` therefore prepares again after any Arrow registration on its
-connection; SQL `PREPARE` reports the changed schema instead.
+connection, while SQL `PREPARE` reports the changed schema instead.
 
 Python table functions, scalar UDFs, and aggregates are v2 functions. Their types parse
 through the connection's factory, which resolves catalog types in its open
@@ -203,20 +203,20 @@ transaction and runs no query, so the private connection ducky parsed types on,
 and the v1 database handle it needed, are gone. A table function writes each
 chunk through cached data pointers, about 1.4x faster than through v1's
 per-cell vector calls. V2 hands a scalar function its arguments unflattened, so
-the NumPy trampoline flattens them; an Arrow UDF converts through an exporter
+the NumPy trampoline flattens them. An Arrow UDF converts through an exporter
 and importer that each worker creates once. Both match their v1 speed, as do
 aggregates. A v2 aggregate's destroy callback is documented to run only on
 states discarded without being finalized, but it is the engine's state
 destructor, as v1's is, so it runs on every state.
 
-Queries run through v2 prepared statements, cached per query text as before;
-`PreparedStatement` holds one too. A cached statement keeps the parameter types
+Queries run through v2 prepared statements, cached per query text as before,
+and `PreparedStatement` holds one too. A cached statement keeps the parameter types
 its plan assumed, read from the prepared statement (patch 0013), and executions convert ints
 and floats to them, so a plan is reused instead of bound again: a
 parameterized INSERT takes 76 µs instead of 152. v2 binds each execution's
 values afresh, so nothing carries over between executemany rows.
 `PreparedStatement.columns` reports the schema the statement was prepared with,
-as v1 did; a later schema change shows in its results.
+as v1 did. A later schema change shows in its results.
 
 A materialized result runs to its end with the GIL released, its result
 retained (patch 0011), and then hands over its rows as a column data collection
@@ -237,13 +237,13 @@ instead of 24, a streaming one 30 instead of 46, and
 18.5, since every chunk handed to Python is copied out of the collection. Rows
 are held once: 20M rows of two columns take 320 MB once the query has run,
 where stepping them into chunks held 631. A trivial query takes 34 µs instead
-of 30; most of a query's time goes to waking DuckDB's workers for its few tasks
+of 30. Most of a query's time goes to waking DuckDB's workers for its few tasks
 and waiting for them, as v1 also did.
 
 Rows are still read through v1: the result's chunks and types reach the
 existing conversions through the bridge. Arrow export converts the chunks with
 an exporter created from the connection (patch 0014), which pins the
-connection's Arrow settings when the stream is created; it matches v1's speed
+connection's Arrow settings when the stream is created. It matches v1's speed
 and `Connection.arrow()`'s output.
 
 `Connection.progress()` reads `connection_progress_get`, the same snapshot
