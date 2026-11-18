@@ -20,7 +20,7 @@ build = [
 ]
 dev = [
     "jax>=0.10.1",
-    "mlx>=0.31.2",
+    "mlx[cpu]>=0.31.2",  # the CPU backend, which Linux wheels need to load.
     "numpy>=2.4.6",
     "pandas>=3.0.3",
     "polars>=2.0.0",
