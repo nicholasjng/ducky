@@ -82,19 +82,24 @@ AddressSanitizer builds keep them as well. Loadable extensions do not need
 ducky's symbols, because DuckDB links each one against its own copy of DuckDB.
 Only an extension built with `EXTENSION_STATIC_BUILD=OFF` cannot load.
 
-## AddressSanitizer
+## Sanitizers
+
+Build an AddressSanitizer, UndefinedBehaviorSanitizer or ThreadSanitizer
+editable install (ASAN and TSAN exclude each other):
 
 ```sh
 DUCKY_ASAN=1 uv sync --all-groups --reinstall-package=ducky
+DUCKY_UBSAN=1 uv sync --all-groups --reinstall-package=ducky
+DUCKY_TSAN=1 uv sync --all-groups --reinstall-package=ducky
 ```
 
 On macOS:
 
 ```sh
-VIRTUAL_ENV="$PWD/.venv" scripts/asan-pytest.sh -q
+VIRTUAL_ENV="$PWD/.venv" scripts/sanitizer-pytest.sh asan -q
 ```
 
-On Linux:
+On Linux, preload the runtime, here ASAN's:
 
 ```sh
 LD_PRELOAD="$(clang -print-file-name=libclang_rt.asan.so) $(clang -print-file-name=libc++.so)" \

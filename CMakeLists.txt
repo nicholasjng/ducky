@@ -28,20 +28,48 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
 endif()
 
-# Instrument DuckDB and the extension with AddressSanitizer.
+# Instrument DuckDB and the extension with a sanitizer.
 option(DUCKY_ASAN "Build with AddressSanitizer" OFF)
-if(DEFINED ENV{DUCKY_ASAN} AND NOT DUCKY_ASAN)
-  set(DUCKY_ASAN ON)
+option(DUCKY_UBSAN "Build with UndefinedBehaviorSanitizer" OFF)
+option(DUCKY_TSAN "Build with ThreadSanitizer" OFF)
+foreach(_san ASAN UBSAN TSAN)
+  if(DEFINED ENV{DUCKY_${_san}} AND NOT DUCKY_${_san})
+    set(DUCKY_${_san} ON)
+  endif()
+endforeach()
+if(DUCKY_TSAN AND DUCKY_ASAN)
+  message(FATAL_ERROR "DUCKY_TSAN and DUCKY_ASAN cannot be enabled at the same time")
 endif()
+set(_ducky_sanitize_compile "")
+set(_ducky_sanitize_link "")
 if(DUCKY_ASAN)
-  add_compile_options(-fsanitize=address -fno-omit-frame-pointer)
-  add_link_options(-fsanitize=address)
+  list(APPEND _ducky_sanitize_compile -fsanitize=address)
+  list(APPEND _ducky_sanitize_link -fsanitize=address)
 endif()
+# Fail on the first finding rather than letting a test pass after undefined behavior.
+if(DUCKY_UBSAN)
+  list(APPEND _ducky_sanitize_compile -fsanitize=undefined -fno-sanitize-recover=undefined)
+  list(APPEND _ducky_sanitize_link -fsanitize=undefined)
+endif()
+if(DUCKY_TSAN)
+  list(APPEND _ducky_sanitize_compile -fsanitize=thread)
+  list(APPEND _ducky_sanitize_link -fsanitize=thread)
+endif()
+if(_ducky_sanitize_compile)
+  list(APPEND _ducky_sanitize_compile -fno-omit-frame-pointer)
+  add_compile_options(${_ducky_sanitize_compile})
+  add_link_options(${_ducky_sanitize_link})
+endif()
+# DuckDB adds ASan and UBSan to its own Debug builds, which would mix
+# sanitizers whose runtimes the process does not load.
+set(ENABLE_SANITIZER OFF CACHE BOOL "" FORCE)
+set(ENABLE_UBSAN OFF CACHE BOOL "" FORCE)
+set(ENABLE_THREAD_SANITIZER OFF CACHE BOOL "" FORCE)
 
 # Keep symbol names for profilers and stack traces, at the cost of a larger
 # module. Sanitizer reports need them too.
 option(DUCKY_SYMBOLS "Keep symbol names in the extension module" OFF)
-if((DEFINED ENV{DUCKY_SYMBOLS} OR DUCKY_ASAN) AND NOT DUCKY_SYMBOLS)
+if((DEFINED ENV{DUCKY_SYMBOLS} OR _ducky_sanitize_compile) AND NOT DUCKY_SYMBOLS)
   set(DUCKY_SYMBOLS ON)
 endif()
 
@@ -132,10 +160,10 @@ elseif(UNIX)
   set_property(TARGET _core APPEND PROPERTY LINK_DEPENDS "${_ducky_exports}")
 endif()
 
-# Target flags let stub generation preload the ASAN runtime.
-if(DUCKY_ASAN)
-  target_compile_options(_core PRIVATE -fsanitize=address -fno-omit-frame-pointer)
-  target_link_options(_core PRIVATE -fsanitize=address)
+# Target flags let stub generation preload the sanitizer runtime.
+if(_ducky_sanitize_compile)
+  target_compile_options(_core PRIVATE ${_ducky_sanitize_compile})
+  target_link_options(_core PRIVATE ${_ducky_sanitize_link})
 endif()
 
 install(TARGETS _core LIBRARY DESTINATION ducky)
