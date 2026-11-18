@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, ClassVar, Literal, Protocol, overload
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, Protocol, cast, overload
 
 from ._core import Connection, Result, connect
 
@@ -15,6 +15,67 @@ if TYPE_CHECKING:
     import torch
 
 
+type DTypeLike = str | type | np.dtype[Any] | torch.dtype | mx.Dtype
+"""A dtype name such as ``"f32"`` or ``"float32"``, or a NumPy, JAX, torch or MLX dtype."""
+
+_DUCKDB_DTYPES: dict[str, str] = {
+    "f32": "FLOAT",
+    "f64": "DOUBLE",
+    "i8": "TINYINT",
+    "i16": "SMALLINT",
+    "i32": "INTEGER",
+    "i64": "BIGINT",
+    "u8": "UTINYINT",
+    "u16": "USMALLINT",
+    "u32": "UINTEGER",
+    "u64": "UBIGINT",
+    "bool": "BOOLEAN",
+}
+_DTYPE_ALIASES: dict[str, str] = {
+    "float32": "f32",
+    "float64": "f64",
+    "int8": "i8",
+    "int16": "i16",
+    "int32": "i32",
+    "int64": "i64",
+    "uint8": "u8",
+    "uint16": "u16",
+    "uint32": "u32",
+    "uint64": "u64",
+}
+_BUILTIN_DTYPES: dict[type, str] = {bool: "bool", int: "i64", float: "f64"}
+
+
+def _canonical_dtype(dtype: DTypeLike) -> str:
+    """Return the short name (``"f32"``, ``"i64"``, ...) of a dtype or dtype name."""
+    if isinstance(dtype, str):
+        name = dtype
+    elif isinstance(dtype, type) and dtype in _BUILTIN_DTYPES:
+        name = _BUILTIN_DTYPES[dtype]
+    elif type(dtype).__module__.partition(".")[0] in ("torch", "mlx"):
+        # torch.float32 and mlx.core.float32 print as their qualified names
+        name = str(dtype).rpartition(".")[2]
+    else:
+        # NumPy dtypes and scalar types, and JAX's, which NumPy understands
+        import numpy as np
+
+        try:
+            name = np.dtype(cast(Any, dtype)).name
+        except TypeError:
+            name = None
+    short = _DTYPE_ALIASES.get(name, name) if name is not None else None
+    if short not in _DUCKDB_DTYPES:
+        raise ValueError(
+            f"unknown dtype {dtype!r}; pick one of {sorted(_DUCKDB_DTYPES)}, "
+            "or the matching NumPy, JAX, torch or MLX dtype"
+        )
+    return short
+
+
+def _normalize_dtype(spec: Any) -> None:
+    object.__setattr__(spec, "dtype", _canonical_dtype(spec.dtype))
+
+
 @dataclass(frozen=True)
 class Feature:
     """A SQL expression, dtype, and optional train-fold standardization."""
@@ -23,6 +84,9 @@ class Feature:
     dtype: str = "f32"
     standardize: bool = False
 
+    def __post_init__(self) -> None:
+        _normalize_dtype(self)
+
 
 @dataclass(frozen=True)
 class Target:
@@ -30,6 +94,9 @@ class Target:
 
     expr: str
     dtype: str = "f32"
+
+    def __post_init__(self) -> None:
+        _normalize_dtype(self)
 
 
 @dataclass(frozen=True)
@@ -40,6 +107,9 @@ class Vector:
     dtype: str = "f32"
     standardize: bool = False
 
+    def __post_init__(self) -> None:
+        _normalize_dtype(self)
+
 
 @dataclass(frozen=True)
 class Tensor:
@@ -49,6 +119,9 @@ class Tensor:
     shape: tuple[int, ...]
     dtype: str = "f32"
     standardize: ClassVar[bool] = False  # per-element statistics aren't supported
+
+    def __post_init__(self) -> None:
+        _normalize_dtype(self)
 
 
 @dataclass(frozen=True)
@@ -64,6 +137,9 @@ class Category:
     categories: tuple[Any, ...] | None = None
     dtype: str = "i64"
     standardize: ClassVar[bool] = False
+
+    def __post_init__(self) -> None:
+        _normalize_dtype(self)
 
 
 @dataclass(frozen=True)
@@ -84,45 +160,48 @@ class Split:
     seed: int = 0
 
 
-def feature(expr: str, *, dtype: str = "f32", standardize: bool = False) -> Feature:
+def feature(expr: str, *, dtype: DTypeLike = "f32", standardize: bool = False) -> Feature:
     """Shorthand for :class:`Feature`."""
-    return Feature(expr=expr, dtype=dtype, standardize=standardize)
+    return Feature(expr=expr, dtype=_canonical_dtype(dtype), standardize=standardize)
 
 
-def target(expr: str, *, dtype: str = "f32") -> Target:
+def target(expr: str, *, dtype: DTypeLike = "f32") -> Target:
     """Shorthand for :class:`Target`."""
-    return Target(expr=expr, dtype=dtype)
+    return Target(expr=expr, dtype=_canonical_dtype(dtype))
 
 
-def vector(expr: str, *, dtype: str = "f32", standardize: bool = False) -> Vector:
+def vector(expr: str, *, dtype: DTypeLike = "f32", standardize: bool = False) -> Vector:
     """Shorthand for :class:`Vector`."""
-    return Vector(expr=expr, dtype=dtype, standardize=standardize)
+    return Vector(expr=expr, dtype=_canonical_dtype(dtype), standardize=standardize)
 
 
-def tensor(expr: str, shape: int | tuple[int, ...], *, dtype: str = "f32") -> Tensor:
+def tensor(expr: str, shape: int | tuple[int, ...], *, dtype: DTypeLike = "f32") -> Tensor:
     """Shorthand for :class:`Tensor`; an int ``shape`` is a 1-D embedding size."""
     dims = (shape,) if isinstance(shape, int) else tuple(shape)
     if not dims or not all(isinstance(d, int) and d > 0 for d in dims):
         raise ValueError(f"tensor shape must be one or more positive ints; got {shape!r}")
-    return Tensor(expr=expr, shape=dims, dtype=dtype)
+    return Tensor(expr=expr, shape=dims, dtype=_canonical_dtype(dtype))
 
 
 _CODE_DTYPES = ("i8", "i16", "i32", "i64")
 
 
-def category(expr: str, categories: Iterable[Any] | None = None, *, dtype: str = "i64") -> Category:
+def category(
+    expr: str, categories: Iterable[Any] | None = None, *, dtype: DTypeLike = "i64"
+) -> Category:
     """Shorthand for :class:`Category`; ``categories`` fixes the codes' order."""
-    if dtype not in _CODE_DTYPES:
+    code_dtype = _canonical_dtype(dtype)
+    if code_dtype not in _CODE_DTYPES:
         raise ValueError(
             f"category codes need a signed integer dtype, one of {list(_CODE_DTYPES)}; "
             f"got {dtype!r}"
         )
     if categories is None:
-        return Category(expr=expr, dtype=dtype)
+        return Category(expr=expr, dtype=code_dtype)
     given = tuple(categories)
     if not given:
         raise ValueError("categories must not be empty")
-    return Category(expr=expr, categories=given, dtype=dtype)
+    return Category(expr=expr, categories=given, dtype=code_dtype)
 
 
 def matrix(columns: dict[str, Feature]) -> Matrix:
@@ -149,28 +228,6 @@ def split(
     if not all(v > 0 for v in fractions.values()):
         raise ValueError("each fold fraction must be > 0")
     return Split(fractions=dict(fractions), seed=seed)
-
-
-_DUCKDB_DTYPES: dict[str, str] = {
-    "f32": "FLOAT",
-    "f64": "DOUBLE",
-    "i8": "TINYINT",
-    "i16": "SMALLINT",
-    "i32": "INTEGER",
-    "i64": "BIGINT",
-    "u8": "UTINYINT",
-    "u16": "USMALLINT",
-    "u32": "UINTEGER",
-    "u64": "UBIGINT",
-    "bool": "BOOLEAN",
-}
-
-
-def _to_duckdb_dtype(name: str) -> str:
-    try:
-        return _DUCKDB_DTYPES[name]
-    except KeyError as exc:
-        raise ValueError(f"unknown dtype {name!r}; pick one of {sorted(_DUCKDB_DTYPES)}") from exc
 
 
 Backend = Literal["numpy", "jax", "torch", "mlx"]
@@ -540,7 +597,7 @@ def _select_item(alias: str, spec: Column, mean: str | None = None, std: str | N
         # whose NULL result would surface as garbage in the dense ndarrays
         # downstream.
         expr = f"({expr} - {mean}) / coalesce(nullif({std}, 0), 1)"
-    sql_type = _to_duckdb_dtype(spec.dtype)
+    sql_type = _DUCKDB_DTYPES[spec.dtype]
     if isinstance(spec, Tensor):
         sql_type += "".join(f"[{d}]" for d in spec.shape)
     return f"CAST({expr} AS {sql_type}) AS {_quote_ident(alias)}"
