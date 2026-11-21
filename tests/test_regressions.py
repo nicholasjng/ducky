@@ -957,3 +957,149 @@ def test_compact_columns_read_flat_through_every_reader(con):
 
     k = con.sql("SELECT 42 AS k, i FROM range(5000) r(i)").to_numpy()["k"]
     assert (k == 42).all()
+
+
+def test_failed_to_numpy_does_not_return_the_rest_on_retry(con):
+    result = con.sql(
+        "SELECT range AS i, CASE WHEN range = 6000 THEN NULL ELSE range END AS n FROM range(10000)"
+    )
+    with pytest.raises(ducky.Error, match="contains NULLs"):
+        result.to_numpy()
+    # The failed drain consumed rows; a retry must not pass the rest off as all.
+    with pytest.raises(ducky.Error, match="partially consumed"):
+        result.to_numpy(["i"])
+
+
+def test_to_numpy_validation_error_leaves_the_result_usable(con):
+    result = con.sql("SELECT range AS i FROM range(10)")
+    with pytest.raises(ducky.Error, match="unknown column"):
+        result.to_numpy(["nope"])
+    with pytest.raises(TypeError, match="not a str"):
+        result.to_numpy("i")
+    assert result.to_numpy()["i"].tolist() == list(range(10))
+
+
+def test_numpy_output_rejects_duplicate_column_names(con):
+    for streaming in (False, True):
+        with pytest.raises(ducky.Error, match="duplicate names"):
+            con.sql("SELECT 1 AS a, 2 AS a", streaming=streaming).to_numpy()
+        with pytest.raises(ducky.Error, match="duplicate names"):
+            con.sql("SELECT 1 AS a, 2 AS a", streaming=streaming).fetch_numpy_chunk()
+    assert con.sql("SELECT 1 AS a, 2 AS a").fetchall() == [(1, 2)]
+
+
+def test_map_with_unhashable_keys_decodes_to_pairs(con):
+    rows = con.execute("SELECT MAP {[1, 2]: 'a'}, MAP {{'k': 1}: 2}, MAP {'x': 1}").fetchall()
+    assert rows == [([([1, 2], "a")], [({"k": 1}, 2)], {"x": 1})]
+
+
+def test_time_at_the_end_of_the_day(con):
+    rows = con.execute("SELECT TIME '24:00:00', TIMETZ '24:00:00+02', TIME '23:59:59'").fetchall()
+    plus2 = datetime.timezone(datetime.timedelta(hours=2))
+    assert rows == [
+        (datetime.time.max, datetime.time.max.replace(tzinfo=plus2), datetime.time(23, 59, 59))
+    ]
+
+
+def test_aware_time_parameter_keeps_its_offset(con):
+    value = datetime.time(12, 0, tzinfo=datetime.timezone(datetime.timedelta(hours=5)))
+    assert con.execute("SELECT ?, typeof(?)", [value, value]).fetchall() == [
+        (value, "TIME WITH TIME ZONE")
+    ]
+
+
+def test_fast_arrow_stream_keeps_failing_after_an_error(con):
+    pa = pytest.importorskip("pyarrow")
+    result = con.sql(
+        "SELECT (CASE WHEN i < 3000 THEN i ELSE error('boom') END)::DOUBLE AS x "
+        "FROM range(500000) t(i)",
+        streaming=True,
+    )
+    reader = pa.RecordBatchReader.from_stream(result)
+    for _ in range(2):
+        with pytest.raises(OSError, match="boom"):
+            reader.read_next_batch()
+
+
+def test_table_function_factory_may_return_any_iterable(con):
+    columns = {"x": "BIGINT"}
+    con.create_table_function("as_list", lambda: [(1,), (2,)], parameters=[], columns=columns)
+    assert con.execute("SELECT sum(x) FROM as_list()").fetchall() == [(3,)]
+    con.create_table_function("not_iterable", lambda: 5, parameters=[], columns=columns)
+    with pytest.raises(ducky.Error, match="not iterable"):
+        con.execute("SELECT * FROM not_iterable()").fetchall()
+
+
+def test_udf_may_return_a_read_only_array(con):
+    con.create_function("same", lambda x: x, parameters=["BIGINT"], return_type="BIGINT")
+    rows = con.execute(
+        "SELECT sum(same(CASE WHEN range % 100 = 0 THEN NULL ELSE range END)) FROM range(5000)"
+    ).fetchall()
+    assert rows == [(sum(i for i in range(5000) if i % 100),)]
+
+
+def test_udf_inference_skips_the_init_state(con):
+    def add_state(state: int, x: int) -> int:
+        return x + state
+
+    con.create_function("plus_five", add_state, init=lambda: 5)
+    assert con.execute("SELECT plus_five(1)").fetchall() == [(6,)]
+
+
+def test_connection_with_udf_cycle_is_collected_after_execute():
+    class Holder:
+        con: ducky.Connection
+
+    holder = Holder()
+    holder.con = ducky.connect()
+    holder.con.create_function(
+        "keeps", lambda x, h=holder: x, parameters=["BIGINT"], return_type="BIGINT"
+    )
+    holder.con.execute("SELECT 1").fetchall()
+    ref = weakref.ref(holder)
+    del holder
+    gc.collect()
+    assert ref() is None
+
+
+def test_list_dict_and_numpy_parameters(con):
+    np = pytest.importorskip("numpy")
+    rows = con.execute(
+        "SELECT ?, typeof(?), ?, ?", [[1, 2, None], [[1.5], []], {"a": 1, "b": ["x"]}, []]
+    ).fetchall()
+    assert rows == [([1, 2, None], "DOUBLE[][]", {"a": 1, "b": ["x"]}, [])]
+    vector = np.arange(4, dtype=np.float32)
+    assert con.execute("SELECT list_sum(?), ? + 1", [vector, np.int64(41)]).fetchall() == [
+        (6.0, 42)
+    ]
+    similarity = con.execute(
+        "SELECT array_cosine_similarity(?::FLOAT[4], ?::FLOAT[4])", [vector + 1, vector + 1]
+    ).fetchitem()
+    assert similarity == pytest.approx(1.0)
+    with pytest.raises(ducky.Error, match="str keys"):
+        con.execute("SELECT ?", [{1: 2}])
+
+
+def test_to_numpy_folds_routes_rows_and_stacks_groups(con):
+    np = pytest.importorskip("numpy")
+    query = (
+        "SELECT range % 10 AS _bucket, range AS i, CASE WHEN range % 7 = 0 THEN NULL "
+        "ELSE range::FLOAT END AS x, (range * 2)::FLOAT AS y, [range, 1]::FLOAT[2] AS a "
+        "FROM range(100000)"
+    )
+    for streaming in (False, True):
+        result = con.sql(query, streaming=streaming)
+        train, val = result.to_numpy_folds("_bucket", [0, 8, 10], {"X": ["x", "y"]})
+        i = np.arange(100000)
+        np.testing.assert_array_equal(train["i"], i[i % 10 < 8])
+        np.testing.assert_array_equal(val["i"], i[i % 10 >= 8])
+        assert "_bucket" not in train
+        for fold in (train, val):
+            expected = np.where(fold["i"] % 7 == 0, np.nan, fold["i"]).astype(np.float32)
+            np.testing.assert_array_equal(fold["X"][:, 0], expected)
+            np.testing.assert_array_equal(fold["X"][:, 1], fold["i"] * 2)
+            np.testing.assert_array_equal(fold["a"][:, 0], fold["i"])
+    with pytest.raises(ducky.Error, match="one type"):
+        con.sql(query).to_numpy_folds("_bucket", [0, 10], {"X": ["x", "i"]})
+    empty = con.sql("SELECT 0::BIGINT AS _bucket, 1.5::FLOAT AS x WHERE false")
+    assert empty.to_numpy_folds("_bucket", [0, 1], {"X": ["x"]})[0]["X"].shape == (0, 1)

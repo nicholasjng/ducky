@@ -335,7 +335,12 @@ void table_init(duckdb_v2_table_function_init_global_info_handle info,
         auto* bd = (TableUDFBindData*)bind_data;
         // Single-threaded: Python generators are not thread-safe.
         e.check(duckdb_v2_table_function_init_global_set_max_threads(info, 1, e.out()));
-        nb::object gen = bd->factory(*nb::tuple(bd->python_args));
+        // The scan calls PyIter_Next, which needs a real iterator: a factory
+        // may return any iterable (a list, say).
+        nb::object produced = bd->factory(*nb::tuple(bd->python_args));
+        PyObject* iterator = PyObject_GetIter(produced.ptr());
+        if (!iterator) throw nb::python_error();
+        nb::object gen = nb::steal(iterator);
         auto id = std::make_unique<TableUDFInitData>(TableUDFInitData{std::move(gen)});
         duckdb_v2_opaque data{id.get(), &gil_delete<TableUDFInitData>, nullptr};
         e.check(duckdb_v2_table_function_init_global_set_global_state(info, &data, e.out()));

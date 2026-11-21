@@ -330,6 +330,15 @@ duckdb_v2_value_handle V2Parameters::convert(nb::handle value, idx_t idx,
         s.min = (int8_t)PyDateTime_TIME_GET_MINUTE(raw);
         s.sec = (int8_t)PyDateTime_TIME_GET_SECOND(raw);
         s.micros = PyDateTime_TIME_GET_MICROSECOND(raw);
+        nb::object offset = value.attr("utcoffset")();
+        if (!offset.is_none()) {
+            // An aware time keeps its offset as TIME WITH TIME ZONE.
+            int32_t seconds = (int32_t)(PyDateTime_DELTA_GET_DAYS(offset.ptr()) * 86400 +
+                                        PyDateTime_DELTA_GET_SECONDS(offset.ptr()));
+            return made(duckdb_v2_value_create_time_tz(
+                factory_, duckdb_create_time_tz(duckdb_to_time(s).micros, seconds).bits, &out,
+                err.out()));
+        }
         return made(
             duckdb_v2_value_create_time(factory_, duckdb_to_time(s).micros, &out, err.out()));
     }
@@ -356,6 +365,66 @@ duckdb_v2_value_handle V2Parameters::convert(nb::handle value, idx_t idx,
         py_long_to_int128(value.attr("int"), /*is_signed=*/false, lo, hi);
         duckdb_v2_hugeint_t h{lo, (int64_t)(hi ^ (uint64_t(1) << 63))};
         return made(duckdb_v2_value_create_uuid(factory_, &h, &out, err.out()));
+    }
+    if (nb::isinstance<nb::list>(value) || nb::isinstance<nb::tuple>(value)) {
+        // A LIST of the elements' common type, as a SQL list literal resolves it.
+        std::vector<duckdb_v2_value_handle> children;
+        struct Destroy {
+            std::vector<duckdb_v2_value_handle>& values;
+            ~Destroy() {
+                for (duckdb_v2_value_handle& v : values) duckdb_v2_value_destroy(&v);
+            }
+        } destroy{children};
+        for (nb::handle item : value) {
+            children.push_back(convert(item, idx, DUCKDB_V2_LOGICAL_TYPE_ID_INVALID));
+        }
+        // An empty list has no element to take its type from.
+        duckdb_v2_logical_type_handle child_type = nullptr;
+        if (children.empty()) {
+            made(duckdb_v2_factory_create_type_from_text(factory_, "NULL", 4, &child_type,
+                                                         err.out()));
+        }
+        DUCKDB_V2_ERROR code = duckdb_v2_value_create_list(
+            factory_, child_type, children.empty() ? nullptr : children.data(),
+            (idx_t)children.size(), &out, err.out());
+        duckdb_v2_logical_type_destroy(&child_type);
+        return made(code);
+    }
+    if (nb::isinstance<nb::dict>(value)) {
+        // A STRUCT with the dict's keys as field names.
+        std::vector<std::string> names;
+        std::vector<duckdb_v2_value_handle> children;
+        struct Destroy {
+            std::vector<duckdb_v2_value_handle>& values;
+            ~Destroy() {
+                for (duckdb_v2_value_handle& v : values) duckdb_v2_value_destroy(&v);
+            }
+        } destroy{children};
+        for (auto [key, item] : nb::borrow<nb::dict>(value)) {
+            if (!nb::isinstance<nb::str>(key)) {
+                throw DuckyError(
+                    "ducky: a dict parameter binds as a STRUCT and needs str keys "
+                    "(position " +
+                    std::to_string(idx) + ")");
+            }
+            names.push_back(nb::cast<std::string>(key));
+            children.push_back(convert(item, idx, DUCKDB_V2_LOGICAL_TYPE_ID_INVALID));
+        }
+        std::vector<const char*> name_ptrs;
+        std::vector<idx_t> name_lengths;
+        for (const std::string& name : names) {
+            name_ptrs.push_back(name.data());
+            name_lengths.push_back((idx_t)name.size());
+        }
+        bool empty = names.empty();
+        return made(duckdb_v2_value_create_struct(
+            factory_, empty ? nullptr : name_ptrs.data(), empty ? nullptr : name_lengths.data(),
+            empty ? nullptr : children.data(), (idx_t)names.size(), &out, err.out()));
+    }
+    // NumPy arrays bind as lists of their elements.
+    if (nb::hasattr(value, "tolist") && nb::hasattr(value, "ndim") &&
+        nb::cast<int>(value.attr("ndim")) > 0) {
+        return convert(value.attr("tolist")(), idx, planned);
     }
     // Unbox NumPy scalars.
     if (nb::hasattr(value, "item")) {
@@ -949,7 +1018,7 @@ int Connection::gc_traverse(visitproc visit, void* arg) const {
     Py_VISIT(profile_sink_.ptr());
     // The database owns its functions' callables. Only a sole owner of the
     // database owns them, and only then can gc_clear free them by closing.
-    if (handle_ && handle_.use_count() == 1) {
+    if (owns_database_alone()) {
         for (const nb::object& obj : handle_->py_refs()) Py_VISIT(obj.ptr());
     }
     // GC holds the GIL or stops all threads, so taking mu could deadlock.
@@ -962,8 +1031,16 @@ int Connection::gc_traverse(visitproc visit, void* arg) const {
     return 0;
 }
 
+// Whether nothing outside this Connection shares the database. The result of
+// the last execute() holds a reference too, but one the Connection owns.
+bool Connection::owns_database_alone() const {
+    if (!handle_) return false;
+    long owned = 1 + (last_result_ && last_result_.use_count() == 1 ? 1 : 0);
+    return handle_.use_count() == owned;
+}
+
 void Connection::gc_clear() {
-    if (handle_ && handle_.use_count() == 1) {
+    if (owns_database_alone()) {
         // Closing drops the database, and with it the callables it owns.
         close();
         return;
