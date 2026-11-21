@@ -8,6 +8,7 @@
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <limits>
 #include <memory>
 
@@ -32,6 +33,7 @@ struct PyTypes {
     nb::object date_min, date_max;
     nb::object datetime_min, datetime_max;
     nb::object datetime_min_utc, datetime_max_utc;
+    nb::object time_max;  // datetime.time.max, for DuckDB's 24:00:00
 };
 
 const PyTypes& py_types() {
@@ -54,6 +56,7 @@ const PyTypes& py_types() {
         t.date_max = date.attr("max");
         t.datetime_min = dt.attr("min");
         t.datetime_max = dt.attr("max");
+        t.time_max = datetime.attr("time").attr("max");
         t.datetime_min_utc = t.datetime_min.attr("replace")("tzinfo"_a = t.timezone_utc);
         t.datetime_max_utc = t.datetime_max.attr("replace")("tzinfo"_a = t.timezone_utc);
         return t;
@@ -96,7 +99,11 @@ nb::object date_to_py(int32_t days) {
     return steal_checked(PyDate_FromDate(s.year, s.month, s.day));
 }
 
+// DuckDB allows 24:00:00, the end of the day; Python's nearest is time.max.
+constexpr int64_t kMicrosPerDay = 86400000000LL;
+
 nb::object time_to_py(int64_t micros) {
+    if (micros == kMicrosPerDay) return py_types().time_max;
     duckdb_time_struct s = duckdb_from_time(duckdb_time{micros});
     return steal_checked(PyTime_FromTime(s.hour, s.min, s.sec, s.micros));
 }
@@ -110,6 +117,7 @@ nb::object time_tz_to_py(uint64_t bits, tsl::robin_map<int32_t, nb::object>& tim
         it = timezones.emplace(s.offset, py_types().timezone(delta)).first;
     }
     const nb::object& tz = it->second;
+    if (s.time.hour == 24) return py_types().time_max.attr("replace")("tzinfo"_a = tz);
     return steal_checked(PyDateTimeAPI->Time_FromTime(
         s.time.hour, s.time.min, s.time.sec, s.time.micros, tz.ptr(), PyDateTimeAPI->TimeType));
 }
@@ -382,6 +390,26 @@ nb::object convert_cell(CellDecoder& decoder, duckdb_vector vector, void* data, 
             uint64_t* key_validity = duckdb_vector_get_validity(keys);
             void* value_data = duckdb_vector_get_data(values);
             uint64_t* value_validity = duckdb_vector_get_validity(values);
+            switch (decoder.children[0].type) {
+                case DUCKDB_TYPE_LIST:
+                case DUCKDB_TYPE_ARRAY:
+                case DUCKDB_TYPE_STRUCT:
+                case DUCKDB_TYPE_MAP:
+                case DUCKDB_TYPE_UNION: {
+                    // The keys cannot be dict keys: return (key, value) pairs.
+                    nb::list items;
+                    for (idx_t k = 0; k < entry.length; ++k) {
+                        items.append(
+                            nb::make_tuple(convert_cell(decoder.children[0], keys, key_data,
+                                                        key_validity, entry.offset + k),
+                                           convert_cell(decoder.children[1], values, value_data,
+                                                        value_validity, entry.offset + k)));
+                    }
+                    return items;
+                }
+                default:
+                    break;
+            }
             nb::dict mapping;
             for (idx_t k = 0; k < entry.length; ++k) {
                 mapping[convert_cell(decoder.children[0], keys, key_data, key_validity,
@@ -652,8 +680,9 @@ int stream_get_next(ArrowArrayStream* stream, ArrowArray* out) {
         std::unique_lock<std::mutex> lock = state->result->lock_cursor();
         if (state->fast) {
             if (state->done) return 0;  // the single combined batch was already emitted
-            state->done = true;
             build_fast_batch(state, out);
+            // Set only now: after a failure the next call must fail again.
+            state->done = true;
             return 0;
         }
         // The exporter copies the chunk, so it may be borrowed.
@@ -1413,6 +1442,7 @@ nb::list Result::categories(nb::object key) const {
 }
 
 nb::object Result::fetch_numpy_chunk(bool fill_nulls) {
+    require_distinct_names();
     // Validate every column before pulling, so an unsupported type doesn't
     // consume (and lose) a chunk.
     std::vector<NumpyColumnPlan> plans;
@@ -1447,10 +1477,247 @@ nb::object Result::fetch_numpy_chunk(bool fill_nulls) {
     return out;
 }
 
+void Result::require_distinct_names() const {
+    if (schema_->name_to_idx.size() == schema_->names.size()) return;
+    throw DuckyError(
+        "ducky: NumPy output is keyed by column name, but the result has duplicate names; "
+        "alias the columns");
+}
+
+namespace {
+
+// A malloc'ed buffer that grows geometrically, for outputs of unknown size.
+struct GrowBuffer {
+    char* data = nullptr;
+    size_t size = 0, capacity = 0;
+
+    GrowBuffer() = default;
+    GrowBuffer(const GrowBuffer&) = delete;
+    GrowBuffer& operator=(const GrowBuffer&) = delete;
+    GrowBuffer(GrowBuffer&& other) noexcept
+        : data(other.data), size(other.size), capacity(other.capacity) {
+        other.data = nullptr;
+        other.size = other.capacity = 0;
+    }
+    ~GrowBuffer() { std::free(data); }
+
+    // Appends `bytes` uninitialized bytes and returns their start.
+    char* extend(size_t bytes) {
+        if (size + bytes > capacity) {
+            size_t grown = std::max({size + bytes, capacity + capacity / 2, (size_t)1 << 16});
+            void* moved = std::realloc(data, grown);
+            if (!moved) throw std::bad_alloc();
+            data = (char*)moved;
+            capacity = grown;
+        }
+        char* out = data + size;
+        size += bytes;
+        return out;
+    }
+    // Hands the buffer, trimmed to its size, to a capsule that frees it.
+    nb::capsule release(char*& out) {
+        if (size > 0 && size < capacity) {
+            if (void* trimmed = std::realloc(data, size)) data = (char*)trimmed;
+        }
+        // A capsule cannot hold a null pointer.
+        if (!data && !(data = (char*)std::malloc(1))) throw std::bad_alloc();
+        out = data;
+        data = nullptr;
+        size = capacity = 0;
+        return nb::capsule(out, [](void* p) noexcept { std::free(p); });
+    }
+};
+
+// One array of a fold: a column, or scalar columns of one type side by side.
+struct FoldOutput {
+    std::string name;
+    std::vector<idx_t> columns;
+    bool matrix = false;  // adds a trailing axis, also for a single column
+};
+
+}  // namespace
+
+nb::object Result::to_numpy_folds(const std::string& bucket, std::vector<int64_t> bounds,
+                                  nb::object groups) {
+    require_distinct_names();
+    if (bounds.size() < 2) throw DuckyError("ducky: to_numpy_folds needs two bounds or more");
+    auto index_of = [&](const std::string& name) {
+        auto it = schema_->name_to_idx.find(name);
+        if (it == schema_->name_to_idx.end()) {
+            throw DuckyError("ducky: to_numpy_folds: unknown column '" + name + "'");
+        }
+        return (idx_t)it->second;
+    };
+    idx_t bucket_column = index_of(bucket);
+    if (types_[bucket_column] != DUCKDB_TYPE_BIGINT) {
+        throw DuckyError("ducky: to_numpy_folds: column '" + bucket + "' must be BIGINT");
+    }
+    std::vector<NumpyColumnPlan> plans(column_count_);
+    for (idx_t c = 0; c < column_count_; ++c) {
+        if (c != bucket_column)
+            plans[c] = plan_column(types_[c], column_types_[c], schema_->names[c]);
+    }
+
+    // Grouped columns form one matrix each; the others keep their own array.
+    std::vector<bool> grouped(column_count_, false);
+    grouped[bucket_column] = true;
+    std::vector<FoldOutput> matrices;
+    if (!groups.is_none()) {
+        for (auto [name, members] : nb::borrow<nb::dict>(groups)) {
+            FoldOutput output;
+            output.name = nb::cast<std::string>(name);
+            output.matrix = true;
+            for (nb::handle member : members) {
+                idx_t c = index_of(nb::cast<std::string>(member));
+                if (grouped[c]) {
+                    throw DuckyError("ducky: to_numpy_folds: column '" + schema_->names[c] +
+                                     "' is used twice");
+                }
+                grouped[c] = true;
+                const NumpyColumnPlan& plan = plans[c];
+                const NumpyColumnPlan& head =
+                    output.columns.empty() ? plan : plans[output.columns[0]];
+                if (!plan.array.dims.empty() || plan.struct_view || plan.elem_size > 8 ||
+                    plan.type != head.type) {
+                    throw DuckyError("ducky: to_numpy_folds: matrix '" + output.name +
+                                     "' needs scalar columns of one type; '" + schema_->names[c] +
+                                     "' is " + duckdb_type_name(plan.type));
+                }
+                output.columns.push_back(c);
+            }
+            if (output.columns.empty()) {
+                throw DuckyError("ducky: to_numpy_folds: matrix '" + output.name +
+                                 "' has no columns");
+            }
+            matrices.push_back(std::move(output));
+        }
+    }
+    std::vector<FoldOutput> outputs;
+    for (idx_t c = 0; c < column_count_; ++c) {
+        if (!grouped[c]) outputs.push_back(FoldOutput{schema_->names[c], {c}, false});
+    }
+    for (FoldOutput& matrix : matrices) outputs.push_back(std::move(matrix));
+
+    size_t folds = bounds.size() - 1;
+    std::vector<std::vector<GrowBuffer>> buffers(folds);
+    for (auto& fold : buffers) fold.resize(outputs.size());
+    std::vector<idx_t> totals(folds, 0), counts(folds, 0);
+    std::vector<char*> dst(folds, nullptr);
+    std::vector<int32_t> fold_of;
+    std::vector<uint32_t> position;
+    std::vector<char> scratch;
+
+    auto lock = lock_cursor();
+    try {
+        // Each chunk's rows are copied once, into the arrays of their fold.
+        while (true) {
+            BorrowedChunk chunk = borrow_chunk_locked();
+            if (!chunk.chunk) break;
+            idx_t rows = duckdb_data_chunk_get_size(chunk.chunk);
+            if (rows == 0) continue;
+            duckdb_vector key_vector = duckdb_data_chunk_get_vector(chunk.chunk, bucket_column);
+            const int64_t* keys = (const int64_t*)duckdb_vector_get_data(key_vector);
+            uint64_t* key_validity = duckdb_vector_get_validity(key_vector);
+            fold_of.assign(rows, -1);
+            position.assign(rows, 0);
+            std::fill(counts.begin(), counts.end(), 0);
+            for (idx_t r = 0; r < rows; ++r) {
+                if (key_validity && !duckdb_validity_row_is_valid(key_validity, r)) continue;
+                for (size_t k = 0; k < folds; ++k) {
+                    if (keys[r] >= bounds[k] && keys[r] < bounds[k + 1]) {
+                        fold_of[r] = (int32_t)k;
+                        position[r] = (uint32_t)counts[k]++;
+                        break;
+                    }
+                }
+            }
+            int32_t whole = -1;  // the fold that takes the whole chunk, if one does
+            for (size_t k = 0; k < folds; ++k) {
+                if (counts[k] == rows) whole = (int32_t)k;
+            }
+            for (size_t o = 0; o < outputs.size(); ++o) {
+                const FoldOutput& output = outputs[o];
+                size_t width = output.columns.size();
+                size_t size = plans[output.columns[0]].elem_size;
+                for (size_t k = 0; k < folds; ++k) {
+                    dst[k] = counts[k] ? buffers[k][o].extend((size_t)counts[k] * size * width)
+                                       : nullptr;
+                }
+                for (size_t j = 0; j < width; ++j) {
+                    idx_t c = output.columns[j];
+                    duckdb_vector v = duckdb_data_chunk_get_vector(chunk.chunk, c);
+                    if (width == 1 && whole >= 0) {
+                        copy_numpy_values(dst[whole], v, rows, plans[c], schema_->names[c]);
+                        continue;
+                    }
+                    // Resolve NULLs in a contiguous copy, then route the rows.
+                    scratch.resize((size_t)rows * size);
+                    copy_numpy_values(scratch.data(), v, rows, plans[c], schema_->names[c]);
+                    const char* src = scratch.data();
+#define DUCKY_ROUTE(T)                                                                  \
+    for (idx_t r = 0; r < rows; ++r) {                                                  \
+        int32_t k = fold_of[r];                                                         \
+        if (k >= 0) ((T*)dst[k])[(size_t)position[r] * width + j] = ((const T*)src)[r]; \
+    }                                                                                   \
+    break;
+                    switch (size) {
+                        case 1:
+                            DUCKY_ROUTE(uint8_t)
+                        case 2:
+                            DUCKY_ROUTE(uint16_t)
+                        case 4:
+                            DUCKY_ROUTE(uint32_t)
+                        case 8:
+                            DUCKY_ROUTE(uint64_t)
+                        default:
+                            // Wide rows (ARRAY, HUGEINT) are never stacked.
+                            for (idx_t r = 0; r < rows; ++r) {
+                                int32_t k = fold_of[r];
+                                if (k < 0) continue;
+                                std::memcpy(dst[k] + (size_t)position[r] * size, src + r * size,
+                                            size);
+                            }
+                    }
+#undef DUCKY_ROUTE
+                }
+            }
+            for (size_t k = 0; k < folds; ++k) totals[k] += counts[k];
+        }
+    } catch (const DuckyError& e) {
+        // The drain consumed rows: later fetches must not pass the rest off as all.
+        if (error_.empty()) error_ = e.what();
+        throw;
+    }
+
+    nb::list out;
+    for (size_t k = 0; k < folds; ++k) {
+        nb::dict fold;
+        for (size_t o = 0; o < outputs.size(); ++o) {
+            const FoldOutput& output = outputs[o];
+            const NumpyColumnPlan& plan = plans[output.columns[0]];
+            char* data = nullptr;
+            nb::capsule owner = buffers[k][o].release(data);
+            if (output.matrix) {
+                size_t shape[2] = {(size_t)totals[k], output.columns.size()};
+                fold[output.name.c_str()] =
+                    nb::cast(nb::ndarray<nb::numpy>(data, 2, shape, owner, nullptr, plan.dtype));
+            } else {
+                fold[output.name.c_str()] = wrap_numpy(plan, data, totals[k], owner);
+            }
+        }
+        out.append(std::move(fold));
+    }
+    return out;
+}
+
 nb::object Result::to_numpy(nb::object columns) {
+    require_distinct_names();
     // Validate selected columns and layouts before scanning.
     std::vector<bool> selected(column_count_, true);
     if (!columns.is_none()) {
+        if (nb::isinstance<nb::str>(columns)) {
+            throw nb::type_error("ducky: to_numpy: columns must be a list of names, not a str");
+        }
         std::fill(selected.begin(), selected.end(), false);
         for (nb::handle item : columns) {
             std::string name = nb::cast<std::string>(item);
@@ -1469,6 +1736,17 @@ nb::object Result::to_numpy(nb::object columns) {
     }
 
     auto lock = lock_cursor();
+    // A drain that fails half-way consumed rows: later fetches must not pass
+    // the rest off as all of them.
+    struct MarkFailed {
+        std::string& error;
+        int unwinding = std::uncaught_exceptions();
+        ~MarkFailed() {
+            if (std::uncaught_exceptions() > unwinding && error.empty()) {
+                error = "ducky: result was partially consumed by a failed to_numpy()";
+            }
+        }
+    } mark_failed{error_};
 
     // Allocate upfront when the exact remaining row count is known.
     if (std::optional<idx_t> remaining = remaining_rows_locked()) {

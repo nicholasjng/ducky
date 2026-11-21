@@ -170,17 +170,17 @@ NB_MODULE(_core, m) {
     nb::class_<Chunk>(m, "Chunk", nb::pooled(), "A column-major DuckDB result batch.")
         .def("__len__", &Chunk::size, "Number of rows.")
         .def_prop_ro("columns", &Chunk::column_names, "Column names.")
-        .def_prop_ro("types", &Chunk::column_types, "Column type names.")
+        .def_prop_ro("types", &Chunk::column_types, "Column type names.", nb::lock_self())
         .def(
             "column",
             [](nb::object self, nb::object key) {
                 return nb::cast<Chunk&>(self).column(key, self);
             },
-            "key"_a, nb::sig("def column(self, key: int | str) -> numpy.ndarray"),
+            "key"_a, nb::lock_self(), nb::sig("def column(self, key: int | str) -> numpy.ndarray"),
             "Return a zero-copy ndarray view by index or name: (rows, *dims) for an ARRAY, codes "
             "for\n"
             "an ENUM.")
-        .def("categories", &Chunk::categories, "key"_a,
+        .def("categories", &Chunk::categories, "key"_a, nb::lock_self(),
              nb::sig("def categories(self, key: int | str) -> list[str]"),
              "Return an ENUM column's labels, indexed by the codes its views hold.")
         .def(
@@ -188,9 +188,10 @@ NB_MODULE(_core, m) {
             [](nb::object self, nb::object key) {
                 return nb::cast<Chunk&>(self).validity(key, self);
             },
-            "key"_a, nb::sig("def validity(self, key: int | str) -> numpy.ndarray | None"),
+            "key"_a, nb::lock_self(),
+            nb::sig("def validity(self, key: int | str) -> numpy.ndarray | None"),
             "Return a uint8 validity mask (1 = valid, 0 = NULL), or None if no nulls.")
-        .def("decimal_scale", &Chunk::decimal_scale, "key"_a,
+        .def("decimal_scale", &Chunk::decimal_scale, "key"_a, nb::lock_self(),
              nb::sig("def decimal_scale(self, key: int | str) -> int"),
              "Return a DECIMAL column's scale.")
         .def(
@@ -198,13 +199,13 @@ NB_MODULE(_core, m) {
             [](nb::object self, nb::object key) {
                 return nb::cast<Chunk&>(self).dlpack(key, self);
             },
-            "key"_a, nb::sig("def dlpack(self, key: int | str) -> typing.Any"),
+            "key"_a, nb::lock_self(), nb::sig("def dlpack(self, key: int | str) -> typing.Any"),
             "Return a numeric or temporal column, or a fixed-size ARRAY of one, as a DLPack "
             "object.")
         .def(
             "mlx",
             [](nb::object self, nb::object key) { return nb::cast<Chunk&>(self).mlx(key, self); },
-            "key"_a, nb::sig("def mlx(self, key: int | str) -> mlx.core.array"),
+            "key"_a, nb::lock_self(), nb::sig("def mlx(self, key: int | str) -> mlx.core.array"),
             "Return a numeric or temporal column, or a fixed-size ARRAY of one, as an MLX array.");
 
     nb::class_<Result> result_cls(m, "Result",
@@ -235,6 +236,15 @@ NB_MODULE(_core, m) {
              "Pull the next chunk as zero-copy NumPy arrays, or None at end. With fill_nulls, "
              "columns\n"
              "holding NULLs are copied, NULLs becoming NaN in FLOAT/DOUBLE and raising elsewhere.",
+             nb::lock_self())
+        .def("to_numpy_folds", &Result::to_numpy_folds, "bucket"_a, "bounds"_a,
+             "groups"_a = nb::none(),
+             nb::sig("def to_numpy_folds(self, bucket: str, bounds: collections.abc.Sequence[int], "
+                     "groups: dict[str, list[str]] | None = None) -> "
+                     "list[dict[str, numpy.ndarray]]"),
+             "Drain into one dict of arrays per range ``bounds[k] <= bucket < bounds[k + 1]`` of "
+             "the\n"
+             "BIGINT column ``bucket``. ``groups`` stacks columns of one type into matrices.",
              nb::lock_self())
         .def(
             "to_numpy", &Result::to_numpy, "columns"_a = nb::none(),

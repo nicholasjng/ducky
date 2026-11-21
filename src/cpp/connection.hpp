@@ -111,6 +111,7 @@ class Connection {
 
     int gc_traverse(visitproc visit, void* arg) const;
     void gc_clear();
+    bool owns_database_alone() const;
 
    private:
     std::shared_ptr<Result> run(const std::string& query, nb::object parameters, bool streaming);

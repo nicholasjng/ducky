@@ -80,6 +80,10 @@ bool guard(Body&& body, SetError&& set_error) {
     } catch (nb::python_error& e) {
         set_error(e.what());
         return false;
+    } catch (const nb::cast_error&) {
+        // Its what() is a bare "std::bad_cast".
+        set_error("ducky: a Python value has the wrong type for its DuckDB column or return type");
+        return false;
     } catch (const std::exception& e) {
         set_error(e.what());
         return false;

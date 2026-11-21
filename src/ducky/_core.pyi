@@ -1,7 +1,7 @@
 """ducky: tiny nanobind bindings for the DuckDB C API"""
 
 import enum
-from collections.abc import Callable, Coroutine, Iterable, Iterator
+from collections.abc import Callable, Coroutine, Iterable, Iterator, Sequence
 from types import TracebackType
 from typing import Any, Literal, Self, overload
 
@@ -104,6 +104,14 @@ class Result:
         """
         Pull the next chunk as zero-copy NumPy arrays, or None at end. With fill_nulls, columns
         holding NULLs are copied, NULLs becoming NaN in FLOAT/DOUBLE and raising elsewhere.
+        """
+
+    def to_numpy_folds(
+        self, bucket: str, bounds: Sequence[int], groups: dict[str, list[str]] | None = None
+    ) -> list[dict[str, numpy.ndarray]]:
+        """
+        Drain into one dict of arrays per range ``bounds[k] <= bucket < bounds[k + 1]`` of the
+        BIGINT column ``bucket``. ``groups`` stacks columns of one type into matrices.
         """
 
     def to_numpy(self, columns: Iterable[str] | None = None) -> dict[str, numpy.ndarray]:

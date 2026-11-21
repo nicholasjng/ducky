@@ -150,6 +150,12 @@ class Result {
     nb::list categories(nb::object key) const;
 
     nb::object to_numpy(nb::object columns);
+    // Drains into one dict of arrays per fold: fold k takes the rows with
+    // bounds[k] <= bucket < bounds[k + 1] of the BIGINT column `bucket`, which
+    // is not returned. `groups` (dict of name to column names) stacks scalar
+    // columns of one type into (rows, n) matrices.
+    nb::object to_numpy_folds(const std::string& bucket, std::vector<int64_t> bounds,
+                              nb::object groups);
 
     nb::object arrow_c_stream(nb::object self, bool allow_fast = true);
 
@@ -186,6 +192,8 @@ class Result {
     // Read after buffered_.
     std::unique_ptr<TakenRows> taken_;
     std::string error_;
+    // NumPy output is a dict by column name.
+    void require_distinct_names() const;
     std::shared_ptr<DuckDBHandle> handle_;
     idx_t column_count_ = 0;
     int64_t rows_changed_ = 0;

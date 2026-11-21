@@ -97,7 +97,8 @@ std::string annotation_to_type(nb::handle hint, const std::string& where) {
                      "explicitly for other types)");
 }
 
-nb::list infer_parameters(nb::callable fn) {
+// With `skip_first`, the first parameter is the `init=` state, not a SQL one.
+nb::list infer_parameters(nb::callable fn, bool skip_first = false) {
     nb::module_ inspect = nb::module_::import_("inspect");
     nb::module_ typing = nb::module_::import_("typing");
     nb::object sig = inspect.attr("signature")(fn);
@@ -110,6 +111,10 @@ nb::list infer_parameters(nb::callable fn) {
     }
     nb::list out;
     for (auto item : params) {
+        if (skip_first) {
+            skip_first = false;
+            continue;
+        }
         std::string pname = nb::cast<std::string>(item);
         if (!hints.contains(pname.c_str())) {
             throw DuckyError("ducky: UDF parameter '" + pname +
@@ -355,7 +360,7 @@ void udf_trampoline(duckdb_v2_scalar_function_exec_info_handle info,
         // straight off arr.data(), so a strided return (a slice such as
         // `big[::2]`) would otherwise be copied out wrong. nanobind
         // materializes a contiguous copy for us when needed.
-        auto arr = nb::cast<nb::ndarray<nb::numpy, nb::c_contig>>(values_obj);
+        auto arr = nb::cast<nb::ndarray<nb::numpy, nb::ro, nb::c_contig>>(values_obj);
         if (arr.ndim() != 1 || arr.shape(0) != m) {
             throw DuckyError("ducky: UDF returned an array of shape != (" + std::to_string(m) +
                              ",)");
@@ -379,7 +384,7 @@ void udf_trampoline(duckdb_v2_scalar_function_exec_info_handle info,
         }
 
         if (mask_obj) {
-            auto mask = nb::cast<nb::ndarray<nb::numpy, nb::c_contig>>(mask_obj);
+            auto mask = nb::cast<nb::ndarray<nb::numpy, nb::ro, nb::c_contig>>(mask_obj);
             if (mask.ndim() != 1 || mask.shape(0) != m) {
                 throw DuckyError("ducky: UDF mask shape != (" + std::to_string(m) + ",)");
             }
@@ -740,7 +745,7 @@ void create_scalar_function(Connection& con, const std::string& name, nb::callab
     if (has_varargs && !parameters.is_none()) {
         throw DuckyError("ducky: UDF '" + name + "' cannot set both `parameters` and `varargs`");
     }
-    if (!has_varargs && parameters.is_none()) parameters = infer_parameters(fn);
+    if (!has_varargs && parameters.is_none()) parameters = infer_parameters(fn, !init.is_none());
     std::string rt_name =
         return_type.is_none() ? infer_return_type(fn) : nb::cast<std::string>(return_type);
     ctx->callable = handle->keep(std::move(fn));
