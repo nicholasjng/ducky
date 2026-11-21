@@ -281,6 +281,11 @@ class Stream[ArrayT: AbstractArray]:
         self.field_specs = field_specs
         self.batch_size = batch_size
         self.fold = fold
+        if split is not None and split.ranked:
+            raise ValueError(
+                "stream() cannot rank rows for split(group=..., stratify=...); "
+                "use dataset(), or assign folds in a column and filter on it"
+            )
         self.split = split
         self.key = key
         self.drop_nulls = drop_nulls
