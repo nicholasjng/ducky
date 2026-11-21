@@ -61,7 +61,23 @@ ds = ducky.dataset(URL, fields={"sex": ducky.category("Sex")})
 ds.categories["sex"]  # ['female', 'male']
 ```
 
-See [examples/titanic_jax.py](examples/titanic_jax.py) for a complete example.
+`ducky.split()` takes `group=` to keep rows with the same value in one fold and
+`stratify=` to keep each value's share of rows in every fold:
+
+```python
+split = ducky.split({"train": 0.8, "val": 0.2}, group="PassengerId", stratify="Survived")
+```
+
+### Examples
+
+Each runs with `--backend jax` or `--backend mlx`.
+
+| Example | Shows |
+|---|---|
+| [titanic_jax.py](examples/titanic_jax.py) | Logistic regression on a CSV file read over HTTP. |
+| [tabular_mlp.py](examples/tabular_mlp.py) | An MLP on millions of generated rows, with features, standardization and a three-way split compiled into one query. |
+| [linear_algebra.py](examples/linear_algebra.py) | Ridge regression and PCA, where DuckDB reduces the rows to a small matrix and projects them in SQL. |
+| [text_lm.py](examples/text_lm.py) | A character-level transformer: tokenization and training windows in SQL, and nearest-neighbour search over embeddings stored as `FLOAT[d]`. |
 
 ## Streaming
 
