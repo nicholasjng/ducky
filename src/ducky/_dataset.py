@@ -6,7 +6,7 @@ from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, Protocol, cast, overload
 
-from ._core import Connection, Result, connect
+from ._core import Connection, connect
 
 if TYPE_CHECKING:
     import jax
@@ -154,10 +154,24 @@ Field = Vector | Matrix | Tensor | Category
 
 @dataclass(frozen=True)
 class Split:
-    """Reproducible named-fold fractions keyed by row-position hashes."""
+    """Reproducible named-fold fractions, optionally grouped or stratified.
+
+    Without ``group`` or ``stratify``, each row lands in a fold by the hash of
+    its identity. With either, rows are ranked in a seeded hash order and each
+    fold takes its exact share of the ranking: with ``group``, all rows of a
+    group stay in one fold and fractions count groups; with ``stratify``, each
+    fold keeps every stratum's share of rows (or groups).
+    """
 
     fractions: dict[str, float] = field(default_factory=lambda: {"train": 0.8, "val": 0.2})
     seed: int = 0
+    group: str | None = None
+    stratify: str | None = None
+
+    @property
+    def ranked(self) -> bool:
+        """Whether folds come from ranking rather than from each row's own hash."""
+        return self.group is not None or self.stratify is not None
 
 
 def feature(expr: str, *, dtype: DTypeLike = "f32", standardize: bool = False) -> Feature:
@@ -215,19 +229,34 @@ def split(
     fractions: float | dict[str, float] = 0.8,
     *,
     seed: int = 0,
+    group: str | None = None,
+    stratify: str | None = None,
 ) -> Split:
-    """Build a split from a train fraction or named fractions summing to 1."""
+    """Build a split from a train fraction or named fractions summing to 1.
+
+    ``group`` is a SQL expression whose value keeps rows together: every row
+    with the same value lands in the same fold. ``stratify`` is a SQL
+    expression, usually the label, whose value distribution each fold keeps.
+    With both, every group must have a single ``stratify`` value. NULL is one
+    group or stratum like any other value.
+    """
+    if group is not None and not group.strip():
+        raise ValueError("group must be a non-empty SQL expression")
+    if stratify is not None and not stratify.strip():
+        raise ValueError("stratify must be a non-empty SQL expression")
     if isinstance(fractions, int | float):
         f = float(fractions)
         if not 0.0 < f < 1.0:
             raise ValueError(f"train fraction must be in (0, 1); got {f}")
-        return Split(fractions={"train": f, "val": 1.0 - f}, seed=seed)
+        return Split(
+            fractions={"train": f, "val": 1.0 - f}, seed=seed, group=group, stratify=stratify
+        )
     total = sum(fractions.values())
     if abs(total - 1.0) > 1e-6:
         raise ValueError(f"fold fractions must sum to 1.0; got {total}")
     if not all(v > 0 for v in fractions.values()):
         raise ValueError("each fold fraction must be > 0")
-    return Split(fractions=dict(fractions), seed=seed)
+    return Split(fractions=dict(fractions), seed=seed, group=group, stratify=stratify)
 
 
 Backend = Literal["numpy", "jax", "torch", "mlx"]
@@ -241,39 +270,25 @@ class AbstractArray(Protocol):
     @property
     def shape(self) -> tuple[int, ...]: ...
 
+    def __getitem__(self, key: Any, /) -> Any: ...
 
-def _materialize(result: Result, backend: Backend, device: Any) -> dict[str, Any]:
-    from . import _conversions as conv
 
+def _to_backend(arr: Any, backend: Backend, device: Any) -> Any:
+    """Move one NumPy array to ``backend``."""
     if backend == "numpy":
-        return conv.to_numpy(result)
+        return arr
     if backend == "mlx":
-        return conv.to_mlx(result)
+        import mlx.core as mx
 
-    # Folds are split on the host, so the bucket stays a NumPy array.
-    arrays = conv.to_numpy(result)
-    bucket = arrays.pop("_bucket")
-    out: dict[str, Any]
+        return mx.array(arr)
     if backend == "jax":
         import jax.numpy as jnp
 
-        out = {name: jnp.asarray(arr, device=device) for name, arr in arrays.items()}
-    else:
-        import torch
+        return jnp.asarray(arr, device=device)
+    import torch
 
-        out = (
-            {name: torch.from_numpy(arr) for name, arr in arrays.items()}
-            if device is None
-            else {name: torch.from_numpy(arr).to(device) for name, arr in arrays.items()}
-        )
-    out["_bucket"] = bucket
-    return out
-
-
-def _bucket_to_host(arr: Any) -> Any:
-    import numpy as np
-
-    return np.asarray(arr)
+    tensor = torch.from_numpy(arr)
+    return tensor if device is None else tensor.to(device)
 
 
 def _gather(arr: Any, idx: Any, backend: Backend) -> Any:
@@ -286,24 +301,6 @@ def _gather(arr: Any, idx: Any, backend: Backend) -> Any:
 
         return arr[mx.array(idx)]
     return arr[idx]  # numpy and jax both index with a host ndarray
-
-
-def _stack(cols: list[Any], backend: Backend) -> Any:
-    if backend == "jax":
-        import jax.numpy as jnp
-
-        return jnp.stack(cols, axis=1)
-    if backend == "torch":
-        import torch
-
-        return torch.stack(cols, dim=1)
-    if backend == "mlx":
-        import mlx.core as mx
-
-        return mx.stack(cols, axis=1)
-    import numpy as np
-
-    return np.stack(cols, axis=1)
 
 
 @dataclass
@@ -366,6 +363,11 @@ class Fold[ArrayT: AbstractArray]:
         if shuffle:
             np.random.default_rng(seed).shuffle(indices)
         end = (n // batch_size) * batch_size if drop_last else n
+        if not shuffle:
+            # Slices are views; gathering by index would copy every batch.
+            for start in range(0, end, batch_size):
+                yield X[start : start + batch_size], y[start : start + batch_size]
+            return
         for start in range(0, end, batch_size):
             idx = indices[start : start + batch_size]
             yield _gather(X, idx, self.backend), _gather(y, idx, self.backend)
@@ -444,6 +446,11 @@ def _fold_ranges(fractions: dict[str, float]) -> list[tuple[str, int, int]]:
         lo = round(cum * _N_BUCKETS)
         cum += frac
         hi = _N_BUCKETS if i == len(items) - 1 else round(cum * _N_BUCKETS)
+        if hi <= lo:
+            raise ValueError(
+                f"fold {name!r} has fraction {frac}, below the split resolution of "
+                f"{1 / _N_BUCKETS:.1%}; it would always be empty"
+            )
         ranges.append((name, lo, hi))
     return ranges
 
@@ -466,9 +473,43 @@ def _row_id_expr(key: str | None) -> str:
 
 def _bucket_expr(row_id: str, split_spec: Split, key: str | None) -> str:
     """Hash a row's identity (from ``_row_id_expr``) into its fold bucket."""
-    if key is None:
-        return f"(hash({row_id} + {split_spec.seed}) % {_N_BUCKETS})"
+    # The seed is a second hash input: added to a row number, it would only
+    # shift the same split by `seed` rows.
     return f"(hash({row_id}, {split_spec.seed}) % {_N_BUCKETS})"
+
+
+def _ranked_split_sql(source_sql: str, split_spec: Split, key: str | None) -> str:
+    """Select ``source_sql`` with a ``_bucket`` from ranking units within strata.
+
+    A unit is a group, or a row without ``group``. Units are ordered by a seeded
+    hash within each stratum, and unit ``r`` of ``n`` gets bucket
+    ``floor((r - 0.5) * N / n)``: each fold's bucket range then takes its share
+    of every stratum's units, rounded to the nearest unit.
+    """
+    unit = f"({split_spec.group})" if split_spec.group is not None else _row_id_expr(key)
+    stratum = f"({split_spec.stratify})" if split_spec.stratify is not None else "NULL"
+    keyed = f"SELECT *, {unit} AS __ducky_unit, {stratum} AS __ducky_stratum FROM ({source_sql})"
+    order = f"hash(__ducky_unit, {split_spec.seed}), __ducky_unit"
+    rank = f"dense_rank() OVER (PARTITION BY __ducky_stratum ORDER BY {order}) AS __ducky_rank"
+    ranked = f"SELECT *, {rank} FROM ({keyed})"
+    n_units = "max(__ducky_rank) OVER (PARTITION BY __ducky_stratum)"
+    bucket = f"CAST(floor((__ducky_rank - 0.5) * {_N_BUCKETS} / {n_units}) AS BIGINT)"
+    if split_spec.group is not None and split_spec.stratify is not None:
+        # A group with several strata would be ranked once per stratum and could
+        # straddle folds. The check sits in the bucket expression because DuckDB
+        # drops columns nothing reads. count(DISTINCT) skips NULL, so add it back.
+        w = "OVER (PARTITION BY __ducky_unit)"
+        n_strata = f"count(DISTINCT __ducky_stratum) {w} + max((__ducky_stratum IS NULL)::INT) {w}"
+        message = _quote_literal(
+            f"split(group={split_spec.group!r}, stratify={split_spec.stratify!r}) needs "
+            "one stratify value per group, but this group has several: "
+        )
+        group_text = "coalesce(CAST(__ducky_unit AS VARCHAR), 'NULL')"
+        bucket = (
+            f"CASE WHEN {n_strata} > 1 THEN CAST(error({message} || {group_text}) AS BIGINT) "
+            f"ELSE {bucket} END"
+        )
+    return f"SELECT *, {bucket} AS _bucket FROM ({ranked})"
 
 
 def _null_filter(drop_nulls: list[str] | None) -> str:
@@ -625,6 +666,9 @@ def _raw_sql(
         ranges = [("train", 0, _N_BUCKETS)]
         bucket_expr = "0::BIGINT"
     null_filter = _null_filter(drop_nulls)
+    if split_spec is not None and split_spec.ranked:
+        rows = f"SELECT * FROM {_quote_literal(source)}{null_filter}"
+        return _ranked_split_sql(rows, split_spec, key), ranges
     return f"SELECT *, {bucket_expr} AS _bucket FROM {_quote_literal(source)}{null_filter}", ranges
 
 
@@ -674,13 +718,6 @@ def _compile_sql(
 
     sql = f"{ctes} SELECT {', '.join(select_items)} FROM {from_outer}"
     return sql, ranges
-
-
-def _assemble_field(name: str, spec: Field, columns_data: dict[str, Any], backend: Backend) -> Any:
-    if isinstance(spec, Vector | Tensor | Category):
-        return columns_data[name]
-    cols = [columns_data[f"{name}__{c}"] for c in spec.columns]
-    return _stack(cols, backend)
 
 
 def _normalize_fields(
@@ -815,33 +852,42 @@ def dataset(
             field_specs,
         )
         sql, ranges = _compile_sql(source, resolved, drop_nulls, split, key)
-        columns_data = _materialize(con.sql(sql), backend, device)
+        # Columns of a one-dtype matrix are written side by side into its array.
+        groups = {
+            name: [f"{name}__{c}" for c in spec.columns]
+            for name, spec in resolved.items()
+            if isinstance(spec, Matrix) and len({f.dtype for f in spec.columns.values()}) == 1
+        }
+        bounds = [ranges[0][1], *(hi for _, _, hi in ranges)]
+        # Each chunk's rows are copied once, into the arrays of their fold:
+        # nothing full-size is stacked or gathered afterwards.
+        parts = con.sql(sql).to_numpy_folds("_bucket", bounds, groups)
     finally:
         if own_connection:
             con.close()
 
     import numpy as np
 
-    bucket = _bucket_to_host(columns_data.pop("_bucket"))
+    folds: dict[str, Fold[Any]] = {}
+    for (name, _, _), arrays in zip(ranges, parts, strict=True):
+        fold_fields: dict[str, Any] = {}
+        for field_name, spec in field_specs.items():
+            if isinstance(spec, Matrix) and field_name not in groups:
+                # Mixed dtypes: NumPy picks the common one.
+                arr = np.stack([arrays.pop(f"{field_name}__{c}") for c in spec.columns], axis=1)
+            else:
+                arr = arrays.pop(field_name)
+            fold_fields[field_name] = _to_backend(arr, backend, device)
+        folds[name] = Fold(backend=backend, _fields=fold_fields)
     # avg()/stddev_pop() over an empty train fold return NULL, which the
     # standardization would treat as a constant column instead of an empty fold.
-    # Checked here, on the materialized buckets, rather than with a second query
-    # that would read the source again.
-    if any(spec.standardize for _, _, spec in _iter_field_columns(field_specs)):
-        _, train_lo, train_hi = next(r for r in ranges if r[0] == "train")
-        if not np.any((bucket >= train_lo) & (bucket < train_hi)):
-            raise ValueError(
-                "standardize=True requires at least one row in the 'train' fold "
-                "after filtering/splitting, but it's empty; widen the split, check "
-                "drop_nulls, or drop standardize=True"
-            )
-    assembled = {
-        field_name: _assemble_field(field_name, spec, columns_data, backend)
-        for field_name, spec in field_specs.items()
-    }
-    folds: dict[str, Fold[Any]] = {}
-    for name, lo, hi in ranges:
-        idx = np.nonzero((bucket >= lo) & (bucket < hi))[0]
-        gathered = {field_name: _gather(arr, idx, backend) for field_name, arr in assembled.items()}
-        folds[name] = Fold(backend=backend, _fields=gathered)
+    if (
+        any(spec.standardize for _, _, spec in _iter_field_columns(field_specs))
+        and folds["train"].n_rows == 0
+    ):
+        raise ValueError(
+            "standardize=True requires at least one row in the 'train' fold "
+            "after filtering/splitting, but it's empty; widen the split, check "
+            "drop_nulls, or drop standardize=True"
+        )
     return Dataset(folds=folds, field_specs=field_specs, categories=categories)

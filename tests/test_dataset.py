@@ -559,3 +559,178 @@ def test_category_validation(labels_path):
         )
     with pytest.raises(ValueError, match="no values in the 'train' fold"):
         ducky.dataset(labels_path, fields={"s": ducky.category("NULL::VARCHAR")})
+
+
+@pytest.fixture
+def grouped_csv_path(tmp_path):
+    """Rows with an imbalanced label `y`, a group id `g`, and a per-group label `gy`."""
+    p = tmp_path / "grouped.csv"
+    rng = np.random.default_rng(0)
+    n = 1000
+    x = rng.normal(size=n)
+    y = (rng.uniform(size=n) < 0.1).astype(int)
+    g = rng.integers(0, 40, size=n)
+    lines = [f"{xi},{yi},{gi},{gi % 4 == 0:d}" for xi, yi, gi in zip(x, y, g, strict=True)]
+    p.write_text("x,y,g,gy\n" + "\n".join(lines))
+    return str(p)
+
+
+def _grouped_dataset(path, split):
+    return ducky.dataset(
+        path,
+        fields={
+            "y": ducky.vector("y", dtype="i32"),
+            "g": ducky.vector("g", dtype="i32"),
+            "gy": ducky.vector("gy", dtype="i32"),
+        },
+        split=split,
+    )
+
+
+FRACTIONS = {"train": 0.7, "val": 0.2, "test": 0.1}
+
+
+def test_stratified_split_keeps_label_share(grouped_csv_path):
+    ds = _grouped_dataset(grouped_csv_path, ducky.split(FRACTIONS, seed=3, stratify="y"))
+    total = sum(int(f["y"].sum()) for f in ds.folds.values())
+    n = sum(f.n_rows for f in ds.folds.values())
+    assert n == 1000
+    for name, fold in ds.folds.items():
+        # Each stratum is split separately and rounded to the nearest row.
+        assert abs(fold.n_rows - FRACTIONS[name] * n) <= 2
+        assert abs(int(fold["y"].sum()) - FRACTIONS[name] * total) <= 1
+
+
+def test_grouped_split_keeps_groups_together(grouped_csv_path):
+    ds = _grouped_dataset(grouped_csv_path, ducky.split(FRACTIONS, seed=3, group="g"))
+    groups = {name: set(fold["g"].tolist()) for name, fold in ds.folds.items()}
+    assert not groups["train"] & groups["val"]
+    assert not groups["train"] & groups["test"]
+    assert not groups["val"] & groups["test"]
+    # Fractions count groups, not rows.
+    assert {name: len(g) for name, g in groups.items()} == {"train": 28, "val": 8, "test": 4}
+
+
+def test_grouped_stratified_split(grouped_csv_path):
+    split = ducky.split(FRACTIONS, seed=3, group="g", stratify="gy")
+    ds = _grouped_dataset(grouped_csv_path, split)
+    groups = {name: set(fold["g"].tolist()) for name, fold in ds.folds.items()}
+    assert not groups["train"] & groups["val"]
+    # 10 of the 40 groups have gy = 1: 7, 2, and 1 of them per fold.
+    positive = {name: sum(g % 4 == 0 for g in gs) for name, gs in groups.items()}
+    assert positive == {"train": 7, "val": 2, "test": 1}
+
+
+def test_grouped_stratified_split_rejects_mixed_groups(grouped_csv_path):
+    split = ducky.split(FRACTIONS, group="g", stratify="y")
+    with pytest.raises(ducky.Error, match="one stratify value per group"):
+        _grouped_dataset(grouped_csv_path, split)
+
+
+def test_grouped_split_is_seeded(grouped_csv_path):
+    def train_groups(seed):
+        ds = _grouped_dataset(grouped_csv_path, ducky.split(0.5, seed=seed, group="g"))
+        assert ds.train is not None
+        return set(ds.train["g"].tolist())
+
+    assert train_groups(1) == train_groups(1)
+    assert train_groups(1) != train_groups(2)
+
+
+def test_stratified_split_applies_drop_nulls(tmp_path):
+    p = tmp_path / "nulls.csv"
+    p.write_text("x,y\n" + "\n".join(f"{'' if i % 5 == 0 else i},{i % 2}" for i in range(100)))
+    ds = ducky.dataset(
+        str(p),
+        fields={"x": ducky.vector("x"), "y": ducky.vector("y", dtype="i32")},
+        drop_nulls=["x"],
+        split=ducky.split(0.5, stratify="y"),
+    )
+    assert ds.train is not None
+    assert ds.val is not None
+    assert ds.train.n_rows + ds.val.n_rows == 80
+    assert int(ds.train["y"].sum()) == 20
+
+
+def test_split_rejects_empty_group_or_stratify():
+    with pytest.raises(ValueError, match="group"):
+        ducky.split(0.8, group=" ")
+    with pytest.raises(ValueError, match="stratify"):
+        ducky.split(0.8, stratify="")
+
+
+def test_split_seeds_give_different_splits(tmp_path):
+    path = str(tmp_path / "rows.parquet")
+    with ducky.connect() as con:
+        con.execute(f"COPY (SELECT range AS i FROM range(20000)) TO '{path}'")
+
+    def val_rows(seed):
+        ds = ducky.dataset(
+            path, fields={"i": ducky.vector("i", dtype="i64")}, split=ducky.split(0.7, seed=seed)
+        )
+        return np.asarray(ds["val"]["i"])
+
+    base, other = val_rows(0), val_rows(1)
+    # A seed that only shifted the split would map every row r to r - 1.
+    assert np.isin(other, base + 1).mean() < 0.5
+
+
+def test_fold_fraction_below_the_split_resolution_is_rejected():
+    with pytest.raises(ValueError, match="split resolution"):
+        ducky.dataset(
+            "x",
+            fields={"i": ducky.vector("i")},
+            split=ducky.split({"train": 0.9998, "val": 0.0002}),
+        )
+
+
+def test_stream_rejects_ranked_splits(csv_path):
+    with pytest.raises(ValueError, match="cannot rank rows"):
+        ducky.stream(
+            csv_path,
+            fields={"x": ducky.vector("x")},
+            split=ducky.split(0.8, stratify="y"),
+            batch_size=16,
+        )
+
+
+def test_matrix_folds_are_contiguous_and_typed(tmp_path):
+    path = str(tmp_path / "data.parquet")
+    with ducky.connect() as con:
+        con.execute(
+            f"COPY (SELECT range AS id, (hash(range) % 100) / 10 AS a, range / 7 AS b, "
+            f"range % 5 AS g FROM range(20000)) TO '{path}'"
+        )
+    ds = ducky.dataset(
+        path,
+        fields={
+            "X": ducky.matrix({"a": ducky.feature("a", standardize=True), "b": ducky.feature("b")}),
+            "one": ducky.matrix({"a": ducky.feature("a")}),
+            "mixed": ducky.matrix({"a": ducky.feature("a"), "g": ducky.feature("g", dtype="i32")}),
+            "id": ducky.vector("id", dtype="i64"),
+        },
+        split=ducky.split({"train": 0.7, "val": 0.2, "test": 0.1}, seed=3),
+    )
+    assert sum(fold.n_rows for fold in ds.folds.values()) == 20000
+    ids = np.concatenate([fold["id"] for fold in ds.folds.values()])
+    assert sorted(ids.tolist()) == list(range(20000))
+    for fold in ds.folds.values():
+        assert fold["X"].shape == (fold.n_rows, 2)
+        assert fold["X"].dtype == np.float32
+        assert fold["X"].flags.c_contiguous
+        assert fold["one"].shape == (fold.n_rows, 1)
+        assert fold["mixed"].dtype == np.float64  # float32 and int32 stack as float64
+        np.testing.assert_allclose(fold["X"][:, 1], fold["id"] / 7, rtol=1e-6)
+        np.testing.assert_array_equal(fold["mixed"][:, 1], fold["id"] % 5)
+    assert abs(float(ds["train"]["X"][:, 0].mean())) < 1e-4
+
+
+def test_unshuffled_batches_are_views(csv_path):
+    ds = ducky.dataset(
+        csv_path, columns={"x": ducky.feature("x")}, target=ducky.target("y", dtype="i64")
+    )
+    fold = ds["train"]
+    batches = list(fold.batches(256))
+    assert sum(len(y) for _, y in batches) == fold.n_rows
+    assert np.shares_memory(batches[0][0], fold["X"])
+    np.testing.assert_array_equal(np.concatenate([X for X, _ in batches]), fold["X"])
